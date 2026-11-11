@@ -96,6 +96,7 @@ async fn tools_list_exposes_all_core_tools() {
         "resolve_pipeline",
         "list_builtin_pipelines",
         "fix_rules",
+        "format_rules",
         "author_ads",
         "reverse_convert",
         "tune_rules",
@@ -105,7 +106,7 @@ async fn tools_list_exposes_all_core_tools() {
             "missing tool {expected}"
         );
     }
-    assert_eq!(tools.len(), 15, "expected exactly 15 tools, got {names:?}");
+    assert_eq!(tools.len(), 16, "expected exactly 16 tools, got {names:?}");
 
     // parse_rule advertises an input schema with the `yaml` property.
     let parse_rule = tools.iter().find(|t| t.name == "parse_rule").unwrap();
@@ -139,8 +140,8 @@ async fn tools_list_gains_operate_reads_when_daemon_url_is_set() {
     }
     assert_eq!(
         tools.len(),
-        21,
-        "expected 15 engineer tools plus 6 operate reads, got {names:?}"
+        22,
+        "expected 16 engineer tools plus 6 operate reads, got {names:?}"
     );
     assert!(
         !names
@@ -162,8 +163,8 @@ async fn tools_list_gains_write_tools_only_when_gated_on() {
     assert!(names.contains(&"post_disposition".to_string()));
     assert_eq!(
         tools.len(),
-        23,
-        "expected 15 engineer tools plus 6 reads plus 2 writes, got {names:?}"
+        24,
+        "expected 16 engineer tools plus 6 reads plus 2 writes, got {names:?}"
     );
 
     client.cancel().await.ok();
@@ -303,6 +304,28 @@ async fn call_evaluate_events_refuses_command_enricher() {
     }));
     let err = client.call_tool(req).await.unwrap_err();
     assert!(format!("{err:?}").contains("not available over MCP"));
+
+    client.cancel().await.ok();
+    server.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn call_evaluate_events_refuses_env_reference_in_template() {
+    let (server, client) = connect().await;
+    let server_path = std::env::var("PATH").expect("PATH is set for the test process");
+
+    let mut req = CallToolRequestParams::new("evaluate_events");
+    req.arguments = Some(object!({
+        "yaml": RULE,
+        "events": [ { "CommandLine": "cmd /c whoami" } ],
+        "enrichers": "enrichers:\n  - id: leak\n    kind: detection\n    type: template\n    inject_field: out\n    template: \"${PATH}\"\n",
+    }));
+    let err = format!("{:?}", client.call_tool(req).await.unwrap_err());
+    assert!(
+        err.contains("environment variable references are not available over MCP"),
+        "{err}"
+    );
+    assert!(!err.contains(&server_path), "{err}");
 
     client.cancel().await.ok();
     server.cancel().await.ok();

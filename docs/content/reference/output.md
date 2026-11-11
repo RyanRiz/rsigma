@@ -1,3 +1,7 @@
+---
+description: "RSigma output formats reference: the global selector for human, JSON, NDJSON, table, CSV, and TSV output, color policy, and noise controls."
+---
+
 # Output Formats
 
 Structured rsigma commands can emit results in one of five formats. Artifact producers (Sigma YAML, backend query text, replay fixtures) and protocol streams keep their fixed wire format. The selector, color policy, and noise controls are global flags that resolve through the same precedence model as the rest of the [configuration](configuration.md).
@@ -117,11 +121,14 @@ warning: `--output-format csv` is not supported by `rule reverse`; falling back 
 | `rule reverse` | Sigma YAML | Warn; keep YAML. |
 | `rule draft` (default `--emit yaml`) | Sigma YAML | Warn; keep YAML. |
 | `rule migrate-sources` | Source YAML + pipeline rewrites | Warn; keep file/YAML product. |
+| `rule fmt` | File report, unified diff, or formatted YAML | Warn; keep text. |
 | `engine tap` | Replayable NDJSON fixture | Warn unless `ndjson`; never array-wrap or pretty-print. |
 | `engine daemon` | Configured sink wire format | Warn; sinks unchanged. |
 | `mcp serve` | MCP protocol stream | Warn; protocol unchanged. |
 | `config init`/`config reload` | File write/HTTP status | Warn; no stdout data product. |
 | `config schema` | JSON Schema document | `json`/`ndjson` supported; `table`/`csv`/`tsv` warn and fall back to JSON. |
+
+`rule fmt` writes its data product to stdout: `Would reformat:` report lines, unified diffs, or the formatted text from `--stdout`. Progress lines, `Reformatted:` lines, `skipped:` lines, errors, and the trailing summary go to stderr.
 
 ## Examples
 

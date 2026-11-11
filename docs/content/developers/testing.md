@@ -1,6 +1,12 @@
+---
+description: "How RSigma is tested: unit, integration, golden, corpus, and docs audit tiers, which ones gate CI on every pull request, and how to run them locally."
+---
+
 # Testing
 
 The workspace runs several test tiers. Most are gated in CI on every PR; coverage is advisory, and representative performance is path-selective on PRs with a fuller weekly matrix.
+
+The `CI` and `Docs audit` workflows run on every pull request, whatever its base branch or changed paths, and on `merge_group` events, so they can serve as required checks for a merge queue. A workflow skipped by a path filter would leave its required checks pending and keep the PR out of the queue, so `CI` skips work inside the run instead. Its `Changes` job runs `scripts/ci-changes.sh`, and when a PR changes only documentation (`docs/`, `assets/`, `LICENSE`, `.gitignore`, and Markdown files outside a `tests/` directory), the build and test jobs are skipped. Merge queue entries always run every job. The `CI result` job reports one pass or fail for the whole run; require it rather than individual jobs, because a skipped matrix job reports one check instead of one per OS. Coverage is advisory and does not affect `CI result`. The `Security Audit` and `Workflow security (zizmor)` workflows keep their path filters but also run on PRs against any base branch, so a PR stacked on another PR's branch gets them too.
 
 ## At a glance
 
@@ -41,7 +47,7 @@ These tests link directly against the crate as a library and exercise multi-comp
 | Crate | Files | What they cover |
 |-------|-------|-----------------|
 | `rsigma-parser` | `ast_snapshots.rs`, `parse_errors.rs` (+ `snapshots/` for `insta`) | Multi-document parsing, malformed YAML, directory parsing; insta-locked AST snapshots. |
-| `rsigma-eval` | `integration.rs`, `correlation_edge.rs`, `error_paths.rs`, `pipeline_errors.rs`, `regression_eval.rs`, `state_snapshot.rs`, `hir_cache.rs`, `optimize_diff.rs`, `schema_classification_golden.rs`, `gcp_audit_pipeline.rs`, `wire_shape_golden.rs`, `match_detail.rs` (+ shared `helpers/`) | Full rule-eval pipelines, correlation edge cases, snapshot replay, pipeline error semantics, HIR cache, matcher optimizer differentials, schema classification and wire-shape goldens, match detail. |
+| `rsigma-eval` | `integration.rs`, `correlation_edge.rs`, `error_paths.rs`, `pipeline_errors.rs`, `regression_eval.rs`, `state_snapshot.rs`, `hir_cache.rs`, `optimize_diff.rs`, `schema_classification_golden.rs`, `gcp_audit_pipeline.rs`, `ecs_linux_pipeline.rs`, `wire_shape_golden.rs`, `match_detail.rs` (+ shared `helpers/`) | Full rule-eval pipelines, correlation edge cases, snapshot replay, pipeline error semantics, HIR cache, matcher optimizer differentials, schema classification and wire-shape goldens, shipped path-only pipeline regressions (`gcp_audit`, `ecs_linux`), match detail. |
 | `rsigma-convert` | `golden_postgres.rs`, `golden_lynxdb.rs`, `golden_fibratus.rs`, `golden_lucene.rs` (+ `golden/` for committed expected outputs); live SQL via `postgres_integration.rs` in the E2E section | Backend query generation for every `--format` (`default`, `view`, `timescaledb`, `continuous_aggregate`, `sliding_window`, `minimal`, Fibratus/Lucene formats as applicable). |
 | `rsigma-runtime` | `integration.rs`, `evtx_integration.rs`, `sources_integration.rs`, `ocsf_golden.rs`, `alert_pipeline_golden.rs`, `enrichment_lookup.rs`, `enrichment_integration.rs` (the `nats_*.rs` files live in the E2E section below) | Streaming runtime; EVTX file parsing against the committed `security.evtx` fixture; dynamic source resolution (HTTP, file, command, in-process mocks) with TTL, refresh, and template expansion; OCSF and alert-pipeline goldens; enrichment lookup and integration. |
 
@@ -179,7 +185,7 @@ The Performance workflow also uses this pinned corpus for representative through
 
 Two standard-library Python scripts keep the docs in step with the code. `.github/workflows/docs-audit.yml` runs both on every PR, including PRs that touch no docs, because most drift starts as a code change.
 
-- `scripts/docs-audit/check_sources.py` reads only the source tree. It compares the hand-maintained catalogues with the code they describe: fuzz harnesses and the scheduled set, lint and metrics counts in `docs/_data/vars.yml`, metric names, daemon HTTP routes, CLI features, environment variables, native backends, and the navigation. It also rejects em and en dashes outside lines that describe the windash dash set.
+- `scripts/docs-audit/check_sources.py` reads only the source tree. It compares the hand-maintained catalogues with the code they describe: fuzz harnesses and the scheduled set, lint and metrics counts in `docs/_data/vars.yml`, metric names, daemon HTTP routes, CLI features, the config keys project files may not set, environment variables, native backends, and the navigation. It also rejects em and en dashes outside lines that describe the windash dash set.
 - `scripts/docs-audit/check_binary.py --bin <path>` drives an all-features binary. Every flag in `--help` must appear on its `docs/content/cli/` page, and every flag in a page's tables must exist. `docs/rsigma.schema.json` must equal `rsigma config schema`, and every schema key must be documented directly or through its flag. Every MCP tool and resource must appear in the MCP guide, the `mcp serve` page, and the `rsigma-mcp` README. The `backend targets` and `backend formats` samples must match the output line for line. Self-contained YAML examples (rules with a `title`, pipelines, and config files) must pass `rule validate`, a pipeline load, or `config validate`. Blocks with `...` or `<placeholder>` elisions are skipped.
 
 When a check fails, fix the docs, or fix the code if the docs describe the intended behavior.

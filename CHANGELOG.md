@@ -4,6 +4,131 @@ All notable changes to RSigma are documented in this file. Each entry correspond
 
 ## [Unreleased]
 
+### Docs site breadcrumb structured data passes Google validation (#677)
+
+Google Search Console rejected the breadcrumb structured data on most rsigma.io pages with `Missing field "item"`. docmd builds the trail from the sidebar, so a navigation group without a page of its own, such as Reference, rule, or Deploy and Detect, became a breadcrumb entry with no URL. The docs plugin now drops those entries and renumbers the rest, so every entry links to a page. The visible sidebar and breadcrumbs are unchanged.
+
+### Docs site search and link preview metadata (#676)
+
+Every page on rsigma.io now has a written meta description in its frontmatter, so search results, link previews, and `llms.txt` show a summary of the page instead of an empty description. The docs plugin fails the build when a page has no description or one over 160 characters. The home page title and heading now read "RSigma: Sigma Detection Engineering Toolkit in Rust" instead of "Welcome to RSigma's documentation!".
+
+The RSigma social banner, which now lists the formatter among the capabilities, is committed as `assets/social-banner.png`, and every page references it through `og:image` and `twitter:image`, with its size and alt text. The docs plugin also adds `og:site_name`, a schema.org `SoftwareApplication` description of RSigma on the home page with the version and license from `Cargo.toml`, and a `<lastmod>` to every sitemap entry from the last commit to the page's source, or to the root file it inlines, such as `CHANGELOG.md` for the release notes. The home page no longer declares a structured-data search URL, because the site search does not read a query from the URL.
+
+### Path-only `ecs_linux` pipeline for ECS-shaped Linux events (#674)
+
+Adds [`crates/rsigma-eval/pipelines/ecs_linux.yml`](crates/rsigma-eval/pipelines/ecs_linux.yml): load with `-p crates/rsigma-eval/pipelines/ecs_linux.yml` (not a builtin short name). Maps Sysmon-style Sigma fields to ECS for `product: linux` in `process_creation`, `network_connection`, `image_load`, `file_event`, and `dns_query`, matching the corresponding `ecs_windows` blocks. Integration tests in `crates/rsigma-eval/tests/ecs_linux_pipeline.rs` pin synthetic ECS events for each category; [Builtin Pipelines](docs/content/reference/builtin-pipelines.md) includes the full field map, [Processing Pipelines](docs/content/guide/processing-pipelines.md) documents path-only use, and [`crates/rsigma-eval/README.md`](crates/rsigma-eval/README.md) links the file. Issue: [#330](https://github.com/timescale/rsigma/issues/330).
+
+### `rsigma rule fmt` formats Sigma rules and keeps their comments (#673)
+
+`rsigma rule fmt` rewrites detection rules, correlations, filters, and action-chain fragments into one canonical layout. It reports the files that would change by default, `--check` exits `1` when any file is not canonical, `--diff` prints a unified diff, `--write` rewrites files atomically, and `--stdout` prints one file for editor or pipe use. `-` reads one document from stdin for `--stdout`, `--check`, `--diff`, and the bare report; it must be the only path and cannot be combined with `--write`. Exit codes are `0` for a completed report or write, `1` for `--check` or `--diff` when a file would change, `2` when a file or stdin cannot be read, parsed, formatted, or written, and `3` for conflicting mode flags, `--stdout` without exactly one file, `--write` with `-`, or `-` mixed with file paths.
+
+The canonical layout uses four-space indentation, block collections, a fixed root key order per document kind, `action` first, recognized `rsigma.*` attributes before other custom attributes, `timeframe` before `condition`, and `condition` last in `detection`. Comments keep their text and their attachment to the entry or item they describe, and anchors, aliases, tags, and YAML directives are preserved. A value that YAML 1.2 reads as a string but YAML 1.1 reads as a number or timestamp, such as `date: 2024-01-01` or `1_000`, keeps its source quoting so PyYAML and pySigma see the same types after formatting.
+
+Before returning changed text the formatter runs a semantic guard that reparses the output and refuses the rewrite unless YAML values, parsed rules, correlations, filters, parser diagnostics, comment attachment, anchors, aliases, tags, directives, and action values all match the source. Files that are not Sigma documents are skipped. A file with invalid YAML or invalid Sigma is reported as an error, and the original file is left untouched.
+
+The MCP server exposes the same formatter as `format_rules`: inline `yaml` or a confined `path`, with `write: true` persisting the result when the server runs with `--rules-dir`. Non-Sigma documents come back as `skipped`.
+
+The LSP advertises document and range formatting and delegates both to the parser, so an editor, the CLI, and the library produce the same text. `rsigma-parser` exposes `format_yaml`, `format_yaml_range`, `FormatOutcome`, `RangeEdit`, and `FormatError` behind the default `fmt` feature, which adds `tree-sitter` and `tree-sitter-yaml`; disable default features for `wasm32-unknown-unknown` builds.
+
+The emitter also changed: strings that YAML would read as another type are quoted, prose such as reference URLs stays plain, multi-line values become literal blocks with an explicit chomping indicator unless a line ends in a space or tab, detection field keys are quoted as a whole, empty custom-attribute collections are written as `{}` and `[]`, and recognized `rsigma.*` attributes are emitted before other custom attributes.
+
+### Dependency follow-up and `minimatch` security fix (#672)
+
+Rolls up the Dependabot PRs that opened after #643, with `Cargo.lock`, `fuzz/Cargo.lock`, and `ci/wasm-smoke/Cargo.lock` regenerated against current `main`. Security: the VS Code extension moves `minimatch` from 10.2.6 to 11.0.3 through a top-level npm override for GHSA-g3hv-75wg-m249 (denial of service through glob part amplification). Version 11 replaces the regular-expression matcher, and the packaged extension file list is unchanged. Rust: `async-nats` 0.50.0 to 0.51.0 (#665), which moves to `tokio-websockets` 0.13 and drops the duplicate `webpki-roots` 0.26 copy, and the patch group with `globset` 0.4.21, `pest` and `pest_derive` 2.9.5, `rusqlite` 0.41.1, `tonic` 0.14.9, and `jsonschema` 0.60.2 (#663). The compatible updates queued past the 7-day cooldown are taken too, including `rmcp` 3.8.0, `aws-lc-rs` 1.19.0, `der` 0.8.3, `ctutils` 0.4.7, and `wasm-bindgen` 0.2.130. `pest_stack_guard`, which `pest` 2.9.5 adds, stays at 1.0.0 because 1.0.1 is inside the cooldown. CI: `taiki-e/install-action` v2.88.0, `docker/login-action` v4.7.0, and `zizmorcore/zizmor-action` v0.8.0, repinned by commit SHA (#662). VS Code: `vscode-languageclient` 10.1.2 to 11.0.0 (#661), plus `@types/node` 26.6.6, `@types/vscode` 1.144.0, and `@vscode/vsce` 4.1.0 (#660). Held back: `yamlpath` and `yamlpatch` 1.31.1 (#664, #666) require rustc 1.97 through `tree-sitter-iter`, above the 1.96.0 MSRV; `testcontainers` 0.28.0 waits for a `testcontainers-modules` release; `reqwest` 0.13 changes the trust store of the outbound HTTP clients and needs its own change; `tikv-jemallocator` 0.7.0 (#425) remains excluded after the measured musl daemon throughput regression.
+
+### Docs-only PRs skip the CI build and test jobs (#669)
+
+- A new `Changes` job in the `CI` workflow skips the build, lint, and test jobs when a PR changes only documentation: `docs/`, `assets/`, `LICENSE`, `.gitignore`, and Markdown files outside a `tests/` directory, so golden output files still run the tests. The jobs still report, as skipped, so required checks are not left pending. Merge queue entries always run every job.
+- A new `CI result` job reports one pass or fail for the workflow and is the check to require. Coverage stays advisory and does not affect it.
+
+### MCP HTTP requires a token off loopback, validates `Origin`, and accepts the server's own host names (#659)
+
+`rsigma mcp serve --http` on a non-loopback address started without `--auth-token`, exposing every tool to anyone who could reach the port. It now refuses to start (exit code `3`) unless `--allow-unauthenticated` is set. Loopback binds are unchanged.
+
+Every request's `Host` header was checked against `localhost`, `127.0.0.1`, and `::1` only, so a token-guarded server on `0.0.0.0` answered `403` to clients that used its IP or DNS name. A non-loopback bind with `--auth-token` now accepts any host, since the token is the access control, and the repeatable `--allowed-host` narrows that to named hosts. A specific bind IP is always accepted. Unauthenticated binds keep the validation that stops DNS-rebinding pages from reaching the server.
+
+The `Origin` header was not checked, so a web page on any site could send requests to a loopback MCP server through the user's browser. A request with an `Origin` header must now name an accepted host over `http` or `https`, or it gets `403`; requests without `Origin`, which is how MCP clients connect, are unaffected. Only a token-guarded bind that accepts any host skips the check. See [`rsigma mcp serve`](https://rsigma.io/cli/mcp/serve/#streamable-http).
+
+In `rsigma-mcp`, `http_router_with` and `serve_http_with` take `HttpOptions` (bearer token and `AllowedHosts`); `http_router` and `serve_http` keep the loopback hosts and now validate `Origin` too. `HttpOptions` and `AllowedHosts` are `#[non_exhaustive]`, and an empty `AllowedHosts::List` means loopback.
+
+Breaking changes: a non-loopback `--http` bind without `--auth-token` refuses to start; pass `--allow-unauthenticated` to keep the old behavior. An empty `--auth-token` or `RSIGMA_MCP_AUTH_TOKEN` is refused. Browser requests whose `Origin` names a host that is not accepted get `403`. A plaintext non-loopback bind without `--allow-plaintext` now exits `3` instead of `2`.
+
+### API silences are bounded, and refused without an alert pipeline (#658)
+
+`POST /api/v1/silences` accepted any matcher set and any `ends_at`, so one call with `rule =~ .*` and `ends_at: 9999-12-31T23:59:59Z` muted every detection indefinitely. That call can come from any token with `silences:write`, including an MCP client following prompt-injected instructions. Two alert-pipeline keys now bound silences created over the API:
+
+- `max_silence_duration` (default `720h`): `ends_at` is required and must be no more than this far from now. `0` removes the bound.
+- `allow_broad_silences` (default `false`): at least one matcher must be `=` with a non-empty value on `rule`, `match.<field>`, or `correlation.group_key.<field>`, so `rule =~ .*`, `rule != x`, or `level = high` alone is refused.
+
+A silence that breaks either rule gets `400` with a hint naming the key. Silences declared in the alert-pipeline config are not limited. Without `--alert-pipeline` the daemon never applied silences but still returned `201`; it now returns `409`. API silences restored from `--state-db` are kept even when they exceed the limits; the daemon logs their ids at startup and on reload so they can be reviewed and deleted.
+
+In `rsigma-runtime`, `Silence::build_api` and `SilenceLimits` implement the limits, `AlertPipeline::silence_limits` exposes them, and `SilenceError` gains `Unbounded`, `TooLong`, and `TooBroad`.
+
+Breaking changes: API silences without `ends_at`, longer than 30 days, or without a scoped `=` matcher are refused by default; set `max_silence_duration: 0` or `allow_broad_silences: true` in the alert-pipeline config to keep the old behavior. `POST /api/v1/silences` without an alert pipeline returns `409` instead of `201`. `SilenceError` and the new `SilenceLimits` are `#[non_exhaustive]`, `AlertPipelineFile` has two new fields, and `AlertPipeline::new` takes the limits.
+
+### Delegated `convert_rules` no longer follows symlinks out of the rules root (#657)
+
+With `--rules-dir` and `--allow-sigma-cli`, the MCP `convert_rules` tool checked that a delegated `path` stayed inside the root, but passed a directory to sigma-cli without looking inside it. sigma-cli walks the directory itself and follows symlinks, so a link under the root to a file outside it could be read and echoed back in the converted queries. Delegated directory inputs are now refused when they contain a symlink anywhere in the tree, as the in-process tools already did, and sigma-cli is never started for them.
+
+sigma-cli also ran with the rules root as its working directory, and pySigma opens an unknown pipeline name as a file relative to it. A bare name such as `leak` therefore reached a symlink at the root that pointed outside it. With `--rules-dir` set, sigma-cli now runs in an empty temporary directory; every path it receives is already canonical and absolute.
+
+### Project config files cannot configure daemon sources, enrichers, sinks, or API access (#656)
+
+Running `rsigma engine daemon` inside a cloned repository loaded that repository's `./rsigma.yaml` or `.rsigmarc`, so a planted file could add a `command` enricher or source that ran on the first detection, send detections to its own sink, weaken the API listener, send the operator's API token to its own server, have a unix socket bind delete a file, or have the daemon, `engine eval`, or `rule scorecard` truncate a file outside the repository. Project files can no longer set:
+
+- `daemon.sources`, `daemon.enrichers`, and `daemon.dispositions.source`, which can run commands and make HTTP requests.
+- `daemon.output.sinks`, `daemon.output.dlq`, `daemon.output.webhooks`, `daemon.api.audit`, `daemon.nats.consumer_group`, and a `nats://` `daemon.input.source`.
+- A `daemon.api.addr` other than a loopback `host:port` or a `unix://` path inside the project, a `unix://` `daemon.input.source` outside the project, and a `daemon.state.db`, `eval.output`, or `scorecard.report` outside the project, since rsigma creates or truncates those files.
+- `daemon.api.auth`, `daemon.api.allow_unauthenticated`, `daemon.api.tls.allow_plaintext`, and `daemon.api.tls.client_ca`.
+- `daemon.tap.enabled`, `daemon.tail.enabled`, `daemon.capture.enabled`, and `daemon.capture.spool_dir`.
+- `daemon.engine.egress_policy` and `daemon.engine.allow_remote_include`.
+
+rsigma ignores these keys with the same warning as the protected `mcp.*` keys. Boolean opt-ins, including the `mcp.*` ones, are ignored only when set to `true`, so a project file can still turn a gate off. `rsigma config init` no longer writes `sources`, `sinks`, `egress_policy`, or `api.addr` uncommented, so the generated `./rsigma.yaml` sets no protected key.
+
+Two related changes close paths a project file could still reach through keys it may set:
+
+- jq event filters (`--jq`, `daemon.input.jq`) no longer have the `env` builtin, which copied the process environment, including tokens, into evaluated events and detections.
+- Binding a `unix://` input or API socket replaces an existing path only when it is a stale socket. A regular file, directory, or symlink at that path now fails the bind instead of being deleted.
+
+Breaking changes: a daemon that reads one of these keys from `./rsigma.yaml`, `./rsigma.yml`, or `.rsigmarc` no longer applies it. jq filters that call `env` fail to compile (exit `3`). Pass the file with `engine daemon --config <PATH>`, as the deployment guides do, or move the keys to `~/.config/rsigma/config.yaml` or `/etc/rsigma/config.yaml`.
+
+### Project config files cannot open MCP server gates (#655)
+
+`rsigma` discovers `./rsigma.yaml` and the nearest `.rsigmarc` above the current directory, so a cloned repository could configure any command run inside it. Opening an MCP client in such a repository could point `rsigma mcp serve` at another daemon (sending it the daemon token), turn on the mutating operate tools, allow sigma-cli subprocesses, unconfine paths, start an HTTP listener, or read a file outside the repository as the lint config. Project files can no longer set `mcp.http_addr`, `mcp.allow_unconfined_paths`, `mcp.allow_sigma_cli`, `mcp.daemon_url`, `mcp.daemon_ca`, or `mcp.allow_operate_writes`, or a `mcp.rules_dir` or `mcp.lint_config` that resolves outside the project file's directory (symlinks included). rsigma ignores these keys and prints a warning naming the file. The same keys still resolve from an explicit `--config`, the user and system config, `RSIGMA_MCP__*` environment variables, and flags.
+
+- `rsigma mcp serve` gains `--config <PATH>`, which loads only that file and may set every `mcp.*` key.
+- `rsigma config validate` and `rsigma config show` leave the ignored keys out of the resolved config and list them under `ignored_keys`.
+- The [Configuration](https://rsigma.io/reference/configuration/#project-config-trust) and [Security](https://rsigma.io/reference/security/) references list the protected keys.
+
+Breaking changes: an `mcp.*` key from the list above that lives in `./rsigma.yaml`, `./rsigma.yml`, or `.rsigmarc` no longer takes effect. Move it to `~/.config/rsigma/config.yaml` or `/etc/rsigma/config.yaml`, pass the file with `mcp serve --config <PATH>`, or use the matching `RSIGMA_MCP__*` variable or flag.
+
+### The egress policy covers IP-literal URLs, redirects, IPv6 forms of IPv4 addresses, and more cloud metadata addresses (#654)
+
+`--egress-policy` was enforced only when a hostname was resolved, and some addresses slipped through its rules, so these requests reached addresses the policy denies:
+
+- A URL whose host is an IP literal, such as `http://169.254.169.254/latest/meta-data/` in an HTTP source, HTTP enricher, or webhook, skips DNS and was sent as is. The daemon now checks the URL before sending and fails the request with the policy's reason. A webhook delivery refused this way is permanent and goes to the DLQ instead of being retried.
+- Redirects were followed without a check, so an allowed upstream could answer with a redirect to a denied IP literal. Every hop is now checked before it is followed, still with at most 10 redirects.
+- The cloud-metadata rule compared against `fd00:ec:2::254` instead of the AWS IPv6 instance metadata address `fd00:ec2::254`, so the `default` preset, which allows private addresses, did not block it. It now does, along with GCP's IPv6 metadata address `fd20:ce::254` and Alibaba Cloud's `100.100.100.200`.
+- Only IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) inherited the IPv4 rules. IPv4-compatible (`::a.b.c.d`), NAT64 (`64:ff9b::/96` and `/96` prefixes in `64:ff9b:1::/48`), and 6to4 (`2002::/16`) addresses now do too, so `http://[64:ff9b::10.0.0.1]/` is denied wherever `10.0.0.1` is.
+
+Source, enricher, and webhook transport errors now include the underlying cause, so a resolution-time denial names the policy instead of reading only `error sending request`. The new `EgressPolicy::check_url` exposes the URL check to library users. When `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` is set, the proxy resolves hostnames, so only IP-literal URLs and redirect targets are checked; the daemon now logs a warning at startup in that case.
+
+### MCP `evaluate_events` refuses `${ENV_VAR}` in template enrichers (#653)
+
+A `template` enricher passed to the MCP server's `evaluate_events` tool, inline or through `enrichers_path`, could reference `${NAME}`, which renders from the server process's environment. Any MCP caller could read the server's environment variables, such as cloud credentials or API tokens, from the enrichment result. The tool now refuses an enricher with a `${ENV_VAR}` reference in any templated field and names up to five of them in the error; `${detection.*}` and `${correlation.*}` references work as before. The daemon still expands `${ENV_VAR}` in its own enrichers config. The new `rsigma_runtime::env_references` returns the environment references in a template, for library users who accept templates from untrusted input.
+
+### CI runs for merge queues and stacked PRs (#652)
+
+- The `CI` and `Docs audit` workflows now also run on `merge_group` events, so their jobs can be required checks for a GitHub merge queue.
+- Their `pull_request` trigger no longer filters on the base branch or on changed paths, so every PR, including a docs-only PR or one based on another PR's branch, reports every job.
+- The `Security Audit` and `Workflow security (zizmor)` workflows also run on PRs against any base branch.
+
+### VS Code extension: `rsigma.serverPath` is ignored in workspace settings (#651)
+
+`rsigma.serverPath` is the program the extension starts, and it starts on opening any folder with a `.yml` or `.yaml` file. A repository could commit a `.vscode/settings.json` that pointed it at a script of its own, and a developer who opened and trusted that folder would run the script. The setting now has `machine` scope, so VS Code reads it only from user settings, or from remote settings in a remote window, and ignores it in a workspace or folder `.vscode/settings.json`.
+
+Migration: if you set `rsigma.serverPath` in a `.vscode/settings.json`, VS Code now ignores it and the extension starts `rsigma-lsp` from `$PATH`, or fails to start if it is not there. Move the value to your user settings, or to remote settings for Remote-SSH, WSL, and Dev Containers, where the path is on the remote host. Settings Sync does not carry `machine`-scoped values, so set a custom path on each machine.
+
 ## [0.26.0] - 2026-11-02
 
 **TL;DR**

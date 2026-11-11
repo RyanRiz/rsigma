@@ -52,6 +52,14 @@ export default {
       commitHistory: true,
     },
     mermaid: {},
+    seo: {
+      // Copied from the repo-root assets/ by docmd-plugin-rsigma.
+      openGraph: { defaultImage: "assets/images/social-banner.png" },
+      // docmd's search box does not read a `?q=` URL parameter, so the
+      // structured-data SearchAction would advertise a search URL that ignores
+      // its query.
+      searchAction: false,
+    },
     // The AI chat plugin is on by default and sends reader questions to
     // api.docmd.io, a processor the privacy page does not cover.
     ai: { enabled: false },
@@ -93,6 +101,7 @@ export default {
             { title: "Drafting Rules from Logs", path: "/guide/rule-drafting" },
             { title: "Rule Tuning", path: "/guide/rule-tuning" },
             { title: "Linting Rules", path: "/guide/linting-rules" },
+            { title: "Formatting Rules", path: "/guide/formatting-rules" },
             { title: "Rule Hygiene", path: "/guide/rule-hygiene" },
             { title: "Detection Strategy", path: "/guide/detection-strategy" },
           ],
@@ -194,6 +203,7 @@ export default {
             { title: "parse", path: "/cli/rule/parse" },
             { title: "validate", path: "/cli/rule/validate" },
             { title: "lint", path: "/cli/rule/lint" },
+            { title: "fmt", path: "/cli/rule/fmt" },
             { title: "fields", path: "/cli/rule/fields" },
             { title: "draft", path: "/cli/rule/draft" },
             { title: "tune", path: "/cli/rule/tune" },

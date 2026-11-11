@@ -1,3 +1,7 @@
+---
+description: "RSigma Cargo feature flags: every optional feature across the workspace crates, its default, what it pulls in, and how to enable it in source builds."
+---
+
 # Feature Flags
 
 `rsigma` is a workspace of nine library crates (`rsigma-parser`, `rsigma-ir`, `rsigma-eval`, `rsigma-convert`, `rsigma-runtime`, `rsigma-mcp`, `rsigma-cli`, `rsigma-lsp`, `rstix`), several of which expose Cargo features that gate optional dependencies and code paths. This page documents every feature, its default state, what it pulls in, and how to enable it when building from source.
@@ -60,6 +64,7 @@ The conversion engine. Used as a library and re-exported by `rsigma-cli`.
 | Feature | Default | Pulls in | What it enables |
 |---------|---------|----------|-----------------|
 | `fix` | yes | `yamlpath`, `yamlpatch` | The source-preserving `lint::fix` module and crate-root `apply_fixes_to_source`/`SourceFixOutcome` re-exports. Disable default features for parser/evaluator-only `wasm32-unknown-unknown` builds. Parsing, validation, lint diagnostics, and fix metadata remain available without it. |
+| `fmt` | yes | `tree-sitter`, `tree-sitter-yaml` | The comment-preserving formatter: the `fmt` module and crate-root `format_yaml`, `format_yaml_range`, `FormatOutcome`, `RangeEdit`, and `FormatError` re-exports. `rsigma rule fmt` and LSP formatting need it. Disable default features for `wasm32-unknown-unknown` builds. |
 
 ## `rsigma-mcp`
 
@@ -67,7 +72,7 @@ The Model Context Protocol server library. Gated into the CLI by the `mcp` featu
 
 | Feature | Default | Pulls in | What it enables |
 |---------|---------|----------|-----------------|
-| `http` | no | `axum`, `rmcp/transport-streamable-http-server` | `serve_http` and `http_router` for Streamable HTTP (`/mcp`). Bearer-token auth is configured by the CLI; TLS for the listener is provided by `rsigma-cli` when built with `daemon-tls`. |
+| `http` | no | `axum`, `rmcp/transport-streamable-http-server` | `serve_http`, `http_router`, and their `HttpOptions` variants (`serve_http_with`, `http_router_with`) for Streamable HTTP (`/mcp`). Bearer-token auth and `Host` and `Origin` validation are configured by the caller; TLS for the listener is provided by `rsigma-cli` when built with `daemon-tls`. |
 
 ## `rstix`
 

@@ -1,3 +1,7 @@
+---
+description: "Give AI agents like Cursor and Claude Code structured Sigma tools with the RSigma MCP server: parse, lint, evaluate, convert, and tune rules as typed calls."
+---
+
 # MCP Server
 
 {{ added "0.16.0" }}
@@ -47,7 +51,7 @@ Either way the client launches `rsigma mcp serve` as a subprocess and talks to i
 
 ## Tool reference
 
-Fifteen Engineer-cycle tools always register. When `--daemon-url` (or `mcp.daemon_url`) points at a running daemon, six Operate-cycle read tools join `tools/list`; `--allow-operate-writes` adds the two mutating tools. Content-bearing Engineer tools accept **either** inline content (`yaml`, `condition`, `events`, `query`) **or** a file `path`, never both. Path arguments resolve against `--rules-dir` when relative (and `tune_rules` and `test_exemplars` path inputs stay confined to that root when it is set). Outputs are JSON with an `ok` flag plus tool-specific fields. Content errors (a rule that fails to parse, a backend that cannot represent a rule, or a daemon that returns non-2xx) come back inside a successful response as `{ "ok": false, ... }` so the agent can read and act on them; only malformed requests return MCP errors.
+Sixteen Engineer-cycle tools always register. When `--daemon-url` (or `mcp.daemon_url`) points at a running daemon, six Operate-cycle read tools join `tools/list`; `--allow-operate-writes` adds the two mutating tools. Content-bearing Engineer tools accept **either** inline content (`yaml`, `condition`, `events`, `query`) **or** a file `path`, never both. Path arguments resolve against `--rules-dir` when relative (and `tune_rules` and `test_exemplars` path inputs stay confined to that root when it is set). Outputs are JSON with an `ok` flag plus tool-specific fields. Content errors (a rule that fails to parse, a backend that cannot represent a rule, or a daemon that returns non-2xx) come back inside a successful response as `{ "ok": false, ... }` so the agent can read and act on them; only malformed requests return MCP errors.
 
 | Tool | Input | Output |
 |------|-------|--------|
@@ -63,6 +67,7 @@ Fifteen Engineer-cycle tools always register. When `--daemon-url` (or `mcp.daemo
 | `resolve_pipeline` | `pipeline` (builtin name or path), `resolve_sources` | Pipeline name, priority, transformation count, dynamic sources. |
 | `list_builtin_pipelines` | (none) | The builtin pipelines (`ecs_windows`, `fibratus_windows`, `sysmon`). |
 | `fix_rules` | `yaml` or file `path`, `lint_rules`, `write` | Applies safe auto-fixes; returns the fixed YAML and applied/failed/skipped-unsafe counts. `write: true` (path only, and only with `--rules-dir`) persists to disk. |
+| `format_rules` | `yaml` or file `path`, `write` | Rewrites Sigma YAML into the canonical layout and returns the formatted YAML and whether it changed. The semantic guard refuses rewrites that would change meaning, and non-Sigma documents come back as `skipped`. `write: true` (path only, and only with `--rules-dir`) persists to disk. {{ added "unreleased" }} |
 | `author_ads` | `yaml` or file/dir `path` | Per rule: the current ADS sections, the required sections missing under the active config, and a `rsigma.ads.*` scaffold to complete. |
 | `tune_rules` | rules (`yaml` or confined file/dir `path`), target `rule`, inline `false_positives` and `true_positives`, optional `pipelines` and tuning bounds | A verified `TuneReport` containing filter YAML, field rationale, clusters, FP coverage, warnings, and before/after counts. |
 | `test_exemplars` | rules (`yaml` or confined file/dir `path`), optional `pipelines` | The shared exemplar report: per-entry expect/actual/pass plus rules with no exemplars. {{ added "0.22.0" }} |
@@ -95,15 +100,15 @@ Three registration tiers:
 
 | Configuration | Tools in `tools/list` |
 |---------------|----------------------|
-| No daemon URL | The 15 Engineer-cycle tools. |
-| `--daemon-url` set | Those 15 plus the six read tools. |
-| `--daemon-url` and `--allow-operate-writes` | Those 21 plus `create_silence` and `post_disposition`. |
+| No daemon URL | The 16 Engineer-cycle tools. |
+| `--daemon-url` set | Those 16 plus the six read tools. |
+| `--daemon-url` and `--allow-operate-writes` | Those 22 plus `create_silence` and `post_disposition`. |
 
 `--allow-operate-writes` mirrors `--allow-sigma-cli`: default off, flag beats config (`mcp.allow_operate_writes`). A daemon running API authentication needs `--daemon-token` (or `RSIGMA_MCP_DAEMON_TOKEN`); the token is flag/env-only. A `reader` token covers the six read tools; an `operator` token adds `silences:write` and `dispositions:write` (and `capture:write` when capture is enabled). 401/403 come back as `{ "ok": false }` with a hint naming the flag and the required permission.
 
 `--daemon-ca <PATH>` adds a PEM root CA for a self-signed daemon TLS listener. Unix-socket daemon URLs are unsupported; use TCP loopback.
 
-`create_silence` refuses an unbounded window: supply `ends_at` (RFC 3339) or `duration` (humantime, converted at call time). An optional client `id` is checked against `GET /api/v1/silences` first so a retried create is a no-op. `post_disposition` requires `fingerprint` or `incident_id` so the disposition store's redelivery key engages; without an identity a retry would double-count.
+`create_silence` refuses an unbounded window: supply `ends_at` (RFC 3339) or `duration` (humantime, converted at call time). The daemon also applies its silence limits, so a window past `max_silence_duration` or a silence without a scoped `=` matcher comes back as `{ "ok": false }` with the daemon's hint. {{ added "unreleased" }} An optional client `id` is checked against `GET /api/v1/silences` first so a retried create is a no-op. `post_disposition` requires `fingerprint` or `incident_id` so the disposition store's redelivery key engages; without an identity a retry would double-count.
 
 A typical triage loop calls `list_incidents` (optionally with `min_level` or `limit`), then `get_incident` or `get_incident_bundle`, then `list_risk_entities` and `get_rule_quality`, then `create_silence` with a TTL and `post_disposition`, and finally `tune_rules` if the verdict is a false positive.
 
@@ -120,7 +125,7 @@ The server exposes read-only MCP resources so an agent can ground itself on the 
 
 ## Enrichment
 
-`evaluate_events` accepts an optional `enrichers` (inline YAML/JSON) or `enrichers_path`. The config follows the daemon's enrichers schema, restricted to `template` enrichers (with kind-aware template namespaces); the matches are enriched before being returned. Because the loader validates the config (including template-namespace checks) and surfaces failures as structured errors, the tool doubles as a template-enricher validator. `command` and `http` enrichers are refused so a tool call cannot run local programs or reach network endpoints, and `lookup` and `stix` enrichers need resources only the daemon has; configure all four on the daemon.
+`evaluate_events` accepts an optional `enrichers` (inline YAML/JSON) or `enrichers_path`. The config follows the daemon's enrichers schema, restricted to `template` enrichers (with kind-aware template namespaces) that use only `${detection.*}` or `${correlation.*}` references; the matches are enriched before being returned. Because the loader validates the config (including template-namespace checks) and surfaces failures as structured errors, the tool doubles as a template-enricher validator. `command` and `http` enrichers are refused so a tool call cannot run local programs or reach network endpoints, and `lookup` and `stix` enrichers need resources only the daemon has; configure all four on the daemon. {{ added "unreleased" }} An enricher with a `${ENV_VAR}` reference in any templated field is refused too, because it would render the server's environment variables (API keys, tokens) into the result returned to the caller.
 
 ### Example calls
 
@@ -216,11 +221,13 @@ rsigma mcp serve --http 127.0.0.1:9100 --rules-dir /path/to/rules
 ```
 
 - **Auth.** `--auth-token <token>` (or `RSIGMA_MCP_AUTH_TOKEN`) requires a static bearer token on every request; requests without `Authorization: Bearer <token>` get `401`. The token is compared in constant time and is flag/env-only (never read from config files).
+- **Auth off loopback.** A non-loopback `--http` bind refuses to start without `--auth-token` unless `--allow-unauthenticated` is set. {{ added "unreleased" }}
+- **Host validation.** Requests whose `Host` header is not accepted get `403`, which stops DNS-rebinding pages from reaching a local server. Loopback binds accept `localhost`, `127.0.0.1`, `::1`, and the bind IP. A non-loopback bind with a token accepts any host unless `--allowed-host` (repeatable) narrows it. A browser request whose `Origin` does not name an accepted host gets `403` as well, so a web page on another site cannot drive a local server. See [`rsigma mcp serve`](../cli/mcp/serve.md#streamable-http) for the full table. {{ added "unreleased" }}
 - **TLS.** `--tls-cert`/`--tls-key` terminate TLS in-process using the same rustls loader as the daemon (requires a build with the `daemon-tls` feature). Alternatively terminate TLS at a sidecar proxy and bind plaintext with `--allow-plaintext`.
 - **Plaintext safety.** Binding plaintext on a non-loopback address is refused unless `--allow-plaintext` is set.
 - **Path confinement.** `--http` refuses to start without `--rules-dir` unless `--allow-unconfined-paths` is set. {{ added "0.25.0" }}
 
-The `--http`, `--lint-config`, `--rules-dir`, `--allow-unconfined-paths`, `--daemon-url`, `--daemon-ca`, and `--allow-operate-writes` settings also resolve from the layered config (`mcp` section) and the `RSIGMA_MCP__*` environment layer (for example `RSIGMA_MCP__HTTP_ADDR=127.0.0.1:9100`); the MCP HTTP auth token and the daemon token stay flag/env-only.
+The `--http`, `--lint-config`, `--rules-dir`, `--allow-unconfined-paths`, `--allow-sigma-cli`, `--daemon-url`, `--daemon-ca`, and `--allow-operate-writes` settings also resolve from the layered config (`mcp` section) and the `RSIGMA_MCP__*` environment layer (for example `RSIGMA_MCP__HTTP_ADDR=127.0.0.1:9100`); the MCP HTTP auth token and the daemon token stay flag/env-only. {{ added "unreleased" }} A project file (`./rsigma.yaml` or `.rsigmarc`) cannot set `mcp.http_addr`, `mcp.allow_unconfined_paths`, `mcp.allow_sigma_cli`, `mcp.daemon_url`, `mcp.daemon_ca`, `mcp.allow_operate_writes`, or a `mcp.rules_dir` or `mcp.lint_config` outside the project, so opening an agent in a cloned repository cannot turn these on. Set them with flags, `RSIGMA_MCP__*` environment variables, the user or system config, or an explicit `--config <PATH>` (see [Project config trust](../reference/configuration.md#project-config-trust)).
 
 ## See also
 

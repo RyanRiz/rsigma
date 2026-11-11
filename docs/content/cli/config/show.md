@@ -1,3 +1,7 @@
+---
+description: "Reference for rsigma config show: print the effective rsigma configuration after merging every layer, annotated with the layer each value came from."
+---
+
 # `rsigma config show`
 
 {{ added "0.14.0" }}
@@ -18,7 +22,7 @@ Resolves the config the same way `engine daemon` and `engine eval` do at startup
 2. discovered config files (system → user → `.rsigmarc` → `./rsigma.yaml`, or `--config`)
 3. the `RSIGMA_*` environment layer
 
-into a single tree, and reports the winning layer for every leaf. To inspect what a specific live invocation would resolve to, including the flag layer, use `--dry-run` on `engine daemon` or `engine eval` instead.
+into a single tree, and reports the winning layer for every leaf. Security-sensitive keys set in a project file are left out of the tree, as they are at startup, and each one prints a warning on stderr (see [Project config trust](../../reference/configuration.md#project-config-trust)). {{ added "unreleased" }} To inspect what a specific live invocation would resolve to, including the flag layer, use `--dry-run` on `engine daemon` or `engine eval` instead.
 
 ## Flags
 
@@ -51,9 +55,12 @@ An envelope that pairs the resolved tree with the per-leaf source map.
   },
   "sources": {
     "daemon.api.addr": "file"
-  }
+  },
+  "ignored_keys": []
 }
 ```
+
+`ignored_keys` {{ added "unreleased" }} lists the protected keys dropped from project files as `{ "file", "key" }` objects. JSON mode prints no stderr warning for them.
 
 ### YAML mode
 
