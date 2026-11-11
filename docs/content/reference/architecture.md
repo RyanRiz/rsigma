@@ -1,3 +1,7 @@
+---
+description: "RSigma architecture: the crate map of the Rust workspace, the execution shapes of eval and daemon, and how parsing, evaluation, and I/O fit together."
+---
+
 # Architecture
 
 RSigma is a workspace of nine crates organised around one principle: rule processing and event evaluation are pure library code; everything I/O-bound or runtime-shaped is layered on top. This page documents the crate map, the execution shapes, and how the pieces interact at runtime.
@@ -90,7 +94,7 @@ PostgreSQL/TimescaleDB, LynxDB, and Fibratus (rule YAML for Windows EDR sensors)
 
 ### Plus: MCP
 
-`rsigma-mcp` exposes the toolchain to MCP-aware agents (Cursor, Claude Code, ...) over stdio, and over Streamable HTTP (with bearer-token auth) behind the `http` feature. TLS for the HTTP listener is provided by `rsigma-cli` when built with `daemon-tls` (`--tls-cert`/`--tls-key` on `mcp serve`). The `RsigmaMcp` handler wraps `rsigma-parser`, `rsigma-eval`, `rsigma-convert`, and `rsigma-runtime` behind 15 Engineer-cycle tools (parse, lint, fix, validate, evaluate, convert, reverse-convert, tune, test exemplars, list backends and fields, resolve and list pipelines, and author ADS metadata) and 4 resources (the lint catalogue, the ADS schema, the modifier reference, and MITRE tactics), returning structured JSON. Point `--daemon-url` at a running daemon to add the Operate-cycle tools (incidents, risk, silences, dispositions); `--allow-operate-writes` is required for the two mutating tools. It is driven by `rsigma mcp serve`. See the [MCP server guide](../guide/mcp-server.md).
+`rsigma-mcp` exposes the toolchain to MCP-aware agents (Cursor, Claude Code, ...) over stdio, and over Streamable HTTP (with bearer-token auth) behind the `http` feature. TLS for the HTTP listener is provided by `rsigma-cli` when built with `daemon-tls` (`--tls-cert`/`--tls-key` on `mcp serve`). The `RsigmaMcp` handler wraps `rsigma-parser`, `rsigma-eval`, `rsigma-convert`, and `rsigma-runtime` behind 16 Engineer-cycle tools (parse, lint, fix, format, validate, evaluate, convert, reverse-convert, tune, test exemplars, list backends and fields, resolve and list pipelines, and author ADS metadata) and 4 resources (the lint catalogue, the ADS schema, the modifier reference, and MITRE tactics), returning structured JSON. Point `--daemon-url` at a running daemon to add the Operate-cycle tools (incidents, risk, silences, dispositions); `--allow-operate-writes` is required for the two mutating tools. It is driven by `rsigma mcp serve`. See the [MCP server guide](../guide/mcp-server.md).
 
 ## Data flow
 

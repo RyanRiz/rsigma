@@ -1,3 +1,7 @@
+---
+description: "Map Sigma rule fields to your log schema with pySigma-compatible processing pipelines in RSigma: static, builtin ECS and Sysmon, and dynamic pipelines."
+---
+
 # Processing Pipelines
 
 Processing pipelines are RSigma's mechanism for transforming Sigma rules before they reach the engine or a backend. They handle the impedance mismatch between how Sigma rules name fields (`CommandLine`, `EventID`, `User`) and how your events actually name fields (`process.command_line`, `winlog.event_id`, `actor.user.name`). Pipelines are pySigma-compatible, so anything you write for pySigma works in RSigma, and most pipelines from the SigmaHQ pySigma backends work as well.
@@ -52,11 +56,14 @@ Pass `-p NAME_OR_PATH` to any subcommand that accepts pipelines (`engine eval`, 
 ```bash
 rsigma engine eval -r rules/ -p ecs_windows -e @events.ndjson
 rsigma engine daemon -r rules/ -p ecs_windows -p custom-mappings.yml
+rsigma engine eval -r rules/ -p crates/rsigma-eval/pipelines/ecs_linux.yml -e @linux-events.ndjson
 rsigma backend convert rules/ -t postgres -p crates/rsigma-convert/pipelines/ocsf_postgres.yml
 rsigma rule validate rules/ -p sysmon
 ```
 
 The argument is first checked against [builtin pipelines](#builtin-pipelines). If no match, it is treated as a file path. Multiple pipelines are sorted by `priority` and applied in sequence.
+
+Shipped path-only YAML under [`crates/rsigma-eval/pipelines/`](https://github.com/timescale/rsigma/tree/main/crates/rsigma-eval/pipelines) includes [`gcp_audit.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/gcp_audit.yml) and [`ecs_linux.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/ecs_linux.yml). Pass the file path; there is no builtin short name until one is registered in `builtin_names()`. See [Builtin Pipelines](../reference/builtin-pipelines.md). {{ added "unreleased" }}
 
 ## Builtin pipelines
 

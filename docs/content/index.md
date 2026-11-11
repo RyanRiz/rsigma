@@ -1,4 +1,10 @@
-# Welcome to RSigma's documentation!
+---
+title: "RSigma: Sigma Detection Engineering Toolkit in Rust"
+titleAppend: false
+description: "RSigma is a Rust toolkit for Sigma detection rules: parse, lint, evaluate, correlate, and convert rules, and run a streaming detection daemon from one binary."
+---
+
+# RSigma: Sigma Detection Engineering Toolkit in Rust
 
 RSigma is a [Sigma](https://sigmahq.io/) detection engineering toolkit: parser, linter, evaluator, correlation engine, conversion framework, streaming daemon, and MCP and LSP servers. It builds on open standards: Sigma for detection rules, [OpenTelemetry](https://opentelemetry.io/) for log ingestion and detection export, and [STIX](https://oasis-open.github.io/cti-documentation/stix/intro) and [TAXII](https://oasis-open.github.io/cti-documentation/taxii/intro) for threat intelligence.
 
@@ -100,6 +106,12 @@ RSigma combines pySigma-style conversion with a streaming evaluator in one self-
 | [Sheut](https://github.com/PerceptraHQ/sheut-community) | MPL-2.0 | Local-first cyber threat intelligence workbench using RSigma for STIX 2.1 validation and interchange |
 | [Sigmacatch](https://github.com/frack113/sigmacatch) | MIT | Captures live Windows Event Log events, matches them with RSigma, and writes SigmaHQ-ready regression data |
 | [Sluice](https://github.com/Dr1nS0menOp/SLUICE) | AGPL-3.0 | Writes Vector configurations that cut SIEM ingest, using RSigma to prove on real traffic that Sigma rules raise the same alerts, correlations included |
+
+## Watch the talks
+
+| Event | Talk | Topic | Materials |
+|-------|------|-------|-----------|
+| Linux Security Summit Europe 2026 | [Detection Engineering with RSigma](https://lsseu2026.sched.com/event/2WHc4) | One Linux detection from auditd and Tetragon telemetry through normalization, portable Sigma evaluation, stateful correlation, fixture-based testing, and deployment | [Video](https://www.youtube.com/watch?v=cqeYdA39qv0), [slides](https://hosted-files.sched.co/lsseu2026/d0/talk.pdf), [demo and materials](https://github.com/mostafa/rsigma-lss-eu-2026-talk) |
 
 ## Read the deep dives
 

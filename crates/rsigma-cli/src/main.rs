@@ -23,10 +23,10 @@ use std::process;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use commands::{
     BacktestArgs, ClassifyArgs, ConditionArgs, ConvertArgs, CoverageArgs, DiscoverArgs, DocArgs,
-    DraftArgs, EvalArgs, ExplainArgs, FieldsArgs, HuntCommands, HygieneArgs, LintArgs, LintCounts,
-    ListFormatsArgs, MigrateSourcesArgs, ParseArgs, PipelineDiffArgs, ReverseArgs, ScorecardArgs,
-    StatusArgs, StdinArgs, TailArgs, TapArgs, TestArgs, TuneArgs, ValidateArgs, VisibilityArgs,
-    dispatch_hunt,
+    DraftArgs, EvalArgs, ExplainArgs, FieldsArgs, FmtArgs, HuntCommands, HygieneArgs, LintArgs,
+    LintCounts, ListFormatsArgs, MigrateSourcesArgs, ParseArgs, PipelineDiffArgs, ReverseArgs,
+    ScorecardArgs, StatusArgs, StdinArgs, TailArgs, TapArgs, TestArgs, TuneArgs, ValidateArgs,
+    VisibilityArgs, dispatch_hunt,
 };
 // `pipeline resolve` resolves dynamic sources, which needs the async runtime
 // (tokio) and the source resolver from rsigma-runtime. Both ship with the
@@ -222,6 +222,9 @@ enum RuleCommands {
 
     /// Lint Sigma rules against the specification
     Lint(LintArgs),
+
+    /// Format Sigma rules into the canonical layout, keeping comments
+    Fmt(FmtArgs),
 
     /// List all fields referenced by Sigma rules
     Fields(FieldsArgs),
@@ -433,6 +436,10 @@ fn dispatch_rule(cmd: RuleCommands, matches: &ArgMatches, ctx: output::OutputCtx
         RuleCommands::Parse(args) => commands::cmd_parse(args, ctx),
         RuleCommands::Validate(args) => commands::cmd_validate(args, ctx),
         RuleCommands::Lint(args) => run_lint(args, ctx),
+        RuleCommands::Fmt(args) => {
+            let code = commands::cmd_fmt(args, ctx);
+            process::exit(code);
+        }
         RuleCommands::Fields(args) => commands::cmd_fields(args, ctx),
         RuleCommands::Draft(args) => commands::cmd_draft(args, ctx),
         RuleCommands::Tune(args) => commands::cmd_tune(args, ctx),
@@ -781,33 +788,40 @@ pub(crate) enum EventFilter {
     JsonPath(JsonPath),
 }
 
+/// Compile a jq event filter. The `env` builtin is left out, so a filter from
+/// a project config file cannot copy the process environment into events.
+fn compile_jq_filter(jq_expr: &str) -> Result<CompiledJqFilter, String> {
+    let program = File {
+        code: jq_expr,
+        path: (),
+    };
+    let defs = jaq_core::defs()
+        .chain(jaq_std::defs())
+        .chain(jaq_json::defs());
+    let funs = jaq_core::funs()
+        .chain(jaq_std::funs().filter(|fun| fun.0 != "env"))
+        .chain(jaq_json::funs());
+    let arena = Arena::default();
+    let modules = Loader::new(defs)
+        .load(&arena, program)
+        .map_err(|e| format!("Invalid jq filter '{jq_expr}': {} module error(s)", e.len()))?;
+    Compiler::default()
+        .with_funs(funs)
+        .compile(modules)
+        .map_err(|e| format!("jq compilation errors ({} error(s))", e.len()))
+}
+
 /// Build an `EventFilter` from CLI arguments. Exits on parse errors.
 pub(crate) fn build_event_filter(jq: Option<String>, jsonpath: Option<String>) -> EventFilter {
     if let Some(jq_expr) = jq {
         eprintln!("Event filter: jq '{jq_expr}'");
-        let program = File {
-            code: jq_expr.as_str(),
-            path: (),
-        };
-        let defs = jaq_core::defs()
-            .chain(jaq_std::defs())
-            .chain(jaq_json::defs());
-        let funs = jaq_core::funs()
-            .chain(jaq_std::funs())
-            .chain(jaq_json::funs());
-        let arena = Arena::default();
-        let modules = Loader::new(defs).load(&arena, program).unwrap_or_else(|e| {
-            eprintln!("Invalid jq filter '{jq_expr}': {} module error(s)", e.len());
-            process::exit(exit_code::CONFIG_ERROR);
-        });
-        let filter = Compiler::default()
-            .with_funs(funs)
-            .compile(modules)
-            .unwrap_or_else(|e| {
-                eprintln!("jq compilation errors ({} error(s))", e.len());
+        match compile_jq_filter(&jq_expr) {
+            Ok(filter) => EventFilter::Jq(filter),
+            Err(e) => {
+                eprintln!("{e}");
                 process::exit(exit_code::CONFIG_ERROR);
-            });
-        EventFilter::Jq(filter)
+            }
+        }
     } else if let Some(jp_expr) = jsonpath {
         eprintln!("Event filter: jsonpath '{jp_expr}'");
         match JsonPath::parse(&jp_expr) {

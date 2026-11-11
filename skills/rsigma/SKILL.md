@@ -1,6 +1,6 @@
 ---
 name: rsigma
-description: "Use the rsigma CLI and MCP server: engine eval, engine daemon, rule lint, rule draft, rule tune, rule backtest, backend convert, mcp serve. Prefer MCP tools when rsigma mcp serve is connected. For authoring Sigma YAML (detection, correlation, filters, pipelines, modifiers), use the sigma-rules skill. Use this skill whenever the user mentions rsigma, evaluating or linting Sigma rules, converting rules to a SIEM query, running a detection daemon, drafting or tuning rules from events, or backtesting a ruleset, even if they do not name the binary."
+description: "Use the rsigma CLI and MCP server: engine eval, engine daemon, rule lint, rule fmt, rule draft, rule tune, rule backtest, backend convert, mcp serve. Prefer MCP tools when rsigma mcp serve is connected. For authoring Sigma YAML (detection, correlation, filters, pipelines, modifiers), use the sigma-rules skill. Use this skill whenever the user mentions rsigma, evaluating or linting Sigma rules, converting rules to a SIEM query, running a detection daemon, drafting or tuning rules from events, or backtesting a ruleset, even if they do not name the binary."
 ---
 
 # rsigma
@@ -45,13 +45,13 @@ Start a local server only when the user wants the agent wired up:
 rsigma mcp serve --rules-dir rules/
 ```
 
-Always pass `--rules-dir`. Without it, path arguments are unconfined, `fix_rules` cannot write, and `--http` refuses to start.
+Always pass `--rules-dir`. Without it, path arguments are unconfined, `fix_rules` and `format_rules` cannot write, and `--http` refuses to start. A non-loopback `--http` bind also needs `--auth-token`.
 
-Point `--daemon-url` at a running daemon when the task is live triage (incidents, silences, dispositions). Those tools stay off until that URL is set. Writes stay behind `--allow-operate-writes`. Details: [MCP server guide](https://rsigma.io/guide/mcp-server/).
+Point `--daemon-url` at a running daemon when the task is live triage (incidents, silences, dispositions). Those tools stay off until that URL is set. Writes stay behind `--allow-operate-writes`. A repository's `./rsigma.yaml` or `.rsigmarc` cannot turn these gates on; they come from flags, the user config, or `--config`. Details: [MCP server guide](https://rsigma.io/guide/mcp-server/).
 
 ## Which command
 
-- One-shot check against a file or a few events: `engine eval`. A long-running process with reload, metrics, and sinks: `engine daemon`.
+- One-shot check against a file or a few events: `engine eval`. A long-running process with reload, metrics, and sinks: `engine daemon`. Pass the daemon's config with `--config`: a discovered `./rsigma.yaml` or `.rsigmarc` cannot set its sources, enrichers, sinks, or API auth.
 - A rule from exemplar events (optional baseline, or `--groups` for a temporal correlation): `rule draft`. A rule the user already described in words: write the YAML with sigma-rules, then lint and evaluate it here.
 - A noisy rule with known false positives and true positives that must still fire: `rule tune`.
 - Embedded `rsigma.exemplars`: `rule test`. A separate corpus and expectations file: `rule backtest`.

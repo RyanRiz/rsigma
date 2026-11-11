@@ -123,7 +123,7 @@ Point the daemon at the same directory with **`--stix-store`** and a `type: stix
 
 ### `config`: YAML configuration
 
-Both `engine daemon` and `engine eval` accept their settings via a YAML config file in addition to CLI flags and environment variables. Precedence is **CLI flag > env > project file > user file > system file > compiled default**, applied per leaf (a project `.rsigmarc` that only sets `eval.rules` does not erase the rest of the user config).
+Both `engine daemon` and `engine eval` accept their settings via a YAML config file in addition to CLI flags and environment variables. Precedence is **CLI flag > env > project file > user file > system file > compiled default**, applied per leaf (a project `.rsigmarc` that only sets `eval.rules` does not erase the rest of the user config). Project files cannot set security-sensitive keys such as `mcp.daemon_url` or `mcp.allow_operate_writes`; those are ignored with a warning and read only from `--config`, the user or system config, the environment, or flags. See [Project config trust](https://rsigma.io/reference/configuration/#project-config-trust).
 
 ```bash
 # Scaffold a commented template at ./rsigma.yaml.
@@ -147,7 +147,7 @@ rsigma config reload
 
 `engine daemon`, `engine eval`, `rule backtest`, `rule coverage`, `rule scorecard`, `rule visibility`, `rule doc`, and `rule hygiene` also support `--config <PATH>` (load only that file) and `--dry-run` (print the effective section and exit `0`).
 
-Discovery walks: `/etc/rsigma/config.yaml` → `~/.config/rsigma/config.yaml` → nearest `.rsigmarc` (walked up from CWD) → `./rsigma.yaml`. Override with `--config`. The full schema, environment-variable scheme (`RSIGMA_<SECTION>__<KEY>`), and secrets policy live in the [Configuration Reference](https://rsigma.io/reference/configuration/).
+Discovery walks: `/etc/rsigma/config.yaml` → `~/.config/rsigma/config.yaml` → nearest `.rsigmarc` (walked up from CWD) → `./rsigma.yaml`. Override with `--config`. The project files (`.rsigmarc` and `./rsigma.yaml`) cannot set security-sensitive keys such as `daemon.enrichers`, `daemon.output.sinks`, `daemon.api.auth`, or `mcp.daemon_url`; rsigma ignores them with a warning, and they resolve from `--config`, the user or system file, environment variables, or flags. The full schema, environment-variable scheme (`RSIGMA_<SECTION>__<KEY>`), and secrets policy live in the [Configuration Reference](https://rsigma.io/reference/configuration/).
 
 ### `rule parse`: Parse a single rule
 
@@ -225,6 +225,28 @@ Checked N file(s): X passed, Y failed (A error(s), B warning(s), C info(s))
 ```
 
 **Schema validation skips** documents with `action: global`, `action: reset`, or `action: repeat` (action fragments).
+
+### `rule fmt`: Format rules into the canonical layout
+
+Rewrite rule files into rsigma's canonical layout while keeping comments, anchors, aliases, tags, and directives. The formatter runs a semantic guard before returning changed text and refuses any rewrite that would change what a rule means.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `paths` | positional | current directory | Rule files or directories. Directories are walked recursively for `*.yml` and `*.yaml`. |
+| `--check` | flag | `false` | Report files that would change and exit `1` if any would be reformatted |
+| `--diff` | flag | `false` | Print a unified diff for each file that would change and exit `1` if any would be reformatted |
+| `--write` | flag | `false` | Rewrite files in place with an atomic rename |
+| `--stdout` | flag | `false` | Print the formatted text of exactly one file |
+
+```bash
+rsigma rule fmt rules/                         # report files that are not canonical
+rsigma rule fmt --check rules/                 # CI gate: exit 1 when a file would change
+rsigma rule fmt --diff rules/whoami.yml        # review the rewrite before applying it
+rsigma rule fmt --write rules/                 # apply the canonical layout
+rsigma rule fmt --stdout rules/whoami.yml      # format one file to stdout
+```
+
+`--write` cannot be combined with `--check`, `--diff`, or `--stdout`; `--stdout` cannot be combined with `--check` or `--diff` and needs exactly one file path. Files that are not Sigma documents are skipped. See the [Formatting Rules guide](https://rsigma.io/guide/formatting-rules/) for the canonical style and the constructs the formatter refuses.
 
 ### `mcp serve`: Run the MCP server for AI agents
 
@@ -1407,7 +1429,7 @@ enrichers:
 
 Every enricher declares a `kind: detection | correlation`. The kind drives two checks:
 
-1. **Config-load-time template validation.** A `kind: detection` enricher may only reference `${detection.*}` variables in its templated fields (`url`, `template`, `headers`, `body`, `command`, `env`, `extract`); a `kind: correlation` enricher may only reference `${correlation.*}`. Cross-namespace references are rejected at startup with a clear error pointing at the offending field. `${ENV_VAR}` is allowed in both namespaces.
+1. **Config-load-time template validation.** A `kind: detection` enricher may only reference `${detection.*}` variables in its templated fields (`url`, `template`, `headers`, `body`, `command`, `env`, `extract`); a `kind: correlation` enricher may only reference `${correlation.*}`. Cross-namespace references are rejected at startup with a clear error pointing at the offending field. `${ENV_VAR}` is allowed in both namespaces, except in enrichers passed to the MCP server's `evaluate_events` tool, which refuses them so a caller cannot read the server's environment.
 2. **Runtime body matching.** The pipeline skips enrichers whose declared kind does not match the current `EvaluationResult` body variant before invoking `enrich()`, so a detection-kind enricher pays no cost on correlation results and vice versa.
 
 Detection variables (`${detection.*}`):

@@ -1,3 +1,7 @@
+---
+description: "Troubleshoot RSigma by symptom: missing commands or flags, daemon startup failures, rules that do not match, correlations that never fire, and API 401 errors."
+---
+
 # Troubleshooting
 
 Common problems, organized by what you see. Each entry names the message to look for, the cause, and the fix.
@@ -143,6 +147,8 @@ daemon.api.addr = 0.0.0.0:9090  (default)
 ```
 
 `--config <PATH>` replaces the discovery chain with a single file, and `rsigma engine daemon --dry-run` prints the effective daemon section without starting anything. See [Configuration File](../reference/configuration.md).
+
+A project file cannot set security-sensitive keys such as `daemon.enrichers`, `daemon.output.sinks`, or `mcp.daemon_url`. When it tries, stderr shows `warning: ignoring '<key>' from project config <path>` and the value comes from another layer. Move the key to the user config, or pass the file with `--config`. See [Project config trust](../reference/configuration.md#project-config-trust).
 
 ## Still stuck
 

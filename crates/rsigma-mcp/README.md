@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
 | `resolve_pipeline` | Inspect a builtin or file pipeline; optionally resolve dynamic sources. |
 | `list_builtin_pipelines` | List the builtin pipelines. |
 | `fix_rules` | Apply safe auto-fixes to Sigma YAML; `write: true` (path only, and only with a rules root) persists to disk. |
+| `format_rules` | Rewrite Sigma YAML into the canonical layout; `write: true` (path only, and only with a rules root) persists to disk. |
 | `author_ads` | Report each rule's ADS sections, the required sections missing under the active config, and a `rsigma.ads.*` scaffold to complete. |
 | `reverse_convert` | Reverse-convert a SIEM query (`dialect: lucene` today) into a draft Sigma rule (YAML); takes the metadata and logsource a query cannot carry as parameters. |
 | `tune_rules` | Propose a verified Sigma filter from inline false-positive and true-positive event arrays; path inputs and pipeline files are confined to `--rules-dir`. |
@@ -77,7 +78,8 @@ Four read-only resources expose reference data: `rsigma://lint/catalogue` (92 en
 - Built on [`rmcp`](https://crates.io/crates/rmcp) 3.0 (the official Rust MCP SDK).
 - `RsigmaMcp` is the cloneable handler; the tool methods are thin wrappers over the underlying rsigma crates.
 - The CLI owns the tokio runtime entry point (`serve_stdio`), mirroring how the daemon is wired.
-- `--rules-dir` confines every path argument (`path`, `events_path`, `enrichers_path`, file-based `pipelines`): paths that leave it through an absolute path, `../`, or a symlink are refused, as are directory inputs containing symlinks. `evaluate_events` only builds `template` enrichers; `command`, `http`, `lookup`, and `stix` are refused.
+- With the `http` feature, `http_router_with` and `serve_http_with` take `HttpOptions` (bearer token and `AllowedHosts` for `Host` and `Origin` validation). `http_router` and `serve_http` keep the loopback host list. The CLI refuses a non-loopback bind without a token unless `--allow-unauthenticated` is set.
+- `--rules-dir` confines every path argument (`path`, `events_path`, `enrichers_path`, file-based `pipelines`): paths that leave it through an absolute path, `../`, or a symlink are refused, as are directory inputs containing symlinks. `evaluate_events` only builds `template` enrichers, and refuses templates that reference `${ENV_VAR}` so a caller cannot read the server's environment; `command`, `http`, `lookup`, and `stix` are refused.
 - sigma-cli delegation is opt-in (`--allow-sigma-cli`) and hardened: `path` and file-based pipeline inputs are confined to `--rules-dir` when set, inline YAML is staged to a temp file, the subprocess is killed after 60s, and at most two delegations run concurrently.
 - Operate-cycle tools are opt-in (`--daemon-url`, plus `--allow-operate-writes` for mutations). The daemon token is flag/env-only (`--daemon-token` / `RSIGMA_MCP_DAEMON_TOKEN`).
 
