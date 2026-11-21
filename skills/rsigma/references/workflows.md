@@ -8,10 +8,10 @@ Author Sigma YAML with the sigma-rules skill. Use the steps below to check and r
 
 Prefer the MCP tool when `rsigma mcp serve` is connected. Otherwise use the CLI.
 
-1. **Draft.** Hand-authored YAML (sigma-rules), `rule draft` from exemplar events, or `reverse_convert` / `rule reverse` from a Lucene query, which needs at least one logsource product, category, or service. Call `parse_rule` (or `rule parse`) and stop if the rule is invalid. Parse errors cover a missing logsource, conflicting modifiers, values of the wrong type, invalid regexes, and undefined detections, and each names the field.
+1. **Draft.** Hand-authored YAML (sigma-rules), `rule draft` from exemplar events, `rule draft --from-stix` from a STIX 2.1 bundle (needs the `stix-draft` feature; flags are on [rule draft](https://rsigma.io/cli/rule/draft/#draft-from-a-stix-indicator)), or `reverse_convert` / `rule reverse` from a Lucene query, which needs at least one logsource product, category, or service. Call `parse_rule` (or `rule parse`) and stop if the rule is invalid. Parse errors cover a missing logsource, conflicting modifiers, values of the wrong type, invalid regexes, and undefined detections, and each names the field.
 2. **Lint.** `lint_rules` or `rule lint`. Each finding has a rule id and a `fixable` flag. Apply a known-safe fix with `fix_rules` or `rule lint --fix`. Rewrite the rest by hand. Do not treat a count of checks as stable. The catalogue is the [linting guide](https://rsigma.io/guide/linting-rules/).
 3. **Format.** `format_rules` or `rule fmt --write` rewrites the file into the canonical layout and keeps comments. Run `format_rules` or `rule fmt --check` in CI. The formatter refuses any rewrite that would change what the rule means. Guide: [Formatting Rules](https://rsigma.io/guide/formatting-rules/).
-4. **Evaluate.** `evaluate_events` or `engine eval` against a few positive and negative events. `match_detail` of `summary` or `full` explains why an event matched. When the events live on the rule as `rsigma.exemplars`, `test_exemplars` or `rule test` is the closed runner.
+4. **Evaluate.** `evaluate_events` or `engine eval` against a few positive and negative events. Pass the schema pipeline when the events are not Sysmon-shaped (see [Match the event schema](../SKILL.md#match-the-event-schema)). `match_detail` of `summary` or `full` explains why an event matched. When the events live on the rule as `rsigma.exemplars`, `test_exemplars` or `rule test` is the closed runner.
    Correlation inputs do not produce standalone output by default, including a correlation that feeds another correlation. Set top-level `generate: true` on the referencing correlation or pass `--emit-detections` when those matches are needed.
 5. **Tune.** For a noisy rule, `tune_rules` or `rule tune` with classified false positives and a true-positive set that must still fire. Review the returned filter before writing it.
    Target filters by rule `id` or `name`, not title. Selector patterns in a filter condition refer only to that filter's own detection items.
@@ -23,22 +23,52 @@ Guide: [MCP server](https://rsigma.io/guide/mcp-server/).
 
 ## Eval versus daemon
 
-`engine eval` reads a fixed input and exits. Use it to test a rule.
+`engine eval` reads a fixed input and exits. Use it to test a rule. Repeat `--ruleset a --ruleset b` to compare two curations over one event file; each result carries its ruleset name, and `--stats` reports per-ruleset matches and skipped events. Use `daemon.rulesets` or `eval.rulesets` for schema-bound `when` entries.
 
 `engine daemon` stays up, reloads rules, and exposes health and metrics. Use it when events are a stream. It needs the `daemon` feature. NATS input also needs `daemon-nats`, and OTLP logs arrive on `/v1/logs` on the API address with `daemon-otlp`, not through `--input`. Release binaries include all three; a `cargo install rsigma` build has only `daemon`.
 
 The API binds `0.0.0.0:9090` by default, and a non-loopback address refuses to start unless it has TLS (or `--allow-plaintext`) and authentication (`--api-token-env`, `--tls-client-ca`, or `--allow-unauthenticated`). For local work pass `--api-addr 127.0.0.1:9090`, which needs neither. See [Daemon network exposure](https://rsigma.io/reference/security/#daemon-network-exposure).
 
+A rule that fails to parse is skipped and counted on the `rsigma_rule_parse_errors` gauge. A load in which every rule fails is refused: at startup the daemon exits `2`, and a refused reload keeps the current rules. Pass `--strict-rules` in deployments and CI to refuse any load with a parse error, so a broken rule cannot drop out unnoticed.
+
+Enrichers add context to each result after evaluation (`--enrichers`): `template`, `lookup` from a dynamic source, `http`, `command`, `stix` from a local store filled by `rsigma taxii`, and `mmdb` for IP lookups in a MaxMind-format database. The MCP `evaluate_events` tool accepts enrichers too, but refuses `${ENV_VAR}` references in templates. Guide: [Enrichers](https://rsigma.io/guide/enrichers/).
+
 Guide: [Evaluating rules](https://rsigma.io/guide/evaluating-rules/), [Streaming detection](https://rsigma.io/guide/streaming-detection/).
 
 ## Draft versus a rule you already know
 
-`rule draft` proposes a detection from exemplar events, optionally contrasted with a baseline. `rule draft --groups` proposes a temporal correlation from grouped, timed exemplars. Use draft when the user has events and wants a rule inferred from them.
+`rule draft` proposes a detection from exemplar events, optionally contrasted with a baseline. `rule draft --groups` proposes a temporal correlation from grouped, timed exemplars. `rule draft --from-stix` proposes one rule per logsource from a STIX 2.1 bundle. Use draft when the user has events or indicators and wants a rule inferred from them.
 
 When the user describes the behavior in words, write the YAML with sigma-rules. Then run the loop above. Do not ask draft to invent a rule from a sentence.
 
 Guide: [Rule drafting](https://rsigma.io/guide/rule-drafting/).
 
+## Hunt the archive for exemplars
+
+`hunt run -t postgres` converts detection rules, runs them read-only against a PostgreSQL archive within a `--since` and `--until` window, and writes the matching rows as NDJSON events. Run it with `--emit sql` first to review the queries without connecting. Pass the DSN through `RSIGMA_HUNT_DSN` rather than `--dsn` so the password stays out of the shell history.
+
+The output feeds `rule draft -e @file`, `rule tune --tp @file`, and `rule backtest --corpus file`. Its events carry the archive's native field names, so do not apply the mapping pipeline to them again. Correlation rules and other targets are refused; use `backend convert` for those. The per-rule `--limit` truncates output, and stderr says when it did. Guide: [Hunting in the Archive](https://rsigma.io/guide/hunting/).
+
+## Curate a vendored rule set
+
+When rules are vendored rather than authored in the repository, declare a ruleset in `rsigma.yaml` instead of editing the vendor files:
+
+1. **Inspect.** `ruleset list` shows every declared ruleset and whether it resolves. `ruleset show <NAME> --all` shows the decisions, origins, reasons, and applied overlays.
+2. **Resolve.** Use `--ruleset <NAME>` with `engine eval`, `rule validate`, `rule test`, `rule backtest`, `rule coverage`, `rule visibility`, `rule hygiene`, `engine explain`, `rule fields`, `rule tune`, `rule doc`, `backend convert`, `pipeline diff`, or `hunt run`. On MCP, the `ruleset` input is accepted by `validate_rules`, `evaluate_events`, `list_fields`, `convert_rules`, and `test_exemplars`.
+3. **Build.** `ruleset build <NAME> -o <DIR>` writes canonical YAML and a lockfile. Load the output with `engine daemon --rules <DIR>`. `ruleset diff <NAME> --lock <DIR>/ruleset.lock.json --fail-on-change` gates CI.
+
+Overlays can add exemplars, ADS prose, and metadata without editing the vendor rule. `rule test --ruleset` replays the overlaid exemplars. Guide: [Rulesets](https://rsigma.io/guide/rulesets/).
+
+## Review a rule set
+
+- `rule coverage` maps rules onto ATT&CK, exports a Navigator layer, and reports gaps against Atomic Red Team, the SigmaHQ baseline, or a target technique list.
+- `rule scorecard` joins a `rule backtest` JSON report and a `rule coverage` JSON report, plus optional Prometheus and triage inputs, into a keep, tune, or retire verdict for each rule.
+- `rule hygiene` flags silent, noisy, untagged, ownerless, and deprecated rules as retirement candidates.
+- `rule visibility` scores telemetry visibility and exports DeTT&CT data and a Navigator visibility layer.
+- `rule doc` (`author_ads` on MCP) reports the ADS sections a rule is missing and scaffolds them.
+
+Guides: [ATT&CK coverage](https://rsigma.io/guide/attack-coverage/), [Detection scorecard](https://rsigma.io/guide/detection-scorecard/), [Rule hygiene](https://rsigma.io/guide/rule-hygiene/).
+
 ## Convert
 
-Native versus delegated targets are in the Convert section of [SKILL.md](../SKILL.md#convert). When delegation fails, read the error. If `sigma` could not be found or executed, install sigma-cli or set `RSIGMA_SIGMA_CLI`. If sigma-cli rejects the target, install that backend plugin (`sigma plugin install <name>`), then check `rsigma backend targets`.
+For repeatable multi-target exports, put the rulesets and targets in the `convert:` section of `rsigma.yaml` and run `rsigma backend build`. It writes each group's queries and a manifest, and `--check` reports drift without writing. Native versus delegated targets are in the Convert section of [SKILL.md](../SKILL.md#convert). When delegation fails, read the error. If `sigma` could not be found or executed, install sigma-cli or set `RSIGMA_SIGMA_CLI`. If sigma-cli rejects the target, install that backend plugin (`sigma plugin install <name>`), then check `rsigma backend targets`.

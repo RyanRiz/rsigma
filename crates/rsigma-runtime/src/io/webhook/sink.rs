@@ -11,7 +11,8 @@ use rsigma_eval::{EvaluationResult, ProcessResult};
 
 use crate::enrichment::{
     HttpEnricherClient, render_incident_template, render_incident_template_json,
-    render_incident_template_url, render_template, render_template_json, render_template_url,
+    render_incident_template_url, render_template, render_template_json_with_ocsf,
+    render_template_url,
 };
 use crate::error::RuntimeError;
 use crate::io::DeliveryContext;
@@ -105,6 +106,7 @@ pub struct WebhookSink {
     /// Optional HMAC request signer. When set, every delivery carries
     /// signature headers over the rendered body bytes.
     signer: Option<WebhookSigner>,
+    ocsf: crate::ocsf::OcsfOptions,
 }
 
 impl WebhookSink {
@@ -138,7 +140,14 @@ impl WebhookSink {
             client,
             metrics,
             signer,
+            ocsf: crate::ocsf::OcsfOptions::default(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_ocsf_options(mut self, ocsf: crate::ocsf::OcsfOptions) -> Self {
+        self.ocsf = ocsf;
+        self
     }
 
     /// The webhook id, used as the webhook-specific metric label.
@@ -212,7 +221,15 @@ impl WebhookSink {
             .iter()
             .map(|(name, value)| (name.clone(), render_template(value, eval)))
             .collect();
-        let body = self.body.as_ref().map(|b| render_template_json(b, eval));
+        // The finding uses the delivery context, so its identity matches the
+        // OCSF line and OTLP sinks of the same dispatch.
+        let body = self.body.as_ref().map(|b| {
+            render_template_json_with_ocsf(b, eval, || {
+                let options = crate::ocsf::OcsfOptions::new(self.ocsf.version());
+                let finding = crate::io::ocsf_finding(eval, Some((ctx, idx)), &options);
+                serde_json::to_string(&finding).unwrap_or_else(|_| "null".to_string())
+            })
+        });
         self.post(url, headers, body, ctx, idx).await
     }
 
@@ -394,10 +411,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: title.to_string(),
                 rule_id: Some("rule-1".to_string()),
+                tenant_id: None,
                 level: Some(Level::High),
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Detection(DetectionBody {
                 matched_selections: vec!["sel".to_string()],
@@ -525,6 +544,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ocsf_body_reference_posts_a_conformant_finding() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut sink = WebhookSink::new(
+            "siem".to_string(),
+            WebhookKind::Detection,
+            reqwest::Method::POST,
+            format!("{}/hook", server.uri()),
+            vec![("Content-Type".to_string(), "application/json".to_string())],
+            Some(
+                r#"{"title": "${detection.rule.title}", "finding": ${detection.ocsf}}"#.to_string(),
+            ),
+            Duration::from_secs(5),
+            crate::enrichment::Scope::default(),
+            None,
+            crate::enrichment::build_default_http_client().unwrap(),
+            Arc::new(NoopMetrics),
+            None,
+        );
+        let ctx = ctx();
+        let result: ProcessResult = vec![detection("first \"quoted\""), detection("second")];
+        sink.send(&result, &ctx).await.unwrap();
+
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/ocsf/1.1.0/class_2004.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let received = server.received_requests().await.unwrap();
+        for (index, request) in received.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let finding = &body["finding"];
+            let errors: Vec<String> = validator
+                .iter_errors(finding)
+                .map(|e| e.to_string())
+                .collect();
+            assert!(errors.is_empty(), "non-conformant finding: {errors:#?}");
+            assert_eq!(
+                finding["finding_info"]["uid"],
+                ctx.finding_uid(index).as_str(),
+                "the finding identity matches the other sinks of the dispatch",
+            );
+            assert_eq!(body["title"], finding["finding_info"]["title"]);
+        }
+        assert_eq!(received.len(), 2);
+    }
+
+    #[tokio::test]
     async fn url_template_values_are_percent_encoded() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -613,10 +685,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: "corr".to_string(),
                 rule_id: None,
+                tenant_id: None,
                 level: None,
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Correlation(rsigma_eval::result::CorrelationBody {
                 correlation_type: rsigma_parser::CorrelationType::EventCount,

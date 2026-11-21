@@ -11,7 +11,8 @@
 //! # Architecture
 //!
 //! A single [`Enricher`] trait covers every primitive (`template`, `lookup`,
-//! `http`, `command`, and `stix` when `stix-enrich` is enabled) and any
+//! `http`, `command`, `stix` when `stix-enrich` is enabled, `mmdb` when
+//! `mmdb-enrich` is enabled, and `dns` when `dns-enrich` is enabled) and any
 //! bespoke Rust-coded enrichers. Each enricher
 //! declares an [`EnricherKind`] at config time; the [`EnrichmentPipeline`]
 //! filters results by that declared kind against the
@@ -48,9 +49,13 @@ use crate::metrics::{MetricsHook, NoopMetrics};
 
 mod command;
 pub mod config;
+#[cfg(feature = "dns-enrich")]
+mod dns;
 mod http;
 pub mod http_cache;
 mod lookup;
+#[cfg(feature = "mmdb-enrich")]
+mod mmdb;
 #[cfg(feature = "stix-enrich")]
 mod stix;
 mod template;
@@ -59,20 +64,25 @@ mod tests;
 
 pub use crate::scope::Scope;
 pub use command::{CommandEnricher, OutputFormat};
+#[cfg(feature = "dns-enrich")]
+pub use dns::{DnsEnricher, DnsRecordType, DnsResolverConfig, SUPPORTED_DNS_RECORD_TYPES};
 pub use http::{
     DEFAULT_ENRICHER_MAX_RESPONSE_BYTES, HttpEnricher, HttpEnricherClient,
     build_default_http_client,
 };
 pub use http_cache::{CacheKey, CacheOutcome, HttpResponseCache};
 pub use lookup::LookupEnricher;
+#[cfg(feature = "mmdb-enrich")]
+pub use mmdb::{MmdbDatabase, MmdbEnricher, MmdbFields, MmdbLookupError};
 #[cfg(feature = "stix-enrich")]
 pub use stix::{StixEnricher, StixEnricherQuery};
 pub use template::{
     TemplateEnricher, TemplateError, env_references, render_incident_template,
     render_incident_template_json, render_incident_template_url, render_template,
-    render_template_json, render_template_url, validate_incident_template,
-    validate_template_namespace,
+    render_template_json, render_template_url, render_webhook_body, validate_incident_template,
+    validate_template_namespace, validate_url_tenant_position,
 };
+pub(crate) use template::{render_template_json_with_ocsf, validate_webhook_body_template};
 
 /// The kind of [`EvaluationResult`] an [`Enricher`] applies to.
 ///
@@ -177,8 +187,8 @@ impl std::fmt::Display for EnrichErrorKind {
 }
 
 /// Trait implemented by every enrichment primitive (`template`, `lookup`,
-/// `http`, `command`) and by any bespoke Rust-coded named enricher
-/// registered via [`register_builtin`].
+/// `http`, `command`, `stix`, `mmdb`, `dns`) and by any bespoke Rust-coded named
+/// enricher registered via [`register_builtin`].
 ///
 /// Implementations read shared rule metadata from [`EvaluationResult::header`]
 /// and dispatch on `result.body` for kind-specific fields. The pipeline
@@ -580,7 +590,10 @@ fn registry() -> &'static std::sync::RwLock<std::collections::HashMap<String, En
 /// External crates call this once at startup before the daemon loads its
 /// config. After config load, the registry is read-only in practice.
 pub fn register_builtin(name: &str, factory: EnricherFactory) -> Result<(), String> {
-    if matches!(name, "template" | "lookup" | "http" | "command" | "stix") {
+    if matches!(
+        name,
+        "template" | "lookup" | "http" | "command" | "stix" | "mmdb" | "dns"
+    ) {
         return Err(format!(
             "cannot register '{name}': name is reserved for a built-in primitive"
         ));

@@ -16,6 +16,7 @@ pub(crate) const CONFIG_VERSION: u32 = 1;
 pub(crate) const LOG_FORMAT: &str = "text";
 pub(crate) const API_ADDR: &str = "0.0.0.0:9090";
 pub(crate) const INPUT_SOURCE: &str = "stdin";
+pub(crate) const STDIN_MODE: &str = "batch";
 pub(crate) const INPUT_FORMAT: &str = "auto";
 pub(crate) const SYSLOG_TZ: &str = "+00:00";
 pub(crate) const SYSLOG_STRIP_BOM: bool = true;
@@ -136,6 +137,7 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
         daemon: Some(DaemonPartial {
             rules: None,
             pipelines: Some(Vec::new()),
+            rulesets: None,
             sources: Some(Vec::new()),
             enrichers: None,
             #[cfg(feature = "stix-enrich")]
@@ -153,6 +155,7 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
             }),
             input: Some(InputPartial {
                 source: Some(INPUT_SOURCE.to_string()),
+                stdin_mode: Some(STDIN_MODE.to_string()),
                 format: Some(INPUT_FORMAT.to_string()),
                 syslog_tz: Some(SYSLOG_TZ.to_string()),
                 syslog_strip_bom: Some(SYSLOG_STRIP_BOM),
@@ -160,6 +163,8 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
                 batch_size: Some(BATCH_SIZE),
                 jq: None,
                 jsonpath: None,
+                tenant: None,
+                nats_tenants: None,
             }),
             output: Some(OutputPartial {
                 sinks: Some(vec![STDOUT_SINK.to_string()]),
@@ -246,6 +251,7 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
                 event_logsource: None,
                 strict: Some(LOGSOURCE_STRICT),
             }),
+            tenancy: None,
         }),
         eval: Some(EvalPartial {
             rules: None,
@@ -255,6 +261,8 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
             syslog_strip_bom: Some(SYSLOG_STRIP_BOM),
             output: None,
             fail_on_detection: Some(false),
+            finding_format: None,
+            ocsf_version: None,
             schema: Some(SchemaPartial {
                 observe: None,
                 discover: None,
@@ -269,6 +277,8 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
                 event_logsource: None,
                 strict: Some(LOGSOURCE_STRICT),
             }),
+            ruleset: None,
+            rulesets: None,
         }),
         backtest: Some(BacktestPartial {
             // rules, corpus, and expectations are required at runtime and have
@@ -283,6 +293,10 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
             input_format: Some(INPUT_FORMAT.to_string()),
             syslog_tz: Some(SYSLOG_TZ.to_string()),
             syslog_strip_bom: Some(SYSLOG_STRIP_BOM),
+            ruleset: None,
+            findings: None,
+            finding_format: None,
+            ocsf_version: None,
         }),
         // The `coverage` section has no compiled defaults: the cross-reference
         // inputs are opt-in and `fail_on_gaps` defaults to off via clap.
@@ -326,9 +340,14 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
             stale_threshold: Some(HYGIENE_STALE_THRESHOLD.to_string()),
             noisy_threshold: None,
             fail_on: None,
+            ruleset: None,
         }),
         // The `mcp` section has no compiled defaults: stdio is the default
         // transport, and the lint-config / rules-dir roots have no default.
         mcp: None,
+        // Rulesets are declared in config files only; no compiled default.
+        rulesets: None,
+        // Conversion groups are declared in config files only.
+        convert: None,
     }
 }

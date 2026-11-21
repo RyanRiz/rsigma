@@ -1,3 +1,4 @@
+mod backend_build;
 mod backtest;
 mod classify;
 mod convert;
@@ -9,6 +10,8 @@ mod discover;
 mod disposition_spool;
 mod doc;
 mod draft;
+#[cfg(feature = "stix-draft")]
+mod draft_stix;
 mod eval;
 mod eval_stream;
 mod explain;
@@ -32,6 +35,7 @@ pub(crate) mod reports;
 #[cfg(feature = "daemon")]
 mod resolve;
 mod reverse;
+pub(crate) mod ruleset;
 mod scorecard;
 // Delegation to an external sigma-cli for non-native conversion targets.
 mod status;
@@ -44,6 +48,7 @@ mod tune;
 mod validate;
 mod visibility;
 
+pub(crate) use backend_build::{BackendBuildArgs, cmd_build};
 pub(crate) use backtest::{BacktestArgs, apply_backtest_config, cmd_backtest};
 pub(crate) use classify::{ClassifyArgs, cmd_classify};
 pub(crate) use convert::{
@@ -71,6 +76,7 @@ pub(crate) use pipeline_diff::{PipelineDiffArgs, cmd_pipeline_diff};
 #[cfg(feature = "daemon")]
 pub(crate) use resolve::{ResolveArgs, cmd_resolve};
 pub(crate) use reverse::{ReverseArgs, cmd_reverse};
+pub(crate) use ruleset::RulesetCommands;
 pub(crate) use scorecard::{ScorecardArgs, apply_scorecard_config, cmd_scorecard};
 pub(crate) use status::{StatusArgs, cmd_status};
 pub(crate) use tail::{TailArgs, cmd_tail};

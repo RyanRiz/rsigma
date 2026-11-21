@@ -30,6 +30,16 @@ pub struct StateCut {
     pub dispositions: Option<DispositionSnapshot>,
 }
 
+fn watchlist_stamp(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn parse_watchlist_stamp(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Utc))
+}
+
 /// SQLite-backed state store for persisting correlation state across restarts.
 ///
 /// Follows the same pattern as helr's `SqliteStateStore`: a single
@@ -74,10 +84,18 @@ impl SqliteStateStore {
                 method TEXT NOT NULL,
                 endpoint TEXT NOT NULL,
                 token TEXT,
+                tenant TEXT,
                 payload_digest TEXT,
                 status INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_rsigma_audit_ts ON rsigma_audit_log(ts);
+            CREATE TABLE IF NOT EXISTS rsigma_watchlist_indicators (
+                source_id TEXT NOT NULL,
+                value TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                expires_at TEXT,
+                PRIMARY KEY (source_id, value)
+            );
             "#,
         )
         .map_err(|e| format!("init sqlite schema: {e}"))?;
@@ -119,6 +137,23 @@ impl SqliteStateStore {
                 added_columns = "source_sequence,source_timestamp",
                 "State store schema migrated",
             );
+        }
+
+        let audit_has_tenant = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(rsigma_audit_log)")
+                .map_err(|e| format!("pragma table_info audit: {e}"))?;
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| format!("query pragma audit: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            names.iter().any(|name| name == "tenant")
+        };
+        if !audit_has_tenant {
+            conn.execute_batch("ALTER TABLE rsigma_audit_log ADD COLUMN tenant TEXT;")
+                .map_err(|e| format!("migrate audit tenant column: {e}"))?;
+            tracing::debug!(added_columns = "tenant", "Audit log schema migrated");
         }
 
         Ok(())
@@ -289,6 +324,7 @@ impl SqliteStateStore {
         let method = rec.method.clone();
         let endpoint = rec.endpoint.clone();
         let token = rec.token.clone();
+        let tenant = rec.tenant.clone();
         let payload_digest = rec.payload_digest.clone();
         let ts = rec.ts;
         let status = i64::from(rec.status);
@@ -296,9 +332,9 @@ impl SqliteStateStore {
             let c = conn.lock().map_err(|_| "state store lock poisoned")?;
             c.execute(
                 "INSERT INTO rsigma_audit_log
-                    (ts, method, endpoint, token, payload_digest, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![ts, method, endpoint, token, payload_digest, status],
+                    (ts, method, endpoint, token, tenant, payload_digest, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![ts, method, endpoint, token, tenant, payload_digest, status],
             )
             .map_err(|e| format!("insert audit record: {e}"))?;
             Ok(())
@@ -314,12 +350,17 @@ impl SqliteStateStore {
         offset: u64,
         since: Option<i64>,
         until: Option<i64>,
+        tenant: Option<String>,
     ) -> Result<(u64, Vec<super::audit::AuditRecord>), String> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().map_err(|_| "state store lock poisoned")?;
             let mut clauses = Vec::new();
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            if let Some(tenant) = tenant {
+                clauses.push("tenant = ?");
+                params.push(Box::new(tenant));
+            }
             if let Some(s) = since {
                 clauses.push("ts >= ?");
                 params.push(Box::new(s));
@@ -345,7 +386,7 @@ impl SqliteStateStore {
             };
             let count = count as u64;
             let select_sql = format!(
-                "SELECT id, ts, method, endpoint, token, payload_digest, status
+                "SELECT id, ts, method, endpoint, token, tenant, payload_digest, status
                  FROM rsigma_audit_log{where_sql}
                  ORDER BY id DESC
                  LIMIT ? OFFSET ?"
@@ -366,8 +407,9 @@ impl SqliteStateStore {
                         method: row.get(2)?,
                         endpoint: row.get(3)?,
                         token: row.get(4)?,
-                        payload_digest: row.get(5)?,
-                        status: row.get::<_, i64>(6)? as u16,
+                        tenant: row.get(5)?,
+                        payload_digest: row.get(6)?,
+                        status: row.get::<_, i64>(7)? as u16,
                     })
                 })
                 .map_err(|e| format!("query audit rows: {e}"))?;
@@ -413,6 +455,152 @@ impl SqliteStateStore {
         .map_err(|e| format!("spawn_blocking: {e}"))?
     }
 
+    /// Replace every stored indicator for `source_id` with `rows`.
+    ///
+    /// One transaction: a failure leaves the previous rows in place.
+    pub async fn replace_watchlist_rows(
+        &self,
+        source_id: &str,
+        rows: &[rsigma_runtime::sources::WatchlistRow],
+    ) -> Result<(), String> {
+        let source_id = source_id.to_string();
+        let stored: Vec<(String, String, Option<String>)> = rows
+            .iter()
+            .filter(|row| row.source_id == source_id)
+            .map(|row| {
+                (
+                    row.value.clone(),
+                    watchlist_stamp(row.added_at),
+                    row.expires_at.map(watchlist_stamp),
+                )
+            })
+            .collect();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut c = conn.lock().map_err(|_| "state store lock poisoned")?;
+            let tx = c
+                .transaction()
+                .map_err(|e| format!("begin watchlist save: {e}"))?;
+            tx.execute(
+                "DELETE FROM rsigma_watchlist_indicators WHERE source_id = ?1",
+                rusqlite::params![source_id],
+            )
+            .map_err(|e| format!("clear watchlist rows: {e}"))?;
+            for (value, added_at, expires_at) in &stored {
+                tx.execute(
+                    "INSERT INTO rsigma_watchlist_indicators
+                        (source_id, value, added_at, expires_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![source_id, value, added_at, expires_at],
+                )
+                .map_err(|e| format!("insert watchlist row: {e}"))?;
+            }
+            tx.commit()
+                .map_err(|e| format!("commit watchlist save: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))?
+    }
+
+    /// Every indicator row, including ones past their expiry.
+    pub async fn load_watchlist_rows(
+        &self,
+    ) -> Result<Vec<rsigma_runtime::sources::WatchlistRow>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.lock().map_err(|_| "state store lock poisoned")?;
+            let mut stmt = c
+                .prepare(
+                    "SELECT source_id, value, added_at, expires_at
+                     FROM rsigma_watchlist_indicators
+                     ORDER BY source_id, value",
+                )
+                .map_err(|e| format!("prepare load watchlist: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|e| format!("query watchlist: {e}"))?;
+            let mut loaded = Vec::new();
+            for row in rows {
+                let (source_id, value, added_at, expires_at) =
+                    row.map_err(|e| format!("read watchlist row: {e}"))?;
+                let Some(added_at) = parse_watchlist_stamp(&added_at) else {
+                    tracing::warn!(
+                        source_id,
+                        value,
+                        "skipping watchlist row with a bad added_at"
+                    );
+                    continue;
+                };
+                let expires_at = match expires_at {
+                    Some(text) => match parse_watchlist_stamp(&text) {
+                        Some(time) => Some(time),
+                        None => {
+                            tracing::warn!(
+                                source_id,
+                                value,
+                                "skipping watchlist row with a bad expires_at"
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                loaded.push(rsigma_runtime::sources::WatchlistRow {
+                    source_id,
+                    value,
+                    added_at,
+                    expires_at,
+                });
+            }
+            Ok(loaded)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))?
+    }
+
+    /// Delete rows whose `expires_at` is at or before `now`. Returns how many went.
+    pub async fn delete_expired_watchlist_rows(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, String> {
+        let cutoff = watchlist_stamp(now);
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.lock().map_err(|_| "state store lock poisoned")?;
+            let deleted = c
+                .execute(
+                    "DELETE FROM rsigma_watchlist_indicators
+                     WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                    rusqlite::params![cutoff],
+                )
+                .map_err(|e| format!("delete expired watchlist rows: {e}"))?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))?
+    }
+
+    /// Remove every watchlist indicator. Used by `--clear-state`.
+    pub async fn clear_watchlist_indicators(&self) -> Result<(), String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.lock().map_err(|_| "state store lock poisoned")?;
+            c.execute("DELETE FROM rsigma_watchlist_indicators", [])
+                .map_err(|e| format!("clear watchlist indicators: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking: {e}"))?
+    }
+
     /// Load the most recent risk-accumulator snapshot, if any.
     pub async fn load_risk(&self) -> Result<Option<RiskStateSnapshot>, String> {
         let conn = self.conn.clone();
@@ -439,7 +627,7 @@ impl SqliteStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn empty_snapshot() -> CorrelationSnapshot {
         CorrelationSnapshot {
@@ -448,6 +636,8 @@ mod tests {
             last_alert: HashMap::new(),
             event_buffers: HashMap::new(),
             event_ref_buffers: HashMap::new(),
+            tenants: Vec::new(),
+            rulesets: BTreeMap::new(),
         }
     }
 
@@ -766,12 +956,13 @@ mod tests {
             method: "POST".into(),
             endpoint: "/api/v1/silences".into(),
             token: Some("op".into()),
+            tenant: None,
             payload_digest: Some("abc123".into()),
             status: 201,
         };
         store.insert_audit(&rec).await.unwrap();
 
-        let (count, entries) = store.query_audit(10, 0, None, None).await.unwrap();
+        let (count, entries) = store.query_audit(10, 0, None, None, None).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].method, "POST");
@@ -784,14 +975,88 @@ mod tests {
             method: "POST".into(),
             endpoint: "/api/v1/reload".into(),
             token: None,
+            tenant: None,
             payload_digest: None,
             status: 200,
         };
         store.insert_audit(&old).await.unwrap();
         store.prune_audit(1, 500).await.unwrap();
 
-        let (count, entries) = store.query_audit(10, 0, None, None).await.unwrap();
+        let (count, entries) = store.query_audit(10, 0, None, None, None).await.unwrap();
         assert_eq!(count, 1);
         assert_eq!(entries[0].endpoint, "/api/v1/silences");
+    }
+
+    fn indicator(
+        source_id: &str,
+        value: &str,
+        expires_at: Option<&str>,
+    ) -> rsigma_runtime::sources::WatchlistRow {
+        rsigma_runtime::sources::WatchlistRow {
+            source_id: source_id.into(),
+            value: value.into(),
+            added_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            expires_at: expires_at.map(|text| {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn watchlist_rows_round_trip_and_drop_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        let store = SqliteStateStore::open(&db).unwrap();
+        let kept = indicator("c2_ips", "198.51.100.7", None);
+        let expiring = indicator("c2_ips", "203.0.113.9", Some("2026-06-01T00:00:00Z"));
+        let other = indicator("other", "198.51.100.8", None);
+        store
+            .replace_watchlist_rows("c2_ips", &[kept.clone(), expiring])
+            .await
+            .unwrap();
+        store
+            .replace_watchlist_rows("other", std::slice::from_ref(&other))
+            .await
+            .unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let removed = store.delete_expired_watchlist_rows(now).await.unwrap();
+        assert_eq!(removed, 1);
+
+        let loaded = store.load_watchlist_rows().await.unwrap();
+        assert_eq!(loaded, vec![kept, other]);
+
+        store.clear_watchlist_indicators().await.unwrap();
+        assert!(store.load_watchlist_rows().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn watchlist_replace_drops_values_that_left_the_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        let store = SqliteStateStore::open(&db).unwrap();
+        store
+            .replace_watchlist_rows(
+                "c2_ips",
+                &[
+                    indicator("c2_ips", "198.51.100.7", None),
+                    indicator("c2_ips", "203.0.113.9", None),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .replace_watchlist_rows("c2_ips", &[indicator("c2_ips", "203.0.113.9", None)])
+            .await
+            .unwrap();
+        let loaded = store.load_watchlist_rows().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].value, "203.0.113.9");
     }
 }

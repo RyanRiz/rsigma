@@ -174,7 +174,7 @@ The bounded mpsc channels apply back-pressure: when the engine cannot keep up, t
 
 ### Post-evaluation enrichment (`rsigma-runtime::enrichment`)
 
-Between the engine and the sinks, the `EnrichmentPipeline` injects context (asset info, IP reputation, identity, GeoIP, KEV flags, runbook URLs, ...) into each result's `RuleHeader.enrichments` map. Four primitives (`template`, `lookup`, `http`, `command`) compose into recipes. Kind-aware template namespaces (`${detection.*}` for detection-kind enrichers, `${correlation.*}` for correlation-kind) are validated at config-load time. An optional HTTP response cache, scope filtering by rule glob, tag set, and severity, and `on_error` policies (`skip`, `null`, `drop`) round it out. See [Enrichment](../guide/enrichers.md).
+Between the engine and the sinks, the `EnrichmentPipeline` injects context (asset info, IP reputation, identity, GeoIP, KEV flags, runbook URLs, ...) into each result's `RuleHeader.enrichments` map. Seven primitives (`template`, `lookup`, `http`, `command`, `stix`, `mmdb`, and `dns`) compose into recipes; `stix` needs `stix-enrich`, `mmdb` needs `mmdb-enrich`, and `dns` needs `dns-enrich`. Kind-aware template namespaces (`${detection.*}` for detection-kind enrichers, `${correlation.*}` for correlation-kind) are validated at config-load time. An optional HTTP response cache, scope filtering by rule glob, tag set, and severity, and `on_error` policies (`skip`, `null`, `drop`) round it out. See [Enrichment](../guide/enrichers.md).
 
 ### Post-engine layers (`rsigma-runtime::risk`, `::alert_pipeline`, `::dispositions`)
 
@@ -188,9 +188,9 @@ On every rule-load (including reloads), the `DaemonSourceRegistry` collects sour
 2. Parse the response according to `format:` (`json`, `yaml`, `lines`, `csv`).
 3. Apply the `extract:` expression (`jq` via `jaq`, JSONPath via `serde_json_path`, or CEL).
 4. Store in `SourceCache` (in-memory by default; SQLite-backed under `--state-db`).
-5. `TemplateExpander` substitutes the resolved values into the pipeline's `vars:` entries.
+5. `TemplateExpander` substitutes the resolved values into dynamic pipeline `vars:` entries, while `lookup` enrichers read the same cache directly.
 
-Refresh policies and on-error behavior are documented in [Dynamic Pipeline Sources](dynamic-sources.md).
+Refresh policies and on-error behavior are documented in [Dynamic Sources](dynamic-sources.md). Pipeline binding is documented separately in [Dynamic Pipelines](dynamic-pipelines.md).
 
 ## Performance posture
 

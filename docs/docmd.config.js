@@ -25,7 +25,12 @@ export default {
       components: {
         search: true,
         themeSwitch: true,
+        focusMode: true,
       },
+    },
+    footer: {
+      style: "minimal",
+      content: "MIT Licensed · [GitHub](https://github.com/timescale/rsigma) · [crates.io](https://crates.io/crates/rsigma) · [docs.rs](https://docs.rs/rsigma) · [Release Notes](https://rsigma.io/release-notes/) · [Security](https://rsigma.io/security-policy/) · [Privacy](https://rsigma.io/privacy/)",
     },
   },
   cookie: {
@@ -110,11 +115,14 @@ export default {
           title: "Deploy and Detect",
           collapsible: true,
           children: [
+            { title: "Rulesets", path: "/guide/rulesets" },
+            { title: "Multi-tenancy", path: "/guide/multi-tenancy" },
             { title: "Streaming Detection", path: "/guide/streaming-detection" },
             { title: "Processing Pipelines", path: "/guide/processing-pipelines" },
             { title: "Schema Routing", path: "/guide/schema-routing" },
             { title: "Logsource-Aware Evaluation", path: "/guide/logsource-routing" },
             { title: "Enrichers", path: "/guide/enrichers" },
+            { title: "Threat Intel Watchlists", path: "/guide/threat-intel-watchlists" },
             { title: "Input Formats", path: "/guide/input-formats" },
             { title: "NATS Streaming", path: "/guide/nats-streaming" },
             { title: "OTLP Integration", path: "/guide/otlp-integration" },
@@ -225,6 +233,7 @@ export default {
           collapsible: true,
           children: [
             { title: "convert", path: "/cli/backend/convert" },
+            { title: "build", path: "/cli/backend/build" },
             { title: "targets", path: "/cli/backend/targets" },
             { title: "formats", path: "/cli/backend/formats" },
           ],
@@ -235,6 +244,16 @@ export default {
           children: [
             { title: "diff", path: "/cli/pipeline/diff" },
             { title: "resolve", path: "/cli/pipeline/resolve" },
+          ],
+        },
+        {
+          title: "ruleset",
+          collapsible: true,
+          children: [
+            { title: "list", path: "/cli/ruleset/list" },
+            { title: "show", path: "/cli/ruleset/show" },
+            { title: "build", path: "/cli/ruleset/build" },
+            { title: "diff", path: "/cli/ruleset/diff" },
           ],
         },
         {
@@ -320,7 +339,9 @@ export default {
         { title: "Keywords and Conditions", path: "/reference/conditions" },
         { title: "Custom Attributes", path: "/reference/custom-attributes" },
         { title: "Builtin Pipelines", path: "/reference/builtin-pipelines" },
-        { title: "Dynamic Pipeline Sources", path: "/reference/dynamic-sources" },
+        { title: "Canonicalizing Pipelines", path: "/reference/canonicalizing-pipelines" },
+        { title: "Dynamic Pipelines", path: "/reference/dynamic-pipelines" },
+        { title: "Dynamic Sources", path: "/reference/dynamic-sources" },
         { title: "Security Hardening", path: "/reference/security" },
         { title: "WASM ABI", path: "/reference/wasm-abi" },
         { title: "Architecture", path: "/reference/architecture" },
@@ -335,6 +356,7 @@ export default {
         { title: "Docker", path: "/deployment/docker" },
         { title: "Kubernetes", path: "/deployment/kubernetes" },
         { title: "systemd", path: "/deployment/systemd" },
+        { title: "Serverless", path: "/deployment/serverless" },
       ],
     },
     {

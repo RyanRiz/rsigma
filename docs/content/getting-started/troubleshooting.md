@@ -60,7 +60,7 @@ Other startup failures exit with code `2` (the initial rules could not be loaded
 Event source exhausted, engine shutting down
 ```
 
-The default input is `stdin`, and the daemon stops when standard input closes. Under systemd, in a detached container, or with `&` in a non-interactive shell, it closes immediately. Use a long-lived input: `--input http`, a `nats://` URL, or a `unix://` socket.
+The default input is `stdin`, and the daemon stops when standard input closes. Under systemd, in a detached container, or with `&` in a non-interactive shell, it closes immediately. Use a long-lived input: `--input http`, a `nats://` URL, or a `unix://` socket. To keep a stdin daemon running after its input ends, pass `--stdin-mode stream`. {{ added "unreleased" }}
 
 ## Some rules are missing
 
@@ -131,7 +131,7 @@ A rule that does not parse is logged and skipped, and the rest of the reload goe
 {"error":"missing or invalid bearer token"}
 ```
 
-Authentication is on (`--api-token-env` or `daemon.api.auth`), and the request carried no token or an unknown one. Send `Authorization: Bearer <token>`. `rsigma engine status` and `rsigma config reload` do not send a token; to use them against an authenticated daemon, grant the permissions they need to requests without a token through `anonymous_permissions`, and only on a trusted network. `403` means the token is valid but its role lacks the route's permission; the [endpoint summary](../reference/http-api.md#endpoint-summary) lists the permission per route. `/healthz` and `/readyz` never require a token.
+Authentication is on (`--api-token-env` or `daemon.api.auth`), and the request carried no token or an unknown one. Send `Authorization: Bearer <token>`. [`rsigma engine status`](../cli/engine/status.md) and [`rsigma config reload`](../cli/config/reload.md) do not send a token; to use them against an authenticated daemon, grant the permissions they need to requests without a token through `anonymous_permissions`, and only on a trusted network. `403` means the token is valid but its role lacks the route's permission; the [endpoint summary](../reference/http-api.md#endpoint-summary) lists the permission per route. `/healthz` and `/readyz` never require a token.
 
 ## A setting is not taking effect
 

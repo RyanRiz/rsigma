@@ -7,11 +7,13 @@ use arc_swap::ArcSwap;
 use rayon::prelude::*;
 use rsigma_eval::{
     Event, FieldObserver, JsonEvent, ProcessResult, ProcessResultExt, RuleFieldSet, SchemaObserver,
+    TenantId, tenant_at,
 };
 
 use crate::engine::RuntimeEngine;
 use crate::input::{EventInputDecoded, InputFormat, parse_line};
 use crate::metrics::MetricsHook;
+use crate::ruleset::RuleSource;
 use crate::tap::{TapPayload, TapRegistry, TapStage};
 
 /// Closure that extracts multiple payloads from a single JSON value.
@@ -58,11 +60,22 @@ pub struct LogProcessor {
     /// session is active), the hot path performs one `ArcSwap` load and
     /// skips capture entirely.
     event_tap: ArcSwap<Option<Arc<TapRegistry>>>,
+    /// Tenants whose match counts get their own metric label. Any other
+    /// tenant counts under `other`.
+    tenant_allowlist: ArcSwap<Vec<rsigma_eval::TenantId>>,
 }
 
 impl LogProcessor {
     /// Create a new processor wrapping the given engine and metrics hook.
     pub fn new(engine: RuntimeEngine, metrics: Arc<dyn MetricsHook>) -> Self {
+        for stats in engine.ruleset_stats() {
+            metrics.register_ruleset(&stats.name);
+            metrics.on_ruleset_rules_loaded(
+                &stats.name,
+                stats.detection_rules,
+                stats.correlation_rules,
+            );
+        }
         LogProcessor {
             engine: Arc::new(ArcSwap::from_pointee(RwLock::new(engine))),
             processing_order: Mutex::new(()),
@@ -70,7 +83,14 @@ impl LogProcessor {
             field_observer: ArcSwap::new(Arc::new(None)),
             schema_observer: ArcSwap::new(Arc::new(None)),
             event_tap: ArcSwap::new(Arc::new(None)),
+            tenant_allowlist: ArcSwap::new(Arc::new(Vec::new())),
         }
+    }
+
+    /// Set the tenants whose match counts get their own metric label. Any other
+    /// tenant counts under `other`.
+    pub fn set_tenant_allowlist(&self, tenants: Vec<rsigma_eval::TenantId>) {
+        self.tenant_allowlist.store(Arc::new(tenants));
     }
 
     /// Attach (or detach) the opt-in field observer.
@@ -201,6 +221,7 @@ impl LogProcessor {
 
         let start = Instant::now();
         let batch_results = engine.process_batch(&event_refs);
+        let skipped = engine.take_ruleset_skipped();
         let elapsed = start.elapsed().as_secs_f64();
         let per_event_latency = elapsed / event_refs.len() as f64;
 
@@ -235,10 +256,19 @@ impl LogProcessor {
                         );
                     }
                 }
+                if let Some(ruleset) = &r.header.ruleset {
+                    let kind = if r.is_correlation() {
+                        "correlation"
+                    } else {
+                        "detection"
+                    };
+                    self.metrics.on_ruleset_match(ruleset, kind);
+                }
             }
 
             line_results[*line_idx].extend(result);
         }
+        self.record_ruleset_skipped(skipped);
 
         line_results
     }
@@ -271,6 +301,39 @@ impl LogProcessor {
         format: &InputFormat,
         event_filter: Option<&EventFilter>,
     ) -> BatchProcessOutcome {
+        self.process_batch_with_format_detailed_for_tenants(batch, &[], format, event_filter)
+    }
+
+    /// Process a formatted batch whose input lines carry a parallel tenant
+    /// slice, stamping each result with its line's tenant.
+    ///
+    /// `tenants` is empty (every line untenanted) or exactly parallel to
+    /// `batch`; any other length logs and returns empty results.
+    pub fn process_batch_with_format_detailed_for_tenants(
+        &self,
+        batch: &[String],
+        tenants: &[Option<TenantId>],
+        format: &InputFormat,
+        event_filter: Option<&EventFilter>,
+    ) -> BatchProcessOutcome {
+        if !tenants.is_empty() && tenants.len() != batch.len() {
+            debug_assert!(
+                false,
+                "tenants must be empty or parallel to the batch: {} tenants for {} lines",
+                tenants.len(),
+                batch.len()
+            );
+            tracing::error!(
+                tenants = tenants.len(),
+                lines = batch.len(),
+                "tenant slice length mismatch; returning empty results"
+            );
+            return BatchProcessOutcome {
+                results: empty_results(batch.len()),
+                parse_error_indices: Vec::new(),
+            };
+        }
+
         let mut engine_guard = self.engine.load();
         let mut concurrent = engine_guard.read().allows_concurrent_detection();
         // Correlation (and tap-visible global order) still serialize batches.
@@ -306,9 +369,13 @@ impl LogProcessor {
         // for malformed lines. Parsing itself is independent per line and the
         // indexed parallel collect retains input order.
         if tap_has_raw && let Some(sessions) = tap_sessions.as_ref() {
-            for line in batch.iter().filter(|line| !line.trim().is_empty()) {
+            for (line_idx, line) in batch.iter().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let tenant = tenant_at(tenants, line_idx);
                 for s in sessions.iter().filter(|s| s.stage == TapStage::Raw) {
-                    s.offer(TapPayload::Raw(line.clone()));
+                    s.offer(TapPayload::Raw(line.clone()), tenant);
                 }
             }
         }
@@ -389,10 +456,11 @@ impl LogProcessor {
         // post-event-filter) to active decoded-stage sessions. The event is
         // serialized to JSON only when at least one decoded session is active.
         if tap_has_decoded && let Some(sessions) = tap_sessions.as_ref() {
-            for (_, decoded) in &decoded_events {
+            for (line_idx, decoded) in &decoded_events {
                 let value = decoded.to_json();
+                let tenant = tenant_at(tenants, *line_idx);
                 for s in sessions.iter().filter(|s| s.stage == TapStage::Decoded) {
-                    s.offer(TapPayload::Decoded(Box::new(value.clone())));
+                    s.offer(TapPayload::Decoded(Box::new(value.clone())), tenant);
                 }
             }
         }
@@ -402,20 +470,31 @@ impl LogProcessor {
         // Batch evaluation: shared read for detection-only; exclusive write
         // when correlation state must advance in batch order.
         let event_refs: Vec<&EventInputDecoded> = decoded_events.iter().map(|(_, e)| e).collect();
+        let event_tenants: Vec<Option<TenantId>> = if tenants.is_empty() {
+            Vec::new()
+        } else {
+            decoded_events
+                .iter()
+                .map(|(line_idx, _)| tenants[*line_idx].clone())
+                .collect()
+        };
 
         let start = Instant::now();
-        let (batch_results, state_entries) = if concurrent {
+        let (batch_results, state_entries, skipped, quota_evictions, untenanted) = if concurrent {
             let engine = engine_guard.read();
             let results = engine
-                .process_batch_shared(&event_refs)
+                .process_batch_shared_for_tenants(&event_refs, &event_tenants)
                 .expect("concurrent path requires shared detection");
             let state_entries = engine.stats().state_entries as u64;
-            (results, state_entries)
+            (results, state_entries, engine.take_ruleset_skipped(), 0, 0)
         } else {
             let mut engine = engine_guard.write();
-            let results = engine.process_batch(&event_refs);
+            let results = engine.process_batch_for_tenants(&event_refs, &event_tenants);
             let state_entries = engine.stats().state_entries as u64;
-            (results, state_entries)
+            let skipped = engine.take_ruleset_skipped();
+            let quota = engine.take_tenant_quota_evictions();
+            let untenanted = engine.take_untenanted_skipped();
+            (results, state_entries, skipped, quota, untenanted)
         };
         let elapsed = start.elapsed().as_secs_f64();
         self.metrics
@@ -423,12 +502,36 @@ impl LogProcessor {
         let per_event_latency = elapsed / event_refs.len() as f64;
 
         self.metrics.set_correlation_state_entries(state_entries);
+        for _ in 0..quota_evictions {
+            self.metrics.on_tenant_quota_eviction("correlation_state");
+        }
+        for _ in 0..untenanted {
+            self.metrics
+                .on_tenant_rejected("engine", "untenanted_event");
+        }
 
         // Merge results per input line and update metrics.
         let merge_results_start = Instant::now();
         let mut line_results = empty_results(batch.len());
 
-        for ((line_idx, _), result) in decoded_events.iter().zip(batch_results) {
+        for ((line_idx, _), mut result) in decoded_events.iter().zip(batch_results) {
+            let tenant = tenant_at(tenants, *line_idx).cloned();
+            for r in &mut result {
+                r.header.tenant_id = tenant.clone();
+            }
+            if let Some(tenant) = &tenant {
+                let label = {
+                    let allowlist = self.tenant_allowlist.load();
+                    if allowlist.iter().any(|allowed| allowed == tenant) {
+                        tenant.as_str().to_string()
+                    } else {
+                        "other".to_string()
+                    }
+                };
+                for _ in &result {
+                    self.metrics.on_tenant_match(&label);
+                }
+            }
             self.metrics.on_events_processed(1);
             self.metrics.observe_processing_latency(per_event_latency);
             self.metrics
@@ -451,10 +554,19 @@ impl LogProcessor {
                         );
                     }
                 }
+                if let Some(ruleset) = &r.header.ruleset {
+                    let kind = if r.is_correlation() {
+                        "correlation"
+                    } else {
+                        "detection"
+                    };
+                    self.metrics.on_ruleset_match(ruleset, kind);
+                }
             }
 
             line_results[*line_idx].extend(result);
         }
+        self.record_ruleset_skipped(skipped);
         self.metrics.observe_batch_phase_duration(
             "result_merge",
             merge_results_start.elapsed().as_secs_f64(),
@@ -483,10 +595,37 @@ impl LogProcessor {
         Ok(stats)
     }
 
+    /// Rebuild rules from cached source values.
+    ///
+    /// Sources with a cached value are not fetched. A failure leaves the
+    /// current engine in place. The replacement engine stays on a fresh fetch
+    /// for the next full reload.
+    pub fn rebuild_from_sources(&self) -> Result<crate::engine::EngineStats, String> {
+        let (new_engine, stats) =
+            self.prepare_reload_with(crate::engine::SourceFetch::CacheFirst)?;
+        self.commit_reload(new_engine);
+        Ok(stats)
+    }
+
+    fn record_ruleset_skipped(&self, skipped: Vec<(std::sync::Arc<str>, u64)>) {
+        for (ruleset, count) in skipped {
+            if count > 0 {
+                self.metrics.on_ruleset_events_skipped(&ruleset, count);
+            }
+        }
+    }
+
     /// Build and load the replacement engine without holding the batch-order
     /// lock, so rule parsing and dynamic-source resolution do not stall
     /// processing.
     fn prepare_reload(&self) -> Result<(RuntimeEngine, crate::engine::EngineStats), String> {
+        self.prepare_reload_with(crate::engine::SourceFetch::Fresh)
+    }
+
+    fn prepare_reload_with(
+        &self,
+        fetch: crate::engine::SourceFetch,
+    ) -> Result<(RuntimeEngine, crate::engine::EngineStats), String> {
         // Snapshot the old engine's configuration AND tuning so the
         // replacement reaches `load_rules()` with the same flags. Daemon
         // startup typically sets `set_bloom_prefilter`/`set_bloom_max_bytes`
@@ -509,12 +648,22 @@ impl LogProcessor {
         let match_detail = old.match_detail();
         let routing = old.routing();
         let logsource_extractor = old.logsource_extractor();
+        let rule_source = old.rule_source().clone();
+        let ruleset_classifier = old.ruleset_classifier();
         #[cfg(feature = "daachorse-index")]
         let cross_rule_ac = old.cross_rule_ac();
         drop(old);
         drop(snapshot);
 
-        let mut new_engine = RuntimeEngine::new(rules_path, pipelines, corr_config, include_event);
+        let mut new_engine = match &rule_source {
+            RuleSource::Path(_) => {
+                RuntimeEngine::new(rules_path, pipelines, corr_config, include_event)
+            }
+            RuleSource::Rulesets(bindings) => {
+                RuntimeEngine::with_rulesets(bindings.clone(), corr_config, include_event)
+            }
+        };
+        new_engine.set_ruleset_classifier(ruleset_classifier);
         new_engine.set_pipeline_paths(pipeline_paths);
         new_engine.set_allow_remote_include(allow_remote_include);
         new_engine.set_strict_rules(strict_rules);
@@ -528,6 +677,7 @@ impl LogProcessor {
         if let Some(resolver) = resolver {
             new_engine.set_source_resolver(resolver);
         }
+        new_engine.set_source_fetch(fetch);
         new_engine.set_external_sources(external_sources);
         // Carry the schema-routing spec so hot-reload rebuilds the router
         // instead of silently dropping back to a single engine.
@@ -535,6 +685,7 @@ impl LogProcessor {
         // Carry the logsource extractor so pruning survives hot-reload.
         new_engine.set_logsource_extractor(logsource_extractor);
         let stats = new_engine.load_rules()?;
+        new_engine.set_source_fetch(crate::engine::SourceFetch::Fresh);
         Ok((new_engine, stats))
     }
 
@@ -542,6 +693,14 @@ impl LogProcessor {
     /// in, all under the batch-order lock so no batch advances the old
     /// windows between the export and the swap.
     fn commit_reload(&self, mut new_engine: RuntimeEngine) {
+        for stats in new_engine.ruleset_stats() {
+            self.metrics.register_ruleset(&stats.name);
+            self.metrics.on_ruleset_rules_loaded(
+                &stats.name,
+                stats.detection_rules,
+                stats.correlation_rules,
+            );
+        }
         let _order_guard = self.processing_order.lock();
         let live_state = self.engine.load().read().export_state();
         if let Some(state) = live_state
@@ -561,6 +720,13 @@ impl LogProcessor {
         engine.rules_path().to_path_buf()
     }
 
+    /// Per-ruleset loaded rule counts and schema bindings.
+    pub fn ruleset_stats(&self) -> Vec<rsigma_eval::RulesetStats> {
+        let snapshot = self.engine.load();
+        let engine = snapshot.read();
+        engine.ruleset_stats()
+    }
+
     /// Return a reference to the metrics hook.
     pub fn metrics(&self) -> &dyn MetricsHook {
         &*self.metrics
@@ -576,10 +742,19 @@ impl LogProcessor {
 
     /// Import correlation state into the current engine.
     pub fn import_state(&self, snapshot: &rsigma_eval::CorrelationSnapshot) -> bool {
+        self.import_state_detailed(snapshot).is_some()
+    }
+
+    /// Like [`import_state`](Self::import_state), returning the restored and
+    /// discarded entry counts.
+    pub fn import_state_detailed(
+        &self,
+        snapshot: &rsigma_eval::CorrelationSnapshot,
+    ) -> Option<rsigma_eval::ImportStats> {
         let _order_guard = self.processing_order.lock();
         let guard = self.engine.load();
         let mut engine = guard.write();
-        engine.import_state(snapshot)
+        engine.import_state_detailed(snapshot)
     }
 
     /// Return summary statistics about the current engine.
@@ -597,9 +772,20 @@ impl LogProcessor {
         id: Option<&str>,
         group: Option<&str>,
     ) -> Option<rsigma_eval::CorrelationStateSnapshot> {
+        self.introspect_correlations_for_tenant(id, group, None)
+    }
+
+    /// Like [`introspect_correlations`](Self::introspect_correlations), keeping
+    /// only groups owned by `tenant` when it is set.
+    pub fn introspect_correlations_for_tenant(
+        &self,
+        id: Option<&str>,
+        group: Option<&str>,
+        tenant: Option<&rsigma_eval::TenantId>,
+    ) -> Option<rsigma_eval::CorrelationStateSnapshot> {
         let snapshot = self.engine.load();
         let engine = snapshot.read();
-        engine.introspect_correlations(id, group)
+        engine.introspect_correlations_for_tenant(id, group, tenant)
     }
 
     /// Resolve several rule keys to their documentation in one pass.
@@ -1634,6 +1820,311 @@ detection:
         assert!(
             results[0].detection_count() > 0,
             "CEF deviceVendor=Security should match"
+        );
+    }
+
+    struct FailOnSecondFetch {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sources::SourceResolver for FailOnSecondFetch {
+        async fn resolve(
+            &self,
+            source: &rsigma_eval::pipeline::sources::DynamicSource,
+        ) -> Result<crate::sources::ResolvedValue, crate::sources::SourceError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Ok(crate::sources::ResolvedValue {
+                    data: serde_json::json!([]),
+                    resolved_at: std::time::Instant::now(),
+                    from_cache: false,
+                });
+            }
+            Err(crate::sources::SourceError {
+                source_id: source.id.clone(),
+                kind: crate::sources::SourceErrorKind::Fetch("down".into()),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_rebuild_keeps_the_loaded_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let rule_path = dir.path().join("rule.yml");
+        std::fs::write(
+            &rule_path,
+            r#"
+title: Rule A
+status: test
+logsource:
+    category: test
+detection:
+    selection:
+        EventID: 1
+    condition: selection
+"#,
+        )
+        .unwrap();
+        let pipeline_path = dir.path().join("pipeline.yml");
+        std::fs::write(
+            &pipeline_path,
+            r#"
+name: dynamic_pipeline
+priority: 10
+vars:
+  feed: "${source.feed}"
+transformations:
+  - type: value_placeholders
+"#,
+        )
+        .unwrap();
+        let pipeline = rsigma_eval::parse_pipeline_file(&pipeline_path).unwrap();
+        let mut engine = RuntimeEngine::new(
+            rule_path,
+            vec![pipeline],
+            CorrelationConfig::default(),
+            false,
+        );
+        engine.set_source_resolver(Arc::new(FailOnSecondFetch {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        engine.set_external_sources(vec![rsigma_eval::pipeline::sources::DynamicSource {
+            id: "feed".to_string(),
+            source_type: rsigma_eval::pipeline::sources::SourceType::File {
+                path: dir.path().join("unused.json"),
+                format: rsigma_eval::pipeline::sources::DataFormat::Json,
+                extract: None,
+                stix: None,
+            },
+            refresh: rsigma_eval::pipeline::sources::RefreshPolicy::Once,
+            timeout: None,
+            on_error: rsigma_eval::pipeline::sources::ErrorPolicy::Fail,
+            required: true,
+            default: None,
+        }]);
+        engine.load_rules().unwrap();
+        let proc = LogProcessor::new(engine, Arc::new(NoopMetrics));
+
+        let err = proc
+            .rebuild_from_sources()
+            .expect_err("a cache miss that fails must not swap the engine");
+        assert!(err.contains("down"), "got: {err}");
+
+        let batch = vec![r#"{"EventID": 1}"#.to_string()];
+        let results = proc.process_batch_lines(&batch, &identity_filter);
+        assert!(results[0].detection_count() > 0);
+        std::mem::forget(dir);
+    }
+
+    #[test]
+    fn ruleset_metrics_report_registration_matches_and_skips() {
+        use crate::ruleset::RulesetBinding;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RulesetMetrics {
+            registered: Mutex<Vec<String>>,
+            loaded: Mutex<Vec<(String, usize, usize)>>,
+            matches: Mutex<Vec<(String, String)>>,
+            skipped: Mutex<Vec<(String, u64)>>,
+        }
+
+        impl MetricsHook for RulesetMetrics {
+            fn on_parse_error(&self) {}
+            fn on_events_processed(&self, _: u64) {}
+            fn on_detection_matches(&self, _: u64) {}
+            fn on_correlation_matches(&self, _: u64) {}
+            fn observe_processing_latency(&self, _: f64) {}
+            fn on_input_queue_depth_change(&self, _: i64) {}
+            fn on_back_pressure(&self) {}
+            fn observe_batch_size(&self, _: u64) {}
+            fn on_output_queue_depth_change(&self, _: i64) {}
+            fn observe_pipeline_latency(&self, _: f64) {}
+            fn set_correlation_state_entries(&self, _: u64) {}
+            fn register_ruleset(&self, ruleset: &str) {
+                self.registered.lock().unwrap().push(ruleset.to_string());
+            }
+            fn on_ruleset_match(&self, ruleset: &str, kind: &'static str) {
+                self.matches
+                    .lock()
+                    .unwrap()
+                    .push((ruleset.to_string(), kind.to_string()));
+            }
+            fn on_ruleset_events_skipped(&self, ruleset: &str, count: u64) {
+                self.skipped
+                    .lock()
+                    .unwrap()
+                    .push((ruleset.to_string(), count));
+            }
+            fn on_ruleset_rules_loaded(&self, ruleset: &str, detection: usize, correlation: usize) {
+                self.loaded
+                    .lock()
+                    .unwrap()
+                    .push((ruleset.to_string(), detection, correlation));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["win", "cloud"] {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(root.join("rules")).unwrap();
+            std::fs::write(
+                root.join("rules/rule.yml"),
+                "title: TestRule\nid: 11111111-1111-1111-1111-111111111111\nlogsource:\n    category: test\ndetection:\n    selection:\n        EventID: 1\n    condition: selection\n",
+            )
+            .unwrap();
+        }
+        let bindings = vec![
+            RulesetBinding {
+                name: "win".to_string(),
+                spec: rsigma_parser::ruleset::RulesetSpec {
+                    sources: vec![dir.path().join("win/rules")],
+                    ..Default::default()
+                },
+                pipelines: Vec::new(),
+                when_schemas: Vec::new(),
+                tenants: Vec::new(),
+            },
+            RulesetBinding {
+                name: "cloud".to_string(),
+                spec: rsigma_parser::ruleset::RulesetSpec {
+                    sources: vec![dir.path().join("cloud/rules")],
+                    ..Default::default()
+                },
+                pipelines: Vec::new(),
+                when_schemas: vec!["aws_cloudtrail".to_string()],
+                tenants: Vec::new(),
+            },
+        ];
+        let mut engine =
+            RuntimeEngine::with_rulesets(bindings, CorrelationConfig::default(), false);
+        engine.set_ruleset_classifier(Some(std::sync::Arc::new(
+            rsigma_eval::SchemaClassifier::builtin(),
+        )));
+        engine.load_rules().unwrap();
+
+        let metrics = std::sync::Arc::new(RulesetMetrics::default());
+        let proc = LogProcessor::new(engine, metrics.clone());
+        assert_eq!(
+            metrics.registered.lock().unwrap().clone(),
+            vec!["win".to_string(), "cloud".to_string()]
+        );
+        assert!(
+            metrics
+                .loaded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == "win")
+        );
+
+        let batch = vec![r#"{"EventID": 1}"#.to_string()];
+        proc.process_batch_lines(&batch, &identity_filter);
+        assert!(
+            metrics
+                .matches
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == &("win".to_string(), "detection".to_string()))
+        );
+        assert_eq!(
+            metrics.skipped.lock().unwrap().clone(),
+            vec![("cloud".to_string(), 1)]
+        );
+
+        proc.process_batch_lines(&batch, &identity_filter);
+        assert_eq!(
+            metrics.skipped.lock().unwrap().clone(),
+            vec![("cloud".to_string(), 1), ("cloud".to_string(), 1)]
+        );
+
+        proc.reload_rules().unwrap();
+        proc.process_batch_lines(&batch, &identity_filter);
+        assert_eq!(
+            metrics.skipped.lock().unwrap().clone(),
+            vec![
+                ("cloud".to_string(), 1),
+                ("cloud".to_string(), 1),
+                ("cloud".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn tenants_are_stamped_per_input_line() {
+        use rsigma_eval::TenantId;
+
+        let proc = make_processor(
+            r#"
+title: Test Rule
+status: test
+logsource:
+    category: test
+detection:
+    selection:
+        EventID: 1
+    condition: selection
+"#,
+        );
+        let a = TenantId::new("a").unwrap();
+        let b = TenantId::new("b").unwrap();
+        let batch = vec![
+            r#"{"EventID": 1}"#.to_string(),
+            r#"{"EventID": 1}"#.to_string(),
+        ];
+        let tenants = vec![Some(a.clone()), Some(b.clone())];
+        let outcome = proc.process_batch_with_format_detailed_for_tenants(
+            &batch,
+            &tenants,
+            &InputFormat::Json,
+            None,
+        );
+        assert_eq!(outcome.results.len(), 2);
+        assert_eq!(outcome.results[0][0].header.tenant_id.as_ref(), Some(&a));
+        assert_eq!(outcome.results[1][0].header.tenant_id.as_ref(), Some(&b));
+    }
+
+    #[test]
+    fn an_event_filter_stamps_every_expanded_event_with_the_line_tenant() {
+        use rsigma_eval::TenantId;
+
+        let proc = make_processor(
+            r#"
+title: Test Rule
+status: test
+logsource:
+    category: test
+detection:
+    selection:
+        EventID: 1
+    condition: selection
+"#,
+        );
+        let filter = |mut v: serde_json::Value| -> Vec<serde_json::Value> {
+            if v.get("records").is_some_and(serde_json::Value::is_array)
+                && let serde_json::Value::Array(records) = v["records"].take()
+            {
+                return records;
+            }
+            vec![v]
+        };
+        let a = TenantId::new("a").unwrap();
+        let batch =
+            vec![r#"{"records": [{"EventID": 1}, {"EventID": 1}, {"EventID": 1}]}"#.to_string()];
+        let tenants = vec![Some(a.clone())];
+        let outcome = proc.process_batch_with_format_detailed_for_tenants(
+            &batch,
+            &tenants,
+            &InputFormat::Json,
+            Some(&filter),
+        );
+        assert_eq!(outcome.results[0].len(), 3);
+        assert!(
+            outcome.results[0]
+                .iter()
+                .all(|r| r.header.tenant_id.as_ref() == Some(&a))
         );
     }
 }

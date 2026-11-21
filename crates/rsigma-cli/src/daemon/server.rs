@@ -5,25 +5,28 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rsigma_eval::{
-    CorrelationConfig, MatchDetailLevel, OnUnknown, Pipeline, ProcessResult, RoutingPlan,
+    CorrelationConfig, MatchDetailLevel, OnUnknown, Pipeline, ProcessResult, RoutingPlan, TenantId,
     load_schema_config,
 };
 use rsigma_runtime::{
     AckToken, AlertPipeline, AlertPipelineState, BatchProcessOutcome, CaptureRing, CaptureRingSink,
-    DeliveryConfig, DeliveryFailure, Dispatcher, EnrichmentPipeline, FieldObserver, FileSink,
-    FormattedIncidentEnvelope, IncidentEnvelope, IncidentResult, IncludeMode, InputFormat,
-    LogProcessor, MetricsHook, OnFull, RawEvent, RiskLayer, RiskState, RoutingSpec, RuntimeEngine,
-    SchemaClassifier, SchemaObserver, Silence, SilenceError, SilenceSpec, Sink, SinkFormat,
-    StdinSource, StdoutSink, build_alert_pipeline, build_risk_layer, load_alert_pipeline_file,
-    load_risk_file, load_schema_signatures, spawn_source, strip_event_payloads,
+    DeliveryConfig, DeliveryContext, DeliveryFailure, Dispatcher, EnrichmentPipeline,
+    FieldObserver, FileSink, FormattedIncidentEnvelope, IncidentEnvelope, IncidentResult,
+    IncludeMode, InputFormat, LogProcessor, MetricsHook, OnFull, RawEvent, RiskLayer, RiskState,
+    RoutingSpec, RuntimeEngine, SchemaClassifier, SchemaObserver, Silence, SilenceError,
+    SilenceRejection, SilenceRemoval, SilenceSpec, Sink, SinkFormat, StdinReadStatus, StdinSource,
+    StdoutSink, build_alert_pipeline, build_risk_layer, load_alert_pipeline_file, load_risk_file,
+    load_schema_signatures, spawn_source, strip_event_payloads,
 };
 
+use super::auth::AuthIdentity;
+use super::batch;
 use super::bundle::BundleFormat;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -37,6 +40,8 @@ struct DlqEntry {
     original_event: String,
     error: String,
     timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
 }
 
 /// Minimum gap between two warnings about delivery failures dropped for lack
@@ -92,6 +97,8 @@ struct EvaluatedBatch {
     outcome: BatchProcessOutcome,
     payloads: Vec<String>,
     tokens: Vec<AckToken>,
+    /// Tenant per payload, parallel to `payloads`.
+    tenants: Vec<Option<TenantId>>,
     pipeline_start: Instant,
 }
 
@@ -184,6 +191,16 @@ pub enum StateRestoreMode {
     ForceKeep,
 }
 
+/// How a daemon reading stdin treats the end of its input (`--stdin-mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinMode {
+    /// Exit at end of input and report the batch result in the exit code.
+    Batch,
+    /// Keep running after end of input until a shutdown signal, with the
+    /// same restore and exit behavior as the other inputs.
+    Stream,
+}
+
 #[derive(Clone)]
 struct AppState {
     processor: Arc<LogProcessor>,
@@ -216,6 +233,9 @@ struct AppState {
     /// Live detection-tail state. `Some` when the tail is enabled; the
     /// `GET /api/v1/detections/stream` handler registers sessions on it.
     tail: Option<super::tail::TailState>,
+    /// Whether tenancy is enabled, so ingest binds every event to a token's
+    /// tenant.
+    tenancy_enabled: bool,
     /// The alert-pipeline config swap, read by `GET /api/v1/incidents` to
     /// resolve the incident include mode.
     alert_pipeline_swap: Arc<ArcSwap<Option<Arc<AlertPipeline>>>>,
@@ -236,14 +256,31 @@ struct AppState {
     /// Control-plane API audit trail. `Some` when `--state-db` is configured
     /// and audit is not disabled; the `/api/v1/audit` handler reads from it.
     audit: Option<Arc<super::audit::AuditLog>>,
+    /// Indicator push API for `type: watchlist` sources.
+    watchlists: super::watchlist_api::WatchlistApi,
+}
+
+impl axum::extract::FromRef<AppState> for super::watchlist_api::WatchlistApi {
+    fn from_ref(state: &AppState) -> Self {
+        state.watchlists.clone()
+    }
 }
 
 #[derive(Clone)]
 pub struct DaemonConfig {
     pub rules_path: PathBuf,
+    pub rulesets: Vec<rsigma_runtime::RulesetBinding>,
+    pub ruleset_classifier: Option<Arc<rsigma_eval::SchemaClassifier>>,
     pub pipelines: Vec<Pipeline>,
     pub pipeline_paths: Vec<PathBuf>,
     pub corr_config: CorrelationConfig,
+    /// Logical multi-tenancy settings.
+    pub tenancy: super::tenancy::TenancySettings,
+    /// Tenant bound to the single selected pull source.
+    pub input_tenant: Option<rsigma_eval::TenantId>,
+    /// Tenant-bound NATS subscriptions.
+    #[allow(dead_code)]
+    pub nats_tenants: Vec<super::tenancy::NatsTenantBinding>,
     pub include_event: bool,
     pub pretty: bool,
     pub api_addr: super::listen::ListenAddr,
@@ -251,6 +288,7 @@ pub struct DaemonConfig {
     pub state_db: Option<PathBuf>,
     pub state_save_interval: u64,
     pub input: String,
+    pub stdin_mode: StdinMode,
     pub output: Vec<String>,
     pub buffer_size: usize,
     pub batch_size: usize,
@@ -375,6 +413,113 @@ pub struct DaemonConfig {
     pub tls_state: Option<super::tls::TlsState>,
 }
 
+struct AppliedSources {
+    last_applied: std::collections::HashMap<String, serde_json::Value>,
+    referenced: std::collections::HashSet<String>,
+}
+
+fn collect_source_ids(
+    pipelines: &[Pipeline],
+    rulesets: &[rsigma_runtime::RulesetBinding],
+) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for pipeline in pipelines {
+        for source_ref in &pipeline.source_refs {
+            ids.insert(source_ref.source_id.clone());
+        }
+    }
+    for binding in rulesets {
+        for pipeline in &binding.pipelines {
+            match pipeline {
+                rsigma_runtime::PipelineRef::Builtin(pipeline) => {
+                    for source_ref in &pipeline.source_refs {
+                        ids.insert(source_ref.source_id.clone());
+                    }
+                }
+                rsigma_runtime::PipelineRef::File(path) => {
+                    if let Ok(pipeline) = rsigma_eval::parse_pipeline_file(path) {
+                        for source_ref in &pipeline.source_refs {
+                            ids.insert(source_ref.source_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn referenced_source_ids(processor: &LogProcessor) -> std::collections::HashSet<String> {
+    let snapshot = processor.engine_snapshot();
+    let engine = snapshot.read();
+    let mut ids = collect_source_ids(engine.pipelines(), &[]);
+    if let rsigma_runtime::RuleSource::Rulesets(bindings) = engine.rule_source() {
+        ids.extend(collect_source_ids(&[], bindings));
+    }
+    ids
+}
+
+/// A referenced cache value differs from the value the running rules compiled.
+///
+/// The scheduler publishes on a watch channel, which keeps only the newest
+/// result, so this compares every referenced id rather than the ids in that
+/// one result.
+fn referenced_cache_differs(applied: &AppliedSources, cache: &rsigma_runtime::SourceCache) -> bool {
+    applied
+        .referenced
+        .iter()
+        .any(|id| applied.last_applied.get(id) != cache.get(id).as_ref())
+}
+
+fn seed_applied(
+    processor: &LogProcessor,
+    cache: Option<&rsigma_runtime::SourceCache>,
+) -> AppliedSources {
+    let referenced = referenced_source_ids(processor);
+    let mut last_applied = std::collections::HashMap::new();
+    if let Some(cache) = cache {
+        for id in &referenced {
+            if let Some(value) = cache.get(id) {
+                last_applied.insert(id.clone(), value);
+            }
+        }
+    }
+    AppliedSources {
+        last_applied,
+        referenced,
+    }
+}
+
+/// Referenced ids from the engine that just loaded, with values captured
+/// before that load. A value stored while the load was running is then not
+/// recorded as applied, so the next result rebuilds instead of being missed.
+fn applied_from_capture(processor: &LogProcessor, captured: &AppliedSources) -> AppliedSources {
+    let referenced = referenced_source_ids(processor);
+    let mut last_applied = std::collections::HashMap::new();
+    for id in &referenced {
+        if let Some(value) = captured.last_applied.get(id) {
+            last_applied.insert(id.clone(), value.clone());
+        }
+    }
+    AppliedSources {
+        last_applied,
+        referenced,
+    }
+}
+
+fn refresh_watchlist_caps(registry: &rsigma_runtime::WatchlistRegistry, processor: &LogProcessor) {
+    let over = registry.apply_reference_limits(
+        &referenced_source_ids(processor),
+        rsigma_eval::MAX_PLACEHOLDER_COMBINATIONS,
+    );
+    if over > 0 {
+        tracing::warn!(
+            indicators = over,
+            "referenced watchlists hold more indicators than placeholder expansion allows"
+        );
+    }
+}
+
 fn default_detect_inflight(workers: usize) -> usize {
     match workers {
         0 | 1 => 1,
@@ -384,7 +529,8 @@ fn default_detect_inflight(workers: usize) -> usize {
     }
 }
 
-pub async fn run_daemon(config: DaemonConfig) {
+pub async fn run_daemon(config: DaemonConfig) -> i32 {
+    let batch = config.runs_batch();
     let metrics = Arc::new(Metrics::new());
     let health = HealthState::new();
 
@@ -430,16 +576,27 @@ pub async fn run_daemon(config: DaemonConfig) {
         Arc::new(store)
     });
 
-    let mut engine = RuntimeEngine::new(
-        config.rules_path.clone(),
-        config.pipelines.clone(),
-        config.corr_config.clone(),
-        config.include_event,
-    );
+    let mut engine = if config.rulesets.is_empty() {
+        RuntimeEngine::new(
+            config.rules_path.clone(),
+            config.pipelines.clone(),
+            config.corr_config.clone(),
+            config.include_event,
+        )
+    } else {
+        RuntimeEngine::with_rulesets(
+            config.rulesets.clone(),
+            config.corr_config.clone(),
+            config.include_event,
+        )
+    };
+    engine.set_ruleset_classifier(config.ruleset_classifier.clone());
     engine.set_pipeline_paths(config.pipeline_paths.clone());
     engine.set_allow_remote_include(config.allow_remote_include);
     engine.set_strict_rules(config.strict_rules);
     engine.set_match_detail(config.match_detail);
+    engine.set_require_tenant(config.tenancy.enabled);
+    engine.set_max_state_entries_per_tenant(config.tenancy.quotas.correlation_state);
     engine.set_bloom_prefilter(config.bloom_prefilter);
     if let Some(budget) = config.bloom_max_bytes {
         engine.set_bloom_max_bytes(budget);
@@ -483,14 +640,71 @@ pub async fn run_daemon(config: DaemonConfig) {
     let mut sources_trigger_tx_val: Option<
         mpsc::Sender<rsigma_runtime::sources::refresh::RefreshTrigger>,
     > = None;
+    let mut source_results: Option<
+        tokio::sync::watch::Receiver<Option<rsigma_runtime::RefreshResult>>,
+    > = None;
 
     let mut source_resolver_val: Option<Arc<super::instrumented_resolver::InstrumentedResolver>> =
         None;
 
+    let declared_sources: Vec<_> = config
+        .source_registry
+        .sources()
+        .into_iter()
+        .cloned()
+        .collect();
+    let watchlist_ids: Vec<String> = declared_sources
+        .iter()
+        .filter(|source| {
+            matches!(
+                source.source_type,
+                rsigma_eval::pipeline::sources::SourceType::Watchlist { .. }
+            )
+        })
+        .map(|source| source.id.clone())
+        .collect();
+    let watchlist_registry = Arc::new(rsigma_runtime::WatchlistRegistry::from_sources(
+        &declared_sources,
+    ));
+    watchlist_registry.apply_reference_limits(
+        &collect_source_ids(&config.pipelines, &config.rulesets),
+        rsigma_eval::MAX_PLACEHOLDER_COMBINATIONS,
+    );
+    super::watchlist_api::preregister_metrics(&metrics, &watchlist_ids);
+    for source in &declared_sources {
+        let stix = match &source.source_type {
+            rsigma_eval::pipeline::sources::SourceType::Taxii { .. } => true,
+            rsigma_eval::pipeline::sources::SourceType::File { format, .. }
+            | rsigma_eval::pipeline::sources::SourceType::Http { format, .. } => {
+                *format == rsigma_eval::pipeline::sources::DataFormat::Stix
+            }
+            _ => false,
+        };
+        if stix {
+            metrics.register_stix_source(&source.id);
+        }
+    }
+    if let Some(store) = state_store.as_ref() {
+        super::watchlist_api::restore_from_store(
+            store,
+            &watchlist_registry,
+            &watchlist_ids,
+            &metrics,
+            config.state_restore_mode == StateRestoreMode::ForceClear,
+        )
+        .await;
+    }
+
     if has_dynamic {
-        let instrumented = Arc::new(super::instrumented_resolver::InstrumentedResolver::new(
-            metrics.clone(),
-        ));
+        let mut instrumented =
+            super::instrumented_resolver::InstrumentedResolver::new(metrics.clone());
+        instrumented.set_watchlists(watchlist_registry.clone());
+        if let Err(err) = instrumented.prepare_taxii(&declared_sources) {
+            tracing::error!(error = %err, "Failed to prepare TAXII sources");
+            eprintln!("Error preparing TAXII sources: {err}");
+            std::process::exit(crate::exit_code::CONFIG_ERROR);
+        }
+        let instrumented = Arc::new(instrumented);
         source_resolver_val = Some(instrumented.clone());
         let resolver: Arc<dyn rsigma_runtime::sources::SourceResolver> = instrumented;
         engine.set_source_resolver(resolver.clone());
@@ -551,7 +765,16 @@ pub async fn run_daemon(config: DaemonConfig) {
 
         if !all_sources.is_empty() {
             let scheduler = rsigma_runtime::sources::refresh::RefreshScheduler::new();
+            source_results = Some(scheduler.result_receiver());
             sources_trigger_tx_val = Some(scheduler.trigger_sender());
+            if !watchlist_ids.is_empty() {
+                super::watchlist_api::spawn_sweeper(
+                    watchlist_registry.clone(),
+                    sources_trigger_tx_val.clone(),
+                    metrics.clone(),
+                    state_store.clone(),
+                );
+            }
 
             // Spawn NATS control subject listener for remote re-resolution triggers
             #[cfg(feature = "daemon-nats")]
@@ -598,6 +821,10 @@ pub async fn run_daemon(config: DaemonConfig) {
     }
 
     let processor = Arc::new(LogProcessor::new(engine, metrics.clone()));
+    processor.set_tenant_allowlist(config.tenancy.metrics_tenant_allowlist.clone());
+    for tenant in &config.tenancy.metrics_tenant_allowlist {
+        metrics.register_tenant(tenant.as_str());
+    }
 
     // Initial rule load
     match processor.reload_rules() {
@@ -611,6 +838,16 @@ pub async fn run_daemon(config: DaemonConfig) {
             metrics
                 .detection_rules_loaded
                 .set(stats.detection_rules as i64);
+            for ruleset in processor.ruleset_stats() {
+                metrics
+                    .ruleset_rules_loaded
+                    .with_label_values(&[&ruleset.name, "detection"])
+                    .set(ruleset.detection_rules as i64);
+                metrics
+                    .ruleset_rules_loaded
+                    .with_label_values(&[&ruleset.name, "correlation"])
+                    .set(ruleset.correlation_rules as i64);
+            }
             metrics
                 .correlation_rules_loaded
                 .set(stats.correlation_rules as i64);
@@ -619,7 +856,12 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to load initial rules");
-            std::process::exit(crate::exit_code::RULE_ERROR);
+            let code = if config.rulesets.is_empty() {
+                crate::exit_code::RULE_ERROR
+            } else {
+                crate::exit_code::CONFIG_ERROR
+            };
+            std::process::exit(code);
         }
     }
 
@@ -647,16 +889,33 @@ pub async fn run_daemon(config: DaemonConfig) {
                 );
                 restore_state = should_restore;
                 if should_restore {
-                    if processor.import_state(&snapshot) {
-                        let entries = snapshot.windows.values().map(|g| g.len()).sum::<usize>();
+                    let stats = processor.import_state_detailed(&snapshot);
+                    if let Some(stats) = &stats {
+                        if stats.discarded_untenanted > 0 || stats.discarded_tenanted > 0 {
+                            tracing::warn!(
+                                untenanted = stats.discarded_untenanted,
+                                tenanted = stats.discarded_tenanted,
+                                "Discarded correlation entries that do not match the tenancy mode"
+                            );
+                        }
                         tracing::info!(
-                            state_entries = entries,
+                            state_entries = snapshot.window_entries(),
                             "Correlation state restored from database"
                         );
                     } else {
+                        if batch {
+                            batch::exit_unrestorable(
+                                "correlation",
+                                &format!(
+                                    "snapshot version {} is not supported, or its ruleset layout does not match the loaded rules",
+                                    snapshot.version
+                                ),
+                            );
+                        }
                         tracing::warn!(
                             snapshot_version = snapshot.version,
-                            "Incompatible snapshot version, starting with fresh state"
+                            snapshot_rulesets = snapshot.rulesets.len(),
+                            "Snapshot version or ruleset layout does not match the loaded rules, starting with fresh state"
                         );
                     }
                 } else {
@@ -667,6 +926,11 @@ pub async fn run_daemon(config: DaemonConfig) {
                 tracing::info!("No previous correlation state found in database");
             }
             Err(e) => {
+                // A --clear-state run never attempts a restore, so an
+                // unreadable snapshot is not a failure there.
+                if batch && restore_state {
+                    batch::exit_unrestorable("correlation", &e);
+                }
                 tracing::warn!(error = %e, "Failed to load state from database, starting fresh");
             }
         }
@@ -729,7 +993,8 @@ pub async fn run_daemon(config: DaemonConfig) {
     // started yet.
     if let Some(path) = config.alert_pipeline_path.as_ref() {
         match load_alert_pipeline_file(path).and_then(build_alert_pipeline) {
-            Ok(pipeline) => {
+            Ok(mut pipeline) => {
+                pipeline.set_tenant_quotas(config.tenancy.quotas.alert_pipeline());
                 tracing::info!(path = %path.display(), "Alert pipeline loaded");
                 if let Ok(mut state) = alert_state.write() {
                     state
@@ -741,14 +1006,39 @@ pub async fn run_daemon(config: DaemonConfig) {
                 if restore_state && let Some(ref store) = state_store {
                     match store.load_alert_pipeline().await {
                         Ok(Some(snap)) => {
+                            let version = snap.version;
                             let now = chrono::Utc::now().timestamp();
                             let restored = alert_state
                                 .write()
-                                .map(|mut state| pipeline.restore(&mut state, snap, now))
+                                .map(|mut state| {
+                                    let stats = pipeline.restore_detailed(
+                                        &mut state,
+                                        snap,
+                                        now,
+                                        config.tenancy.enabled,
+                                    );
+                                    if let Some(stats) = &stats
+                                        && (stats.discarded_untenanted > 0
+                                            || stats.discarded_tenanted > 0)
+                                    {
+                                        tracing::warn!(
+                                            untenanted = stats.discarded_untenanted,
+                                            tenanted = stats.discarded_tenanted,
+                                            "Discarded alert-pipeline entries that do not match the tenancy mode"
+                                        );
+                                    }
+                                    stats.is_some()
+                                })
                                 .unwrap_or(false);
                             if restored {
                                 tracing::info!("Alert-pipeline state restored from database");
                             } else {
+                                if batch {
+                                    batch::exit_unrestorable(
+                                        "alert_pipeline",
+                                        &format!("snapshot version {version} is not supported"),
+                                    );
+                                }
                                 tracing::warn!(
                                     "Incompatible alert-pipeline snapshot version, starting fresh"
                                 );
@@ -756,6 +1046,9 @@ pub async fn run_daemon(config: DaemonConfig) {
                         }
                         Ok(None) => {}
                         Err(e) => {
+                            if batch {
+                                batch::exit_unrestorable("alert_pipeline", &e);
+                            }
                             tracing::warn!(error = %e, "Failed to load alert-pipeline state");
                         }
                     }
@@ -810,21 +1103,47 @@ pub async fn run_daemon(config: DaemonConfig) {
     // Build the risk layer. Failures exit cleanly because no I/O has started yet.
     if let Some(path) = config.risk_path.as_ref() {
         match load_risk_file(path).and_then(build_risk_layer) {
-            Ok(layer) => {
+            Ok(mut layer) => {
+                layer.set_max_open_entities_per_tenant(config.tenancy.quotas.risk_entities);
                 tracing::info!(path = %path.display(), "Risk layer loaded");
                 // Restore persisted risk state (unless --clear-state), pruning
                 // entries past their window at boot.
                 if restore_state && let Some(ref store) = state_store {
                     match store.load_risk().await {
                         Ok(Some(snap)) => {
+                            let version = snap.version;
                             let now = chrono::Utc::now().timestamp();
                             let restored = risk_state
                                 .write()
-                                .map(|mut state| layer.restore(&mut state, snap, now))
+                                .map(|mut state| {
+                                    let stats = layer.restore_detailed(
+                                        &mut state,
+                                        snap,
+                                        now,
+                                        config.tenancy.enabled,
+                                    );
+                                    if let Some(stats) = &stats
+                                        && (stats.discarded_untenanted > 0
+                                            || stats.discarded_tenanted > 0)
+                                    {
+                                        tracing::warn!(
+                                            untenanted = stats.discarded_untenanted,
+                                            tenanted = stats.discarded_tenanted,
+                                            "Discarded risk entries that do not match the tenancy mode"
+                                        );
+                                    }
+                                    stats.is_some()
+                                })
                                 .unwrap_or(false);
                             if restored {
                                 tracing::info!("Risk state restored from database");
                             } else {
+                                if batch {
+                                    batch::exit_unrestorable(
+                                        "risk",
+                                        &format!("snapshot version {version} is not supported"),
+                                    );
+                                }
                                 tracing::warn!(
                                     "Incompatible risk snapshot version, starting fresh"
                                 );
@@ -832,6 +1151,9 @@ pub async fn run_daemon(config: DaemonConfig) {
                         }
                         Ok(None) => {}
                         Err(e) => {
+                            if batch {
+                                batch::exit_unrestorable("risk", &e);
+                            }
                             tracing::warn!(error = %e, "Failed to load risk state");
                         }
                     }
@@ -850,19 +1172,47 @@ pub async fn run_daemon(config: DaemonConfig) {
     // reloads without blocking, while the consumer debounces with a 500ms
     // sleep + try_recv drain, collapsing bursts into a single reload.
     let (reload_tx, mut reload_rx) = mpsc::channel::<()>(4);
+    // A source-value change asks for a cache-first rebuild. A full reload
+    // already pending supersedes it.
+    let (rebuild_tx, mut rebuild_rx) = mpsc::channel::<()>(4);
+    let applied_sources = Arc::new(std::sync::Mutex::new(seed_applied(
+        &processor,
+        initial_source_cache.as_deref(),
+    )));
+    if let Some(mut source_results) = source_results {
+        let applied = applied_sources.clone();
+        let rebuild_tx = rebuild_tx.clone();
+        let cache = initial_source_cache.clone();
+        tokio::spawn(async move {
+            loop {
+                if source_results.changed().await.is_err() {
+                    break;
+                }
+                if source_results.borrow().is_none() {
+                    continue;
+                }
+                let Some(cache) = cache.as_ref() else {
+                    continue;
+                };
+                let differs = {
+                    let guard = applied.lock().unwrap();
+                    referenced_cache_differs(&guard, cache)
+                };
+                if differs {
+                    let _ = rebuild_tx.try_send(());
+                }
+            }
+        });
+    }
 
-    // File watcher for hot-reload (rules + pipeline files)
-    let pipeline_watch_paths: Vec<&std::path::Path> =
-        config.pipeline_paths.iter().map(|p| p.as_path()).collect();
-    let _watcher = if config.rules_path.is_dir() {
-        reload::spawn_file_watcher(&config.rules_path, &pipeline_watch_paths, reload_tx.clone())
+    // File watcher for hot-reload (rules, overlays, and pipeline files)
+    let rule_source = if config.rulesets.is_empty() {
+        rsigma_runtime::RuleSource::Path(config.rules_path.clone())
     } else {
-        reload::spawn_file_watcher(
-            config.rules_path.parent().unwrap_or(&config.rules_path),
-            &pipeline_watch_paths,
-            reload_tx.clone(),
-        )
+        rsigma_runtime::RuleSource::Rulesets(config.rulesets.clone())
     };
+    let watched = rsigma_runtime::watch_paths(&rule_source, &config.pipeline_paths);
+    let _watcher = reload::spawn_file_watcher(&watched, reload_tx.clone());
 
     let start_time = Instant::now();
 
@@ -923,9 +1273,10 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
 
     let tap = if config.tap.enabled {
-        let registry = rsigma_runtime::TapRegistry::new(
+        let registry = rsigma_runtime::TapRegistry::with_tenant_cap(
             config.tap.buffer_events,
             config.tap.max_sessions,
+            config.tenancy.quotas.stream_sessions,
             config.tap.max_duration,
         );
         processor.set_event_tap(Some(registry.clone()));
@@ -941,8 +1292,11 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
 
     let (tail, tail_registry) = if config.tail.enabled {
-        let registry =
-            super::tail::TailRegistry::new(config.tail.buffer_events, config.tail.max_sessions);
+        let registry = super::tail::TailRegistry::new(
+            config.tail.buffer_events,
+            config.tail.max_sessions,
+            config.tenancy.quotas.stream_sessions,
+        );
         tracing::info!(
             buffer_events = config.tail.buffer_events,
             max_sessions = config.tail.max_sessions,
@@ -977,15 +1331,27 @@ pub async fn run_daemon(config: DaemonConfig) {
         if restore_state && let Some(ref store) = state_store {
             match store.load_dispositions().await {
                 Ok(Some(snap)) => {
+                    let version = snap.version;
                     let now = chrono::Utc::now().timestamp();
-                    if state.restore(snap, now) {
+                    if state.restore(snap, now, config.tenancy.enabled) {
                         tracing::info!("Disposition state restored from database");
                     } else {
+                        if batch {
+                            batch::exit_unrestorable(
+                                "dispositions",
+                                &format!("snapshot version {version} is not supported"),
+                            );
+                        }
                         tracing::warn!("Incompatible disposition snapshot version, starting fresh");
                     }
                 }
                 Ok(None) => {}
-                Err(e) => tracing::warn!(error = %e, "Failed to load disposition state"),
+                Err(e) => {
+                    if batch {
+                        batch::exit_unrestorable("dispositions", &e);
+                    }
+                    tracing::warn!(error = %e, "Failed to load disposition state");
+                }
             }
         }
         // Optional pull source: load the declared dynamic source(s) and ingest
@@ -1057,6 +1423,21 @@ pub async fn run_daemon(config: DaemonConfig) {
     };
     let audit_for_save = audit_log.clone();
 
+    let source_registry = Arc::new(config.source_registry.clone());
+    let reload_watchlists = watchlist_registry.clone();
+    let mut watchlists = super::watchlist_api::WatchlistApi::new(
+        watchlist_registry,
+        source_registry.clone(),
+        sources_trigger_tx_val.clone(),
+        metrics.clone(),
+    );
+    if let Some(store) = state_store.clone() {
+        watchlists.set_persist(Arc::new(move |source_id, rows| {
+            let store = store.clone();
+            Box::pin(async move { store.replace_watchlist_rows(&source_id, &rows).await })
+        }));
+    }
+
     let app_state = AppState {
         processor: processor.clone(),
         metrics: metrics.clone(),
@@ -1068,17 +1449,19 @@ pub async fn run_daemon(config: DaemonConfig) {
         source_resolver: source_resolver_val,
         #[cfg(feature = "daemon-otlp")]
         otlp_event_tx,
-        source_registry: Arc::new(config.source_registry.clone()),
+        source_registry,
         field_observer: field_observer.clone(),
         schema_observer: schema_observer.clone(),
         tap: tap.clone(),
         tail: tail.clone(),
+        tenancy_enabled: config.tenancy.enabled,
         alert_pipeline_swap: alert_pipeline_swap.clone(),
         alert_state: alert_state.clone(),
         risk_swap: risk_swap.clone(),
         risk_state: risk_state.clone(),
         disposition_state,
         audit: audit_log,
+        watchlists: watchlists.clone(),
     };
 
     let app = Router::new()
@@ -1119,7 +1502,8 @@ pub async fn run_daemon(config: DaemonConfig) {
         .route("/api/v1/schemas/suggestions", get(schema_suggestions))
         .route("/api/v1/tap", get(tap_stream))
         .route("/api/v1/detections/stream", get(detections_stream))
-        .route("/api/v1/audit", get(list_audit));
+        .route("/api/v1/audit", get(list_audit))
+        .merge(super::watchlist_api::routes());
 
     #[cfg(feature = "daemon-otlp")]
     let app = app.route("/v1/logs", post(otlp_http_logs));
@@ -1152,6 +1536,7 @@ pub async fn run_daemon(config: DaemonConfig) {
                 auth: auth.clone(),
                 metrics: metrics.clone(),
                 extra_disposition_perm,
+                tenancy: config.tenancy.enabled,
             });
             app.route_layer(axum::middleware::from_fn_with_state(
                 state,
@@ -1228,6 +1613,7 @@ pub async fn run_daemon(config: DaemonConfig) {
             event_tx: event_tx.clone(),
             metrics: metrics.clone(),
             auth: config.api_auth.clone(),
+            tenancy: config.tenancy.enabled,
         })
         .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
         .send_compressed(tonic::codec::CompressionEncoding::Gzip);
@@ -1283,6 +1669,7 @@ pub async fn run_daemon(config: DaemonConfig) {
     let reload_enrichers_path = config.enrichers_path.clone();
     let reload_enrichment_metrics = enrichment_metrics.clone();
     let reload_source_cache = initial_source_cache.clone();
+    let reload_applied = applied_sources.clone();
     #[cfg(feature = "stix-enrich")]
     let reload_stix_fs_store = stix_fs_store.clone();
     let reload_alert_pipeline_swap = alert_pipeline_swap.clone();
@@ -1291,18 +1678,75 @@ pub async fn run_daemon(config: DaemonConfig) {
     let reload_risk_swap = risk_swap.clone();
     let reload_risk_state = risk_state.clone();
     let reload_risk_path = config.risk_path.clone();
+    let reload_tenant_quotas = config.tenancy.quotas;
     #[cfg(feature = "daemon-tls")]
     let reload_tls_state = tls_state.clone();
     #[cfg(feature = "daemon-tls")]
     let reload_tls_metrics = metrics.clone();
     tokio::spawn(async move {
-        while reload_rx.recv().await.is_some() {
-            // Debounce: batch rapid file changes
+        loop {
+            let mut full_reload = tokio::select! {
+                reload = reload_rx.recv() => match reload {
+                    Some(()) => true,
+                    None => break,
+                },
+                rebuild = rebuild_rx.recv() => match rebuild {
+                    Some(()) => false,
+                    None => break,
+                },
+            };
+            // Debounce: batch rapid file changes and source updates. A full
+            // reload supersedes a rebuild that landed in the same burst.
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if reload_rx.try_recv().is_ok() {
+                full_reload = true;
+            }
             while reload_rx.try_recv().is_ok() {}
+            while rebuild_rx.try_recv().is_ok() {}
+
+            if !full_reload {
+                let captured = seed_applied(&reload_processor, reload_source_cache.as_deref());
+                match reload_processor.rebuild_from_sources() {
+                    Ok(stats) => {
+                        tracing::info!(
+                            detection_rules = stats.detection_rules,
+                            correlation_rules = stats.correlation_rules,
+                            "Rules rebuilt from cached source values"
+                        );
+                        reload_metrics
+                            .source_rebuilds_total
+                            .with_label_values(&["success"])
+                            .inc();
+                        reload_metrics
+                            .detection_rules_loaded
+                            .set(stats.detection_rules as i64);
+                        reload_metrics
+                            .correlation_rules_loaded
+                            .set(stats.correlation_rules as i64);
+                        reload_metrics
+                            .rule_parse_errors
+                            .set(stats.parse_errors as i64);
+                        *reload_applied.lock().unwrap() =
+                            applied_from_capture(&reload_processor, &captured);
+                        refresh_watchlist_caps(&reload_watchlists, &reload_processor);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to rebuild rules from cached source values"
+                        );
+                        reload_metrics
+                            .source_rebuilds_total
+                            .with_label_values(&["error"])
+                            .inc();
+                    }
+                }
+                continue;
+            }
 
             reload_metrics.reloads_total.inc();
             tracing::info!("Reloading rules and pipelines...");
+            let captured = seed_applied(&reload_processor, reload_source_cache.as_deref());
 
             match reload_processor.reload_rules() {
                 Ok(stats) => {
@@ -1315,6 +1759,16 @@ pub async fn run_daemon(config: DaemonConfig) {
                     reload_metrics
                         .detection_rules_loaded
                         .set(stats.detection_rules as i64);
+                    for ruleset in reload_processor.ruleset_stats() {
+                        reload_metrics
+                            .ruleset_rules_loaded
+                            .with_label_values(&[&ruleset.name, "detection"])
+                            .set(ruleset.detection_rules as i64);
+                        reload_metrics
+                            .ruleset_rules_loaded
+                            .with_label_values(&[&ruleset.name, "correlation"])
+                            .set(ruleset.correlation_rules as i64);
+                    }
                     reload_metrics
                         .correlation_rules_loaded
                         .set(stats.correlation_rules as i64);
@@ -1322,6 +1776,9 @@ pub async fn run_daemon(config: DaemonConfig) {
                         .rule_parse_errors
                         .set(stats.parse_errors as i64);
                     reload_health.set_ready(true);
+                    *reload_applied.lock().unwrap() =
+                        applied_from_capture(&reload_processor, &captured);
+                    refresh_watchlist_caps(&reload_watchlists, &reload_processor);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to reload rules");
@@ -1391,7 +1848,8 @@ pub async fn run_daemon(config: DaemonConfig) {
             // resolve_timeout, and anything above its caps is trimmed now.
             if let Some(path) = reload_alert_pipeline_path.as_deref() {
                 match load_alert_pipeline_file(path).and_then(build_alert_pipeline) {
-                    Ok(new_pipeline) => {
+                    Ok(mut new_pipeline) => {
+                        new_pipeline.set_tenant_quotas(reload_tenant_quotas.alert_pipeline());
                         // Re-seed static silences (replacing the previous static
                         // set; API-created silences are preserved), trim to the
                         // new caps, and swap under the state lock the sink task
@@ -1425,7 +1883,21 @@ pub async fn run_daemon(config: DaemonConfig) {
             // config swap; stale entries age out via the new window.
             if let Some(path) = reload_risk_path.as_deref() {
                 match load_risk_file(path).and_then(build_risk_layer) {
-                    Ok(new_layer) => {
+                    Ok(mut new_layer) => {
+                        new_layer
+                            .set_max_open_entities_per_tenant(reload_tenant_quotas.risk_entities);
+                        if new_layer.incident_config().is_some()
+                            && let Some(max) = reload_tenant_quotas.risk_entities
+                            && let Ok(mut st) = reload_risk_state.write()
+                        {
+                            let evicted = st.enforce_tenant_cap(max);
+                            if evicted > 0 {
+                                tracing::warn!(
+                                    evicted,
+                                    "Evicted the stalest risk entities to fit the per-tenant quota"
+                                );
+                            }
+                        }
                         // If the reloaded config drops the accumulator, clear
                         // in-flight entities: with no `incident` block the tick
                         // no longer prunes them, so they would otherwise linger
@@ -1530,21 +2002,81 @@ pub async fn run_daemon(config: DaemonConfig) {
     let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<AckToken>();
 
     // Select source based on --input flag
+    let mut stdin_status: Option<StdinReadStatus> = None;
     #[cfg_attr(not(feature = "daemon-otlp"), allow(unused_mut))]
     let mut source_handle: Option<tokio::task::JoinHandle<()>> = match config.input.as_str() {
         "stdin" | "stdin://" => {
-            let h = spawn_source(
-                StdinSource::new(),
-                event_tx,
-                Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
-            );
-            tracing::info!(input = "stdin", "Event source started");
+            let source = StdinSource::new();
+            stdin_status = Some(source.read_status());
+            let hook = Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>);
+            let tenant = config.input_tenant.clone();
+            let h = match config.stdin_mode {
+                StdinMode::Batch => spawn_input_source(source, tenant, event_tx, hook),
+                StdinMode::Stream => {
+                    spawn_input_source(batch::HoldOpen::new(source), tenant, event_tx, hook)
+                }
+            };
+            tracing::info!(input = "stdin", mode = ?config.stdin_mode, "Event source started");
             Some(h)
         }
         "http" => {
             drop(event_tx);
             tracing::info!(input = "http", "Event source started (POST /api/v1/events)");
             None
+        }
+        #[cfg(feature = "daemon-nats")]
+        input if input.starts_with("nats://") && !config.nats_tenants.is_empty() => {
+            let (url, _) = parse_nats_url(input);
+            let mut handles = Vec::new();
+            for binding in &config.nats_tenants {
+                let mut nats_cfg = config.nats_config.clone();
+                nats_cfg.url = url.clone();
+                if let Some(credentials_file) = &binding.credentials_file {
+                    nats_cfg.credentials_file = Some(credentials_file.clone());
+                }
+                let durable = config
+                    .consumer_group
+                    .as_ref()
+                    .map(|group| format!("{group}-{}", binding.tenant.as_str()));
+                match rsigma_runtime::NatsSource::connect(
+                    &nats_cfg,
+                    &binding.subject,
+                    &config.replay_policy,
+                    durable.as_deref(),
+                )
+                .await
+                {
+                    Ok(source) => {
+                        let h = spawn_source(
+                            rsigma_runtime::WithTenant::new(source, binding.tenant.clone()),
+                            event_tx.clone(),
+                            Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+                        );
+                        handles.push(h);
+                        tracing::info!(
+                            url = url,
+                            subject = binding.subject,
+                            tenant = binding.tenant.as_str(),
+                            "Tenant-bound NATS source started"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            url = url,
+                            tenant = binding.tenant.as_str(),
+                            "Failed to connect tenant-bound NATS source"
+                        );
+                        std::process::exit(crate::exit_code::CONFIG_ERROR);
+                    }
+                }
+            }
+            let h = tokio::spawn(async move {
+                for handle in handles {
+                    let _ = handle.await;
+                }
+            });
+            Some(h)
         }
         #[cfg(feature = "daemon-nats")]
         input if input.starts_with("nats://") => {
@@ -1560,11 +2092,18 @@ pub async fn run_daemon(config: DaemonConfig) {
             .await
             {
                 Ok(source) => {
-                    let h = spawn_source(
-                        source,
-                        event_tx,
-                        Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
-                    );
+                    let h = match config.input_tenant.clone() {
+                        Some(tenant) => spawn_source(
+                            rsigma_runtime::WithTenant::new(source, tenant),
+                            event_tx,
+                            Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+                        ),
+                        None => spawn_source(
+                            source,
+                            event_tx,
+                            Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+                        ),
+                    };
                     tracing::info!(url = url, subject = subject, "NATS source started");
                     Some(h)
                 }
@@ -1579,11 +2118,18 @@ pub async fn run_daemon(config: DaemonConfig) {
             let path = input.strip_prefix("unix://").unwrap_or(input);
             match rsigma_runtime::UnixSocketSource::bind(std::path::Path::new(path)).await {
                 Ok(source) => {
-                    let h = spawn_source(
-                        source,
-                        event_tx,
-                        Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
-                    );
+                    let h = match config.input_tenant.clone() {
+                        Some(tenant) => spawn_source(
+                            rsigma_runtime::WithTenant::new(source, tenant),
+                            event_tx,
+                            Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+                        ),
+                        None => spawn_source(
+                            source,
+                            event_tx,
+                            Some(metrics.clone() as Arc<dyn rsigma_runtime::MetricsHook>),
+                        ),
+                    };
                     tracing::info!(path = path, "Unix socket source started");
                     Some(h)
                 }
@@ -1691,6 +2237,11 @@ pub async fn run_daemon(config: DaemonConfig) {
                                 original_event: payload,
                                 error: "parse error".to_string(),
                                 timestamp: chrono::Utc::now().to_rfc3339(),
+                                tenant: batch
+                                    .tenants
+                                    .get(index)
+                                    .and_then(|tenant| tenant.clone())
+                                    .map(|tenant| tenant.as_str().to_string()),
                             })
                             .await
                             .is_err()
@@ -1913,9 +2464,11 @@ pub async fn run_daemon(config: DaemonConfig) {
 
             let mut payloads = Vec::with_capacity(batch.len());
             let mut tokens = Vec::with_capacity(batch.len());
+            let mut tenants = Vec::with_capacity(batch.len());
             for raw_event in batch {
                 payloads.push(raw_event.payload);
                 tokens.push(raw_event.ack_token);
+                tenants.push(raw_event.tenant);
             }
 
             if payloads.is_empty() {
@@ -1933,12 +2486,15 @@ pub async fn run_daemon(config: DaemonConfig) {
                 // hop, same ordering as before concurrent detection.
                 let process_start = Instant::now();
                 let outcome = match filter.as_ref() {
-                    Some(f) => processor.process_batch_with_format_detailed(
+                    Some(f) => processor.process_batch_with_format_detailed_for_tenants(
                         &payloads,
+                        &tenants,
                         &format,
                         Some(f.as_ref()),
                     ),
-                    None => processor.process_batch_with_format_detailed(&payloads, &format, None),
+                    None => processor.process_batch_with_format_detailed_for_tenants(
+                        &payloads, &tenants, &format, None,
+                    ),
                 };
                 let process_elapsed_ms = process_start.elapsed().as_millis() as u64;
                 let match_count = outcome.results.iter().filter(|r| !r.is_empty()).count();
@@ -1955,6 +2511,7 @@ pub async fn run_daemon(config: DaemonConfig) {
                             outcome,
                             payloads,
                             tokens,
+                            tenants,
                             pipeline_start,
                         },
                     ))
@@ -1968,14 +2525,15 @@ pub async fn run_daemon(config: DaemonConfig) {
                 join_set.spawn_blocking(move || {
                     let process_start = Instant::now();
                     let outcome = match filter.as_ref() {
-                        Some(f) => processor.process_batch_with_format_detailed(
+                        Some(f) => processor.process_batch_with_format_detailed_for_tenants(
                             &payloads,
+                            &tenants,
                             &format,
                             Some(f.as_ref()),
                         ),
-                        None => {
-                            processor.process_batch_with_format_detailed(&payloads, &format, None)
-                        }
+                        None => processor.process_batch_with_format_detailed_for_tenants(
+                            &payloads, &tenants, &format, None,
+                        ),
                     };
                     let process_elapsed_ms = process_start.elapsed().as_millis() as u64;
                     let match_count = outcome.results.iter().filter(|r| !r.is_empty()).count();
@@ -1991,6 +2549,7 @@ pub async fn run_daemon(config: DaemonConfig) {
                             outcome,
                             payloads,
                             tokens,
+                            tenants,
                             pipeline_start,
                         },
                     )
@@ -2042,11 +2601,18 @@ pub async fn run_daemon(config: DaemonConfig) {
             }
         }
     }
-    // Incidents are serialized centrally, once per format the leaf sinks
-    // actually ask for, so an all-NDJSON daemon never pays for an OCSF line.
-    let ocsf_incidents = leaves
-        .iter()
-        .any(|(sink, _, _)| sink.format() == Some(SinkFormat::Ocsf));
+    // Incidents are serialized centrally, once per distinct set of OCSF options
+    // the leaf sinks ask for, so an all-NDJSON daemon never pays for an OCSF
+    // line.
+    let mut ocsf_options: Vec<rsigma_runtime::ocsf::OcsfOptions> = Vec::new();
+    for options in leaves.iter().filter_map(|(sink, _, _)| sink.ocsf_options()) {
+        if !ocsf_options.contains(&options) {
+            ocsf_options.push(options);
+        }
+    }
+    // Finding uids are minted before the risk layer and alert pipeline so an
+    // incident can reference the Detection Finding each contributor emitted.
+    let link_findings = !ocsf_options.is_empty();
     tracing::info!(output = ?output_specs, sinks = leaves.len(), "Sink started");
 
     // Bridge the delivery layer's terminal failures into the existing DLQ
@@ -2058,6 +2624,7 @@ pub async fn run_daemon(config: DaemonConfig) {
                 original_event: failure.serialized,
                 error: failure.error,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                tenant: failure.tenant.map(|tenant| tenant.as_str().to_string()),
             };
             if let Err(mpsc::error::SendError(entry)) = dlq_tx.send(entry).await {
                 tracing::warn!(
@@ -2128,6 +2695,10 @@ pub async fn run_daemon(config: DaemonConfig) {
                         }
                     }
 
+                    let mut delivery = DeliveryContext::new();
+                    let mut finding_uids: Option<Vec<String>> = link_findings
+                        .then(|| (0..result.len()).map(|i| delivery.finding_uid(i)).collect());
+
                     // Risk layer: annotate each in-scope firing with a risk
                     // score and risk objects, then (opt-in) emit a compact risk
                     // event per (detection, risk object) pair. Runs before the
@@ -2140,51 +2711,72 @@ pub async fn run_daemon(config: DaemonConfig) {
                             let mut st = risk_state_for_sink
                                 .write()
                                 .unwrap_or_else(|e| e.into_inner());
-                            risk_layer.process(result, &mut st, now, risk_metrics.as_ref())
+                            risk_layer.process_with_finding_uids(
+                                result,
+                                finding_uids.as_deref().unwrap_or_default(),
+                                &mut st,
+                                now,
+                                risk_metrics.as_ref(),
+                            )
                         };
                         result = out.kept;
                         if !out.risk_events.is_empty() {
                             let subject =
                                 risk_layer.risk_event_nats_subject().map(|s| s.to_string());
                             for event in out.risk_events {
-                                match serde_json::to_string(&event) {
-                                    Ok(json) => {
-                                        dispatcher
-                                            .dispatch_incident(IncidentEnvelope::new(
-                                                json,
-                                                subject.clone(),
-                                            ))
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to serialize risk event");
-                                    }
+                                let Ok(json) = serde_json::to_string(&event) else {
+                                    tracing::warn!("Failed to serialize risk event");
+                                    continue;
+                                };
+                                let typed = serde_json::from_value::<rsigma_runtime::RiskEvent>(
+                                    event.clone(),
+                                );
+                                if typed.is_err() && !ocsf_options.is_empty() {
+                                    tracing::warn!("risk event JSON is not a risk event");
                                 }
+                                let ocsf = if typed.is_ok() {
+                                    ocsf_options.as_slice()
+                                } else {
+                                    &[]
+                                };
+                                let env = with_ocsf_lines(
+                                    FormattedIncidentEnvelope::new(
+                                        IncidentEnvelope::new(json, subject.clone())
+                                            .with_tenant(tenant_from_json(&event)),
+                                    ),
+                                    ocsf,
+                                    "risk event",
+                                    |opts| {
+                                        Ok(rsigma_runtime::ocsf::risk_event_finding_opts(
+                                            typed.as_ref().expect("risk event"),
+                                            opts,
+                                        ))
+                                    },
+                                );
+                                dispatcher.dispatch_formatted_incident(env).await;
                             }
                         }
                         if !out.incidents.is_empty() {
                             let subject =
                                 risk_layer.incident_nats_subject().map(|s| s.to_string());
-                            for incident in out.incidents {
+                            for (incident, links) in
+                                out.incidents.into_iter().zip(out.finding_links)
+                            {
                                 match serde_json::to_string(&incident) {
                                     Ok(json) => {
-                                        let mut env = FormattedIncidentEnvelope::new(
-                                            IncidentEnvelope::new(json, subject.clone()),
+                                        let env = with_ocsf_lines(
+                                            FormattedIncidentEnvelope::new(
+                                                IncidentEnvelope::new(json, subject.clone())
+                                                    .with_tenant(incident.tenant_id.clone()),
+                                            ),
+                                            &ocsf_options,
+                                            "risk incident",
+                                            |opts| {
+                                                rsigma_runtime::ocsf::risk_incident_finding_in_class(
+                                                    &incident, &links, opts,
+                                                )
+                                            },
                                         );
-                                        if ocsf_incidents {
-                                            let finding =
-                                                rsigma_runtime::ocsf::risk_incident_finding(
-                                                    &incident,
-                                                );
-                                            match serde_json::to_string(&finding) {
-                                                Ok(line) => {
-                                                    env = env.with_line(SinkFormat::Ocsf, line);
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(error = %e, "Failed to serialize OCSF risk incident");
-                                                }
-                                            }
-                                        }
                                         dispatcher.dispatch_formatted_incident(env).await;
                                     }
                                     Err(e) => {
@@ -2212,34 +2804,44 @@ pub async fn run_daemon(config: DaemonConfig) {
                             // refill them under the retired pipeline's caps.
                             let current = alert_pipeline_swap_for_sink.load_full();
                             let alert_pipeline = current.as_ref().as_ref().unwrap_or(alert_pipeline);
-                            match capture_ring_for_sink.as_ref() {
-                                Some(ring) => {
-                                    let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
-                                    let mut sink = CaptureRingSink {
-                                        ring: &mut ring,
-                                        metrics: capture_metrics.as_ref(),
-                                    };
-                                    let mut kept = alert_pipeline.process_with_capture(
-                                        result,
-                                        &mut st,
-                                        now,
-                                        alert_pipeline_metrics.as_ref(),
-                                        Some(&mut sink),
-                                    );
-                                    if !operator_include_event {
-                                        for result in &mut kept {
-                                            strip_event_payloads(result);
-                                        }
-                                    }
+                            let mut ring = capture_ring_for_sink
+                                .as_ref()
+                                .map(|ring| ring.lock().unwrap_or_else(|e| e.into_inner()));
+                            let mut capture_sink = ring.as_mut().map(|ring| CaptureRingSink {
+                                ring,
+                                metrics: capture_metrics.as_ref(),
+                            });
+                            let capture = capture_sink
+                                .as_mut()
+                                .map(|sink| sink as &mut dyn rsigma_runtime::CaptureSink);
+                            let mut kept = match finding_uids.take() {
+                                Some(uids) => {
+                                    let (kept, kept_uids) = alert_pipeline
+                                        .process_with_finding_uids(
+                                            result,
+                                            uids,
+                                            &mut st,
+                                            now,
+                                            alert_pipeline_metrics.as_ref(),
+                                            capture,
+                                        );
+                                    finding_uids = Some(kept_uids);
                                     kept
                                 }
-                                None => alert_pipeline.process(
+                                None => alert_pipeline.process_with_capture(
                                     result,
                                     &mut st,
                                     now,
                                     alert_pipeline_metrics.as_ref(),
+                                    capture,
                                 ),
+                            };
+                            if ring.is_some() && !operator_include_event {
+                                for result in &mut kept {
+                                    strip_event_payloads(result);
+                                }
                             }
+                            kept
                         };
                         if kept.is_empty() {
                             for token in ack_tokens {
@@ -2258,7 +2860,12 @@ pub async fn run_daemon(config: DaemonConfig) {
                         tail.capture(&result);
                     }
 
-                    dispatcher.dispatch(result, ack_tokens).await;
+                    if let Some(uids) = finding_uids {
+                        delivery.set_finding_uids(uids);
+                    }
+                    dispatcher
+                        .dispatch_with_context(result, ack_tokens, delivery)
+                        .await;
                 }
                 _ = alert_tick.tick() => {
                     // Emit any due dedup repeat/resolved records and incident
@@ -2278,31 +2885,43 @@ pub async fn run_daemon(config: DaemonConfig) {
                             }
                             alert_pipeline.tick(&mut st, now, alert_pipeline_metrics.as_ref())
                         };
-                        for line in out.dedup_lines {
-                            dispatcher
-                                .dispatch_incident(IncidentEnvelope::new(line.to_string(), None))
-                                .await;
+                        for line in &out.dedup_lines {
+                            let json = match serde_json::to_string(line) {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to serialize dedup summary");
+                                    continue;
+                                }
+                            };
+                            let env = with_ocsf_lines(
+                                FormattedIncidentEnvelope::new(
+                                    IncidentEnvelope::new(json, None)
+                                        .with_tenant(tenant_from_json(line)),
+                                ),
+                                &ocsf_options,
+                                "dedup summary",
+                                |opts| Ok(rsigma_runtime::ocsf::dedup_summary_finding_opts(line, opts)),
+                            );
+                            dispatcher.dispatch_formatted_incident(env).await;
                         }
                         let subject =
                             alert_pipeline.incident_nats_subject().map(|s| s.to_string());
-                        for incident in out.incidents {
+                        for (incident, links) in out.incidents.into_iter().zip(out.finding_links) {
                             match serde_json::to_string(&incident) {
                                 Ok(json) => {
-                                    let mut env = FormattedIncidentEnvelope::new(
-                                        IncidentEnvelope::new(json, subject.clone()),
+                                    let env = with_ocsf_lines(
+                                        FormattedIncidentEnvelope::new(
+                                            IncidentEnvelope::new(json, subject.clone())
+                                                .with_tenant(incident.tenant_id.clone()),
+                                        ),
+                                        &ocsf_options,
+                                        "incident",
+                                        |opts| {
+                                            rsigma_runtime::ocsf::incident_finding_in_class(
+                                                &incident, &links, opts,
+                                            )
+                                        },
                                     );
-                                    if ocsf_incidents {
-                                        let finding =
-                                            rsigma_runtime::ocsf::incident_finding(&incident);
-                                        match serde_json::to_string(&finding) {
-                                            Ok(line) => {
-                                                env = env.with_line(SinkFormat::Ocsf, line);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "Failed to serialize OCSF incident finding");
-                                            }
-                                        }
-                                    }
                                     dispatcher.dispatch_formatted_incident(env).await;
                                 }
                                 Err(e) => {
@@ -2332,7 +2951,9 @@ pub async fn run_daemon(config: DaemonConfig) {
     // DLQ writer task: writes DLQ entries to the configured DLQ sink. Without
     // one, only delivery failures arrive here (parse errors are not routed),
     // and they are dropped with a rate-limited warning.
+    let undelivered = Arc::new(AtomicU64::new(0));
     let dlq_metrics = metrics.clone();
+    let undelivered_for_dlq = undelivered.clone();
     let dlq_handle = tokio::spawn(async move {
         tracing::debug!("DLQ task started");
         let mut dlq_sink = dlq_sink;
@@ -2343,9 +2964,11 @@ pub async fn run_daemon(config: DaemonConfig) {
                 let json = serde_json::to_string(&entry).unwrap_or_default();
                 if let Err(e) = sink.send_raw(&json).await {
                     dlq_metrics.dlq_write_failures.inc();
+                    undelivered_for_dlq.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(error = %e, "Failed to write to DLQ sink, entry dropped");
                 }
             } else {
+                undelivered_for_dlq.fetch_add(1, Ordering::Relaxed);
                 dropped.record(&entry.error, Instant::now());
             }
         }
@@ -2443,14 +3066,17 @@ pub async fn run_daemon(config: DaemonConfig) {
         }
     };
 
+    let mut task_failed = false;
     let shutdown_triggered = tokio::select! {
         _ = &mut serve_handle => true,
-        _ = async {
-            let _ = engine_handle.await;
-            let _ = dispatch_handle.await;
+        failed = async {
+            let engine = batch::task_failed("engine", engine_handle.await);
+            let dispatch = batch::task_failed("dispatch", dispatch_handle.await);
+            engine | dispatch
         } => {
             tracing::info!("Streaming pipeline complete");
             serve_handle.abort();
+            task_failed |= failed;
             false
         }
     };
@@ -2474,48 +3100,82 @@ pub async fn run_daemon(config: DaemonConfig) {
         source_done_notify.notify_one();
 
         let drain = async {
-            let _ = sink_handle.await;
+            let mut failed = batch::task_failed("sink", sink_handle.await);
             tracing::debug!("Sink task finished");
-            let _ = df_handle.await;
+            failed |= batch::task_failed("dlq_bridge", df_handle.await);
             tracing::debug!("DLQ bridge finished");
-            let _ = dlq_handle.await;
+            failed |= batch::task_failed("dlq", dlq_handle.await);
             tracing::debug!("DLQ task finished");
-            let _ = ack_handle.await;
+            failed |= batch::task_failed("ack", ack_handle.await);
             tracing::debug!("Ack task finished");
+            failed
         };
-        if tokio::time::timeout(drain_duration, drain).await.is_err() {
-            tracing::warn!(
+        match tokio::time::timeout(drain_duration, drain).await {
+            Ok(failed) => task_failed |= failed,
+            Err(_) => tracing::warn!(
                 timeout_secs = config.drain_timeout,
                 "Drain timeout exceeded, some events may be lost"
-            );
+            ),
         }
     } else {
-        let _ = sink_handle.await;
+        task_failed |= batch::task_failed("sink", sink_handle.await);
         tracing::debug!("Sink task finished");
-        let _ = df_handle.await;
+        task_failed |= batch::task_failed("dlq_bridge", df_handle.await);
         tracing::debug!("DLQ bridge finished");
-        let _ = dlq_handle.await;
+        task_failed |= batch::task_failed("dlq", dlq_handle.await);
         tracing::debug!("DLQ task finished");
-        let _ = ack_handle.await;
+        task_failed |= batch::task_failed("ack", ack_handle.await);
         tracing::debug!("Ack task finished");
     }
 
     // Save state on shutdown. After a drain timeout the ack task may still be
     // advancing the position; `capture` reads it before exporting, so the
     // saved position never runs ahead of the snapshots.
-    if let Some(ref store) = state_store {
-        let cut = state_sources.capture();
-        match store.save_all(&cut).await {
-            Ok(_) => match cut.position {
-                Some(pos) => tracing::info!(
-                    source_sequence = pos.sequence,
-                    "State saved to database on shutdown"
-                ),
-                None => tracing::info!("State saved to database on shutdown"),
-            },
-            Err(e) => tracing::error!(error = %e, "Failed to save state on shutdown"),
+    let state_save_failed = match &state_store {
+        Some(store) => {
+            let cut = state_sources.capture();
+            match store.save_all(&cut).await {
+                Ok(_) => {
+                    match cut.position {
+                        Some(pos) => tracing::info!(
+                            source_sequence = pos.sequence,
+                            "State saved to database on shutdown"
+                        ),
+                        None => tracing::info!("State saved to database on shutdown"),
+                    }
+                    false
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to save state on shutdown");
+                    true
+                }
+            }
         }
+        None => false,
+    };
+
+    if !batch {
+        return crate::exit_code::SUCCESS;
     }
+
+    let failures = batch::BatchFailures {
+        interrupted: shutdown_triggered,
+        input_read_error: stdin_status.as_ref().is_some_and(StdinReadStatus::failed),
+        undelivered: undelivered.load(Ordering::Relaxed),
+        state_save_failed,
+        task_failed,
+    };
+    if !failures.is_clean() {
+        tracing::error!(
+            interrupted = failures.interrupted,
+            input_read_error = failures.input_read_error,
+            undelivered = failures.undelivered,
+            state_save_failed = failures.state_save_failed,
+            task_failed = failures.task_failed,
+            "Batch run did not complete cleanly"
+        );
+    }
+    failures.exit_code()
 }
 
 /// The live state the periodic and shutdown savers persist.
@@ -2551,6 +3211,22 @@ impl StateSources {
                 dispositions: self.dispositions.as_ref().and_then(|d| d.snapshot()),
             },
         )
+    }
+}
+
+fn spawn_input_source<S: rsigma_runtime::EventSource>(
+    source: S,
+    tenant: Option<rsigma_eval::TenantId>,
+    event_tx: mpsc::Sender<RawEvent>,
+    hook: Option<Arc<dyn MetricsHook>>,
+) -> tokio::task::JoinHandle<()> {
+    match tenant {
+        Some(tenant) => spawn_source(
+            rsigma_runtime::WithTenant::new(source, tenant),
+            event_tx,
+            hook,
+        ),
+        None => spawn_source(source, event_tx, hook),
     }
 }
 
@@ -2596,6 +3272,41 @@ async fn shutdown_signal() {
     tracing::info!("Shutdown signal received");
 }
 
+/// Extract a tenant id from a serialized result or incident.
+fn tenant_from_json(value: &serde_json::Value) -> Option<TenantId> {
+    value
+        .get("tenant_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| TenantId::new(raw).ok())
+}
+
+/// Attach one OCSF line per distinct sink option set to an incident-path
+/// envelope. A serialization failure is logged and that option set is left
+/// unset; delivery then rejects the incident instead of rebuilding it from
+/// the native line.
+fn with_ocsf_lines(
+    mut env: FormattedIncidentEnvelope,
+    ocsf_options: &[rsigma_runtime::ocsf::OcsfOptions],
+    what: &str,
+    build: impl Fn(
+        rsigma_runtime::ocsf::OcsfOptions,
+    ) -> Result<serde_json::Value, rsigma_runtime::ocsf::OcsfOptionsError>,
+) -> FormattedIncidentEnvelope {
+    for opts in ocsf_options {
+        let opts = opts.clone();
+        match build(opts.clone()) {
+            Ok(finding) => match serde_json::to_string(&finding) {
+                Ok(line) => env = env.with_ocsf_line(opts, line),
+                Err(e) => tracing::warn!(error = %e, what, "Failed to serialize OCSF line"),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, what, "OCSF options cannot build this finding")
+            }
+        }
+    }
+    env
+}
+
 /// Split an output spec into its base (scheme + target) and `key=value` query
 /// parameters: `file:///p?on_full=drop`, `otlp://host:4317?compression=gzip`.
 pub(super) fn split_query(spec: &str) -> (&str, Vec<(&str, &str)>) {
@@ -2639,14 +3350,144 @@ impl SinkRole {
     }
 }
 
-/// Resolve the wire format from query params, exiting on any spec that cannot
-/// honor it.
+/// Resolved findings sink wire format and OCSF options.
+struct ResolvedSinkFormat {
+    format: SinkFormat,
+    ocsf: rsigma_runtime::ocsf::OcsfOptions,
+}
+
+/// Resolve the wire format and OCSF options from query params, exiting on any
+/// spec that cannot honor them.
 ///
-/// `format` is accepted only on a line-oriented findings sink: OTLP owns its
-/// log-record mapping, and the DLQ and audit channels do not carry findings at
-/// all. Unlike the `on_full` warn-and-default path, an unusable `format` is a
-/// startup config error, so a daemon never silently emits a format the
-/// operator did not ask for.
+/// `format` is accepted only on a findings sink: the DLQ and audit channels do
+/// not carry findings at all. `ocsf_incident_class` is rejected on OTLP sinks,
+/// which carry no incidents. Unlike the `on_full` warn-and-default path, an
+/// unusable parameter is a startup config error, so a daemon never silently
+/// emits a format the operator did not ask for.
+fn resolve_sink_format(params: &[(&str, &str)], base: &str, role: SinkRole) -> ResolvedSinkFormat {
+    let format = format_from_params(params, base, role);
+    if base.starts_with("otlp")
+        && params
+            .iter()
+            .any(|(k, _)| *k == "ocsf_incident_class" || *k == "ocsf_assignee_group")
+    {
+        tracing::error!(
+            spec = base,
+            "ocsf_incident_class= and ocsf_assignee_group= are not supported on OTLP sinks"
+        );
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    let ocsf = ocsf_options_from_params(params, base, role, format);
+    ResolvedSinkFormat { format, ocsf }
+}
+
+fn ocsf_options_from_params(
+    params: &[(&str, &str)],
+    base: &str,
+    role: SinkRole,
+    format: SinkFormat,
+) -> rsigma_runtime::ocsf::OcsfOptions {
+    use rsigma_runtime::ocsf::{OcsfIncidentClass, OcsfOptions, OcsfVersion};
+    let version: Option<OcsfVersion> = ocsf_param(params, "ocsf_version", base, role, format);
+    let incident_class: Option<OcsfIncidentClass> =
+        ocsf_param(params, "ocsf_incident_class", base, role, format);
+    let version = version.unwrap_or_default();
+    let class = incident_class.unwrap_or_default();
+    let group = ocsf_raw_param(params, "ocsf_assignee_group", base, role, format);
+    match class {
+        OcsfIncidentClass::IncidentFinding => {
+            let Some(group) = group else {
+                tracing::error!(
+                    spec = base,
+                    "ocsf_incident_class=2005 requires ocsf_assignee_group=<name>"
+                );
+                std::process::exit(crate::exit_code::CONFIG_ERROR);
+            };
+            match OcsfOptions::new(version).with_incident_finding(group) {
+                Ok(opts) => opts,
+                Err(_) => {
+                    tracing::error!(spec = base, "ocsf_assignee_group= must not be empty");
+                    std::process::exit(crate::exit_code::CONFIG_ERROR);
+                }
+            }
+        }
+        OcsfIncidentClass::DetectionFinding => {
+            if group.is_some() {
+                tracing::error!(
+                    spec = base,
+                    "ocsf_assignee_group= is only valid with ocsf_incident_class=2005"
+                );
+                std::process::exit(crate::exit_code::CONFIG_ERROR);
+            }
+            OcsfOptions::new(version)
+        }
+        _ => {
+            tracing::error!(spec = base, "unsupported OCSF incident class");
+            std::process::exit(crate::exit_code::CONFIG_ERROR);
+        }
+    }
+}
+
+/// Parse one optional free-form OCSF sink parameter.
+fn ocsf_raw_param<'a>(
+    params: &'a [(&str, &str)],
+    key: &str,
+    base: &str,
+    role: SinkRole,
+    format: SinkFormat,
+) -> Option<&'a str> {
+    let mut values = params
+        .iter()
+        .filter(|(k, _)| *k == key)
+        .map(|(_, value)| *value);
+    let value = values.next()?;
+    if values.next().is_some() {
+        tracing::error!(spec = base, "{key}= may be specified only once");
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    if format != SinkFormat::Ocsf {
+        tracing::error!(
+            spec = base,
+            channel = role.label(),
+            "{key}= is only valid with format=ocsf"
+        );
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    Some(value)
+}
+
+/// Parse one optional OCSF sink parameter, exiting when it repeats, appears
+/// without `format=ocsf`, or names a value outside its closed set.
+fn ocsf_param<T: std::str::FromStr<Err = String>>(
+    params: &[(&str, &str)],
+    key: &str,
+    base: &str,
+    role: SinkRole,
+    format: SinkFormat,
+) -> Option<T> {
+    let mut values = params
+        .iter()
+        .filter(|(k, _)| *k == key)
+        .map(|(_, value)| *value);
+    let value = values.next()?;
+    if values.next().is_some() {
+        tracing::error!(spec = base, "{key}= may be specified only once");
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    if format != SinkFormat::Ocsf {
+        tracing::error!(
+            spec = base,
+            channel = role.label(),
+            "{key}= is only valid with format=ocsf"
+        );
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    Some(value.parse().unwrap_or_else(|e: String| {
+        tracing::error!(spec = base, value, error = %e, "Invalid {key}");
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }))
+}
+
 fn format_from_params(params: &[(&str, &str)], base: &str, role: SinkRole) -> SinkFormat {
     let mut formats = params
         .iter()
@@ -2665,14 +3506,6 @@ fn format_from_params(params: &[(&str, &str)], base: &str, role: SinkRole) -> Si
             spec = base,
             channel = role.label(),
             "format= is only supported on findings sinks"
-        );
-        std::process::exit(crate::exit_code::CONFIG_ERROR);
-    }
-
-    if base.starts_with("otlp") {
-        tracing::error!(
-            spec = base,
-            "format= is not supported on OTLP sinks (they emit OTLP log records)"
         );
         std::process::exit(crate::exit_code::CONFIG_ERROR);
     }
@@ -2757,6 +3590,86 @@ fn otlp_timeout_from_params(
 }
 
 /// Build a single Sink from an output spec string, plus its full-queue policy.
+/// Parse the `tenant=` query parameter on a sink spec.
+fn tenant_filter_from_params(params: &[(&str, &str)]) -> Option<TenantId> {
+    let value = params
+        .iter()
+        .find(|(key, _)| *key == "tenant")
+        .map(|(_, value)| *value)?;
+    if value.is_empty() {
+        eprintln!("error: sink 'tenant=' needs a tenant id");
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    match TenantId::new(value) {
+        Ok(tenant) => Some(tenant),
+        Err(error) => {
+            eprintln!("error: sink tenant=: {error}");
+            std::process::exit(crate::exit_code::CONFIG_ERROR);
+        }
+    }
+}
+
+/// Check where a sink spec may route per tenant. Only findings sinks carry a
+/// result tenant, `{tenant}` is understood only in a file path or a NATS
+/// subject (once), and `max_open=` only applies to a `{tenant}` file path.
+fn check_tenant_routing(base: &str, params: &[(&str, &str)], role: SinkRole) -> Result<(), String> {
+    let templated = base.contains("{tenant}");
+    let has_param = |name: &str| params.iter().any(|(key, _)| *key == name);
+    if role != SinkRole::Findings && (templated || has_param("tenant") || has_param("max_open")) {
+        return Err(format!(
+            "{} sink '{base}' cannot use '{{tenant}}', 'tenant=', or 'max_open='; only findings sinks route per tenant",
+            role.label()
+        ));
+    }
+    if templated {
+        if !(base.starts_with("file://") || base.starts_with("nats://")) {
+            return Err(format!(
+                "sink '{base}' uses '{{tenant}}', which only file paths and NATS subjects support"
+            ));
+        }
+        if base.matches("{tenant}").count() > 1 {
+            return Err(format!("sink '{base}' may use '{{tenant}}' only once"));
+        }
+    }
+    if has_param("max_open") && !(templated && base.starts_with("file://")) {
+        return Err(format!(
+            "sink '{base}' sets 'max_open=', which only applies to a file path with '{{tenant}}'"
+        ));
+    }
+    Ok(())
+}
+
+/// Split a file path around a whole-component `{tenant}` token.
+fn tenant_file_template(path: &str) -> Option<(String, String)> {
+    let start = path.find("{tenant}")?;
+    let end = start + "{tenant}".len();
+    let before_ok = start == 0 || path.as_bytes().get(start - 1) == Some(&b'/');
+    let after_ok = end == path.len() || path.as_bytes().get(end) == Some(&b'/');
+    if !before_ok || !after_ok {
+        eprintln!("error: file sink path '{path}' must use '{{tenant}}' as a whole path component");
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
+    Some((path[..start].to_string(), path[end..].to_string()))
+}
+
+/// Parse `?max_open=` for a per-tenant file sink (default 64).
+fn max_open_from_params(params: &[(&str, &str)]) -> usize {
+    match params
+        .iter()
+        .find(|(key, _)| *key == "max_open")
+        .map(|(_, value)| *value)
+    {
+        None => 64,
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("error: sink 'max_open=' must be a positive integer");
+                std::process::exit(crate::exit_code::CONFIG_ERROR);
+            }
+        },
+    }
+}
+
 async fn build_sink(
     spec: &str,
     pretty: bool,
@@ -2764,22 +3677,63 @@ async fn build_sink(
     #[cfg_attr(not(feature = "daemon-nats"), allow(unused))] config: &DaemonConfig,
 ) -> (Sink, OnFull) {
     let (base, params) = split_query(spec);
+    if let Err(message) = check_tenant_routing(base, &params, role) {
+        eprintln!("error: {message}");
+        std::process::exit(crate::exit_code::CONFIG_ERROR);
+    }
     let on_full = on_full_from_params(&params);
-    let format = format_from_params(&params, base, role);
+    let resolved = resolve_sink_format(&params, base, role);
+    let format = resolved.format;
+    let ocsf = resolved.ocsf;
+    let tenant_filter = tenant_filter_from_params(&params);
 
     if base == "stdout" || base == "stdout://" {
         return (
-            Sink::Stdout(StdoutSink::new(pretty).with_format(format)),
+            Sink::Stdout(
+                StdoutSink::new(pretty)
+                    .with_format(format)
+                    .with_ocsf_options(ocsf)
+                    .with_tenant_filter(tenant_filter),
+            ),
             on_full,
         );
     }
 
     if let Some(path) = base.strip_prefix("file://") {
+        if let Some((before, after)) = tenant_file_template(path) {
+            let max_open = max_open_from_params(&params);
+            return match FileSink::open_template(before, after, max_open) {
+                Ok(file_sink) => {
+                    tracing::info!(path = %path, max_open, "Per-tenant file sink opened");
+                    (
+                        Sink::File(
+                            file_sink
+                                .with_format(format)
+                                .with_ocsf_options(ocsf)
+                                .with_tenant_filter(tenant_filter),
+                        ),
+                        on_full,
+                    )
+                }
+                Err(e) => {
+                    tracing::error!(path, error = %e, "Failed to build per-tenant file sink");
+                    std::process::exit(crate::exit_code::CONFIG_ERROR);
+                }
+            };
+        }
         let path = std::path::Path::new(path);
         return match FileSink::open(path) {
             Ok(file_sink) => {
                 tracing::info!(path = %path.display(), "File sink opened");
-                (Sink::File(file_sink.with_format(format)), on_full)
+                (
+                    Sink::File(
+                        file_sink
+                            .with_format(format)
+                            .with_ocsf_options(ocsf)
+                            .with_tenant_filter(tenant_filter),
+                    ),
+                    on_full,
+                )
             }
             Err(e) => {
                 tracing::error!(path = %path.display(), error = %e, "Failed to open file sink");
@@ -2796,7 +3750,15 @@ async fn build_sink(
         return match rsigma_runtime::NatsSink::connect(&nats_cfg, &subject).await {
             Ok(nats_sink) => {
                 tracing::info!(url = url, subject = subject, "NATS sink started");
-                (Sink::Nats(Box::new(nats_sink.with_format(format))), on_full)
+                (
+                    Sink::Nats(Box::new(
+                        nats_sink
+                            .with_format(format)
+                            .with_ocsf_options(ocsf)
+                            .with_tenant_filter(tenant_filter),
+                    )),
+                    on_full,
+                )
             }
             Err(e) => {
                 tracing::error!(error = %e, url = url, "Failed to connect NATS sink");
@@ -2837,6 +3799,10 @@ async fn build_sink(
             });
             return match rsigma_runtime::OtlpSink::new(protocol, endpoint, gzip, tls) {
                 Ok(sink) => {
+                    let sink = sink
+                        .with_format(format)
+                        .with_ocsf_options(ocsf)
+                        .with_tenant_filter(tenant_filter);
                     let sink = match timeout {
                         Some(t) => sink.with_timeout(t),
                         None => sink,
@@ -2847,6 +3813,7 @@ async fn build_sink(
                         gzip,
                         tls = tls_enabled,
                         timeout = %humantime::format_duration(sink.timeout()),
+                        format = format.as_str(),
                         "OTLP sink started"
                     );
                     (Sink::Otlp(Box::new(sink)), on_full)
@@ -2864,7 +3831,15 @@ async fn build_sink(
         return match rsigma_runtime::UnixSocketSink::connect(std::path::Path::new(path)).await {
             Ok(unix_sink) => {
                 tracing::info!(path, "Unix socket sink started");
-                (Sink::Unix(Box::new(unix_sink.with_format(format))), on_full)
+                (
+                    Sink::Unix(Box::new(
+                        unix_sink
+                            .with_format(format)
+                            .with_ocsf_options(ocsf)
+                            .with_tenant_filter(tenant_filter),
+                    )),
+                    on_full,
+                )
             }
             Err(e) => {
                 tracing::error!(path, error = %e, "Failed to connect unix socket sink");
@@ -3091,13 +4066,69 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn list_rules(State(state): State<AppState>) -> impl IntoResponse {
+/// Resolve the tenant an API read should be scoped to. `Ok(None)` means every
+/// tenant, `Ok(Some)` means exactly one.
+#[allow(clippy::result_large_err)]
+fn read_tenant(
+    state: &AppState,
+    identity: Option<&AuthIdentity>,
+    requested: Option<&str>,
+) -> Result<Option<TenantId>, Response> {
+    match super::tenancy::tenant_filter(state.tenancy_enabled, identity, requested)? {
+        super::tenancy::TenantFilter::All => Ok(None),
+        super::tenancy::TenantFilter::Only(tenant) => Ok(Some(tenant)),
+    }
+}
+
+fn incident_visible(incident: &IncidentResult, tenant: Option<&TenantId>) -> bool {
+    tenant.is_none_or(|tenant| incident.tenant_id.as_ref() == Some(tenant))
+}
+
+/// `GET /api/v1/rules` — loaded rule counts and per-ruleset statistics.
+async fn list_rules(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let stats = state.processor.stats();
-    Json(serde_json::json!({
-        "detection_rules": stats.detection_rules,
-        "correlation_rules": stats.correlation_rules,
-        "rules_path": state.processor.rules_path().display().to_string(),
-    }))
+    let mut rulesets = state.processor.ruleset_stats();
+    let ruleset_mode = !rulesets.is_empty();
+    let (mut detection_rules, mut correlation_rules) =
+        (stats.detection_rules, stats.correlation_rules);
+    if let Some(tenant) = &tenant
+        && ruleset_mode
+    {
+        rulesets.retain(|ruleset| {
+            ruleset.tenants.is_empty() || ruleset.tenants.iter().any(|t| t == tenant)
+        });
+        // Counts and bindings describe only what this tenant can see, so a
+        // shared binding does not reveal the other tenants it names.
+        for ruleset in &mut rulesets {
+            if !ruleset.tenants.is_empty() {
+                ruleset.tenants = vec![tenant.clone()];
+            }
+        }
+        detection_rules = rulesets.iter().map(|r| r.detection_rules).sum();
+        correlation_rules = rulesets.iter().map(|r| r.correlation_rules).sum();
+    }
+    let mut value = serde_json::json!({
+        "detection_rules": detection_rules,
+        "correlation_rules": correlation_rules,
+    });
+    if !ruleset_mode {
+        value["rules_path"] = serde_json::json!(state.processor.rules_path().display().to_string());
+    } else {
+        value["rulesets"] = serde_json::json!(rulesets);
+    }
+    Json(value).into_response()
 }
 
 #[derive(Serialize)]
@@ -3110,6 +4141,8 @@ struct StatusResponse {
     detection_matches: u64,
     correlation_matches: u64,
     uptime_seconds: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rulesets: Vec<rsigma_eval::RulesetStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic_sources: Option<DynamicSourcesSummary>,
 }
@@ -3123,7 +4156,19 @@ struct DynamicSourcesSummary {
 }
 
 /// `GET /api/v1/incidents` — open incidents from the grouping stage.
-async fn list_incidents(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_incidents(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let include = state
         .alert_pipeline_swap
         .load_full()
@@ -3133,10 +4178,14 @@ async fn list_incidents(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or(IncludeMode::Refs);
     let incidents = {
         let st = state.alert_state.read().unwrap_or_else(|e| e.into_inner());
-        st.incidents.snapshot(include)
+        st.incidents
+            .snapshot(include)
+            .into_iter()
+            .filter(|incident| incident_visible(incident, tenant.as_ref()))
+            .collect::<Vec<_>>()
     };
     let count = incidents.len();
-    Json(serde_json::json!({ "incidents": incidents, "count": count }))
+    Json(serde_json::json!({ "incidents": incidents, "count": count })).into_response()
 }
 
 /// The 503 body returned by the per-incident routes when grouping is off.
@@ -3171,14 +4220,26 @@ fn incident_include(state: &AppState) -> Option<IncludeMode> {
 /// list entry.
 async fn get_incident(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<super::tenancy::TenantQuery>,
 ) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let Some(include) = incident_include(&state) else {
         return grouping_disabled();
     };
     match snapshot_incident(&state, &id, include) {
-        Some(incident) => Json(incident).into_response(),
-        None => incident_not_found(&id),
+        Some(incident) if incident_visible(&incident, tenant.as_ref()) => {
+            Json(incident).into_response()
+        }
+        Some(_) | None => incident_not_found(&id),
     }
 }
 
@@ -3187,15 +4248,26 @@ async fn get_incident(
 struct BundleQuery {
     /// `json` (default) or `markdown`.
     format: Option<String>,
+    /// Narrow the read to one tenant.
+    tenant: Option<String>,
 }
 
 /// `GET /api/v1/incidents/{id}/bundle` — the incident joined to its rules'
 /// documentation and the risk entities it overlaps.
 async fn get_incident_bundle(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<BundleQuery>,
 ) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let format = match query.format.as_deref() {
         None => BundleFormat::Json,
         Some(requested) => match BundleFormat::parse(requested) {
@@ -3219,6 +4291,9 @@ async fn get_incident_bundle(
     let Some(incident) = snapshot_incident(&state, &id, include) else {
         return incident_not_found(&id);
     };
+    if !incident_visible(&incident, tenant.as_ref()) {
+        return incident_not_found(&id);
+    }
     if incident.bundle_ready == Some(false) {
         return (
             StatusCode::CONFLICT,
@@ -3245,7 +4320,7 @@ async fn get_incident_bundle(
         .map(|cfg| {
             let now = chrono::Utc::now().timestamp();
             let st = state.risk_state.read().unwrap_or_else(|e| e.into_inner());
-            st.views(cfg, now)
+            same_tenant_entities(st.views(cfg, now), incident.tenant_id.as_ref())
         });
 
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -3265,6 +4340,18 @@ async fn get_incident_bundle(
         BundleFormat::Markdown => super::bundle::render_markdown(&bundle),
     };
     ([(header::CONTENT_TYPE, format.content_type())], body).into_response()
+}
+
+/// Keep only the risk entities of `tenant`, so a bundle never joins an
+/// incident to another tenant's entity that shares a value.
+fn same_tenant_entities(
+    entities: Vec<rsigma_runtime::RiskEntityView>,
+    tenant: Option<&TenantId>,
+) -> Vec<rsigma_runtime::RiskEntityView> {
+    entities
+        .into_iter()
+        .filter(|entity| entity.tenant_id.as_ref() == tenant)
+        .collect()
 }
 
 fn snapshot_incident(state: &AppState, id: &str, include: IncludeMode) -> Option<IncidentResult> {
@@ -3287,30 +4374,78 @@ fn incident_not_found(id: &str) -> Response {
 /// `GET /api/v1/risk` — open entities tracked by the risk accumulator, with
 /// their current window score, distinct tactic count, source count, and window
 /// bounds. Empty when no risk accumulator is configured.
-async fn list_risk_entities(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_risk_entities(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let snapshot = state.risk_swap.load_full();
     let entities = match snapshot.as_ref().as_ref().and_then(|l| l.incident_config()) {
         Some(cfg) => {
             let now = chrono::Utc::now().timestamp();
             let st = state.risk_state.read().unwrap_or_else(|e| e.into_inner());
             st.views(cfg, now)
+                .into_iter()
+                .filter(|entity| {
+                    tenant
+                        .as_ref()
+                        .is_none_or(|tenant| entity.tenant_id.as_ref() == Some(tenant))
+                })
+                .collect::<Vec<_>>()
         }
         None => Vec::new(),
     };
     let count = entities.len();
-    Json(serde_json::json!({ "entities": entities, "count": count }))
+    Json(serde_json::json!({ "entities": entities, "count": count })).into_response()
 }
 
 /// `GET /api/v1/correlations` — the compiled correlation list with per-group
 /// counts (no window contents). Empty when the engine has no correlation rules.
-async fn list_correlations(State(state): State<AppState>) -> impl IntoResponse {
-    let correlations = state
+async fn list_correlations(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    let mut correlations = state
         .processor
-        .introspect_correlations(None, None)
+        .introspect_correlations_for_tenant(None, None, tenant.as_ref())
         .map(|s| s.correlations)
         .unwrap_or_default();
+    if let Some(tenant) = &tenant {
+        let allowed: std::collections::HashSet<String> = state
+            .processor
+            .ruleset_stats()
+            .into_iter()
+            .filter(|ruleset| {
+                ruleset.tenants.is_empty() || ruleset.tenants.iter().any(|t| t == tenant)
+            })
+            .map(|ruleset| ruleset.name.to_string())
+            .collect();
+        correlations.retain(|correlation| {
+            correlation
+                .ruleset
+                .as_deref()
+                .is_none_or(|ruleset| allowed.contains(ruleset))
+        });
+    }
     let count = correlations.len();
-    Json(serde_json::json!({ "correlations": correlations, "count": count }))
+    Json(serde_json::json!({ "correlations": correlations, "count": count })).into_response()
 }
 
 /// Query parameters for `GET /api/v1/correlations/state`.
@@ -3321,6 +4456,8 @@ struct CorrelationStateQuery {
     /// Keep only groups whose rendered key (`field=value, ...`) contains this
     /// substring.
     group: Option<String>,
+    /// Narrow the read to one tenant.
+    tenant: Option<String>,
 }
 
 /// `GET /api/v1/correlations/state` — the live per-group window snapshot
@@ -3329,11 +4466,22 @@ struct CorrelationStateQuery {
 /// engine has no correlation rules.
 async fn correlations_state(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(query): axum::extract::Query<CorrelationStateQuery>,
-) -> impl IntoResponse {
-    let snapshot = state
-        .processor
-        .introspect_correlations(query.id.as_deref(), query.group.as_deref());
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    let snapshot = state.processor.introspect_correlations_for_tenant(
+        query.id.as_deref(),
+        query.group.as_deref(),
+        tenant.as_ref(),
+    );
     match snapshot {
         Some(s) => {
             let count = s.groups.len();
@@ -3342,8 +4490,10 @@ async fn correlations_state(
                 "groups": s.groups,
                 "count": count,
             }))
+            .into_response()
         }
-        None => Json(serde_json::json!({ "correlations": [], "groups": [], "count": 0 })),
+        None => Json(serde_json::json!({ "correlations": [], "groups": [], "count": 0 }))
+            .into_response(),
     }
 }
 
@@ -3379,19 +4529,33 @@ struct AuditQuery {
     offset: Option<u64>,
     since: Option<i64>,
     until: Option<i64>,
+    tenant: Option<String>,
 }
 
 /// `GET /api/v1/audit` — paginated control-plane mutation audit log.
 async fn list_audit(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(query): axum::extract::Query<AuditQuery>,
 ) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let Some(audit) = state.audit.as_ref() else {
         return audit_disabled();
     };
     let limit = query.limit.unwrap_or(100).min(1000);
     let offset = query.offset.unwrap_or(0);
-    match audit.query(limit, offset, query.since, query.until).await {
+    let tenant = tenant.map(|tenant| tenant.as_str().to_string());
+    match audit
+        .query(limit, offset, query.since, query.until, tenant)
+        .await
+    {
         Ok((count, entries)) => Json(serde_json::json!({
             "count": count,
             "entries": entries,
@@ -3407,42 +4571,101 @@ async fn list_audit(
 
 /// `POST /api/v1/dispositions` — ingest one or more analyst dispositions (a
 /// single object, a JSON array, or NDJSON). Returns the ingest summary.
-async fn ingest_dispositions(State(state): State<AppState>, body: String) -> Response {
+async fn ingest_dispositions(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    body: String,
+) -> Response {
     let Some(dispositions) = state.disposition_state.as_ref() else {
         return dispositions_disabled();
     };
-    match dispositions.ingest(&body, "api") {
+    // Every record's `tenant` is checked against the token by `write_tenant`,
+    // which refuses a foreign tenant with 403, so a batch may name at most one.
+    let mut body_tenants: Vec<String> = rsigma_runtime::parse_dispositions(&body)
+        .map(|raws| raws.into_iter().filter_map(|raw| raw.tenant).collect())
+        .unwrap_or_default();
+    body_tenants.sort();
+    body_tenants.dedup();
+    if body_tenants.len() > 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "a disposition batch may name only one tenant"
+            })),
+        )
+            .into_response();
+    }
+    let body_tenant = body_tenants.pop();
+    let tenant = match super::tenancy::write_tenant(
+        state.tenancy_enabled,
+        identity.as_ref().map(|e| &e.0),
+        body_tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    let target = tenant.clone();
+    let response = match dispositions.ingest_with_tenant(&body, "api", tenant) {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e })),
         )
             .into_response(),
-    }
+    };
+    super::audit::with_audit_target(response, target.as_ref())
 }
 
 /// `GET /api/v1/dispositions` — the per-rule false-positive ratio view.
-async fn list_dispositions(State(state): State<AppState>) -> Response {
+async fn list_dispositions(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     match state.disposition_state.as_ref() {
-        Some(dispositions) => Json(dispositions.view()).into_response(),
+        Some(dispositions) => Json(dispositions.view_for_tenant(tenant.as_ref())).into_response(),
         None => dispositions_disabled(),
     }
 }
 
 /// `GET /api/v1/silences` — operator silences and their state.
-async fn list_silences(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_silences(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let now = chrono::Utc::now().timestamp();
     let silences = {
         let st = state.alert_state.read().unwrap_or_else(|e| e.into_inner());
-        st.silences.snapshot(now)
+        st.silences.snapshot_scoped(now, tenant.as_ref())
     };
     let count = silences.len();
-    Json(serde_json::json!({ "silences": silences, "count": count }))
+    Json(serde_json::json!({ "silences": silences, "count": count })).into_response()
 }
 
 /// `POST /api/v1/silences` — create a silence. Returns the assigned id.
-async fn create_silence(State(state): State<AppState>, body: String) -> Response {
-    let spec: SilenceSpec = match serde_json::from_str(&body) {
+async fn create_silence(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    body: String,
+) -> Response {
+    let mut spec: SilenceSpec = match serde_json::from_str(&body) {
         Ok(spec) => spec,
         Err(e) => {
             return (
@@ -3452,12 +4675,34 @@ async fn create_silence(State(state): State<AppState>, body: String) -> Response
                 .into_response();
         }
     };
-    let Some((max_silences, limits)) = state
+    let body_tenant = spec.tenant.as_ref().map(|t| t.as_str().to_string());
+    let tenant = match super::tenancy::write_tenant(
+        state.tenancy_enabled,
+        identity.as_ref().map(|e| &e.0),
+        body_tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
+    let target = tenant.clone();
+    spec.tenant = tenant;
+    let response = create_silence_for(&state, spec).await;
+    super::audit::with_audit_target(response, target.as_ref())
+}
+
+async fn create_silence_for(state: &AppState, spec: SilenceSpec) -> Response {
+    let Some((max_silences, max_per_tenant, limits)) = state
         .alert_pipeline_swap
         .load_full()
         .as_ref()
         .as_ref()
-        .map(|p| (p.max_dynamic_silences(), p.silence_limits()))
+        .map(|p| {
+            (
+                p.max_dynamic_silences(),
+                p.max_dynamic_silences_per_tenant(),
+                p.silence_limits(),
+            )
+        })
     else {
         return (
             StatusCode::CONFLICT,
@@ -3474,16 +4719,24 @@ async fn create_silence(State(state): State<AppState>, body: String) -> Response
             let id = silence.id().to_string();
             let added = {
                 let mut st = state.alert_state.write().unwrap_or_else(|e| e.into_inner());
-                st.silences.try_add(silence, max_silences)
+                st.silences
+                    .insert_api(silence, max_silences, max_per_tenant)
             };
-            if added {
-                (
+            match added {
+                Ok(()) => (
                     StatusCode::CREATED,
                     Json(serde_json::json!({ "status": "created", "id": id })),
                 )
-                    .into_response()
-            } else {
-                (
+                    .into_response(),
+                Err(SilenceRejection::DuplicateId) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!("a silence with id '{id}' already exists"),
+                        "id": id,
+                    })),
+                )
+                    .into_response(),
+                Err(SilenceRejection::Full) => (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(serde_json::json!({
                         "error": format!(
@@ -3491,7 +4744,17 @@ async fn create_silence(State(state): State<AppState>, body: String) -> Response
                         )
                     })),
                 )
-                    .into_response()
+                    .into_response(),
+                Err(SilenceRejection::TenantFull) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "this tenant's dynamic silence quota is reached ({}); delete silences or raise daemon.tenancy.quotas.silences",
+                            max_per_tenant.unwrap_or_default()
+                        )
+                    })),
+                )
+                    .into_response(),
             }
         }
         Err(e) => {
@@ -3516,22 +4779,45 @@ async fn create_silence(State(state): State<AppState>, body: String) -> Response
 /// `DELETE /api/v1/silences/{id}` — expire (remove) a silence.
 async fn delete_silence(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> impl IntoResponse {
+    Query(query): Query<super::tenancy::TenantQuery>,
+) -> Response {
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
     let removed = {
         let mut st = state.alert_state.write().unwrap_or_else(|e| e.into_inner());
-        st.silences.remove(&id)
+        st.silences.remove_scoped(&id, tenant.as_ref())
     };
-    if removed {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "deleted", "id": id })),
-        )
-    } else {
-        (
+    match removed {
+        SilenceRemoval::Removed(owner) => super::audit::with_audit_target(
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "deleted", "id": id })),
+            )
+                .into_response(),
+            owner.as_ref(),
+        ),
+        SilenceRemoval::NotFound => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "no such silence", "id": id })),
         )
+            .into_response(),
+        SilenceRemoval::Ambiguous => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("several tenants have a silence with id '{id}'"),
+                "hint": "name one with ?tenant=<id>",
+                "id": id,
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -3594,6 +4880,7 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         detection_matches: state.metrics.detection_matches.get(),
         correlation_matches: state.metrics.correlation_matches.get(),
         uptime_seconds: state.start_time.elapsed().as_secs_f64(),
+        rulesets: state.processor.ruleset_stats(),
         dynamic_sources,
     };
     Json(resp)
@@ -4144,6 +5431,7 @@ async fn fields_observer_reset(State(state): State<AppState>) -> Response {
 /// captured / dropped counts so consumers can detect gaps.
 async fn tap_stream(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(query): axum::extract::Query<super::tap::TapQuery>,
 ) -> Response {
     let Some(tap) = state.tap.as_ref() else {
@@ -4167,13 +5455,21 @@ async fn tap_stream(
                 .into_response();
         }
     };
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
-    let Some(handle) = tap.registry.register(params.stage) else {
+    let Some(handle) = tap.registry.register(params.stage, tenant) else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "tap session capacity reached",
-                "hint": "wait for an active tap to finish, or raise daemon.tap.max_sessions",
+                "hint": "wait for an active tap to finish, or raise daemon.tap.max_sessions (or daemon.tenancy.quotas.stream_sessions)",
             })),
         )
             .into_response();
@@ -4188,6 +5484,7 @@ async fn tap_stream(
 /// reports the streamed / dropped counts.
 async fn detections_stream(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Query(query): axum::extract::Query<super::tail::TailQuery>,
 ) -> Response {
     let Some(tail) = state.tail.as_ref() else {
@@ -4211,24 +5508,83 @@ async fn detections_stream(
                 .into_response();
         }
     };
+    let tenant = match read_tenant(
+        &state,
+        identity.as_ref().map(|e| &e.0),
+        query.tenant.as_deref(),
+    ) {
+        Ok(tenant) => tenant,
+        Err(response) => return response,
+    };
 
-    match super::tail::stream_response(&tail.registry, params, tail.metrics.clone()) {
+    match super::tail::stream_response(&tail.registry, params, tenant, tail.metrics.clone()) {
         Some(response) => response,
         None => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": "tail session capacity reached",
-                "hint": "wait for an active tail to finish, or raise daemon.tail.max_sessions",
+                "hint": "wait for an active tail to finish, or raise daemon.tail.max_sessions (or daemon.tenancy.quotas.stream_sessions)",
             })),
         )
             .into_response(),
     }
 }
 
+/// Resolve the tenant an ingest request binds to. With tenancy on, the
+/// authenticated principal must name exactly one tenant; an `all_tenants`
+/// token has none to bind, so it is refused.
+#[allow(clippy::result_large_err)]
+fn ingest_tenant(
+    enabled: bool,
+    identity: Option<&AuthIdentity>,
+) -> Result<Option<TenantId>, Response> {
+    if !enabled {
+        return Ok(None);
+    }
+    let Some(identity) = identity else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "tenancy is enabled but the request has no authenticated tenant"
+            })),
+        )
+            .into_response());
+    };
+    if identity.all_tenants {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "an all_tenants token cannot ingest; use a tenant-bound token"
+            })),
+        )
+            .into_response());
+    }
+    identity.tenant.clone().map(Some).ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "the authenticated token has no tenant binding"
+            })),
+        )
+            .into_response()
+    })
+}
+
 /// Accept events via HTTP POST for processing.
 /// Each non-empty line in the request body is parsed using the configured
 /// `--input-format` and forwarded to the engine.
-async fn ingest_events(State(state): State<AppState>, body: String) -> Response {
+async fn ingest_events(
+    State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    body: String,
+) -> Response {
+    let tenant = match ingest_tenant(state.tenancy_enabled, identity.as_ref().map(|e| &e.0)) {
+        Ok(tenant) => tenant,
+        Err(response) => {
+            state.metrics.on_tenant_rejected("rest", "no_tenant");
+            return response;
+        }
+    };
     let event_tx = match &state.event_tx {
         Some(tx) => tx,
         None => {
@@ -4262,6 +5618,7 @@ async fn ingest_events(State(state): State<AppState>, body: String) -> Response 
         let raw_event = RawEvent {
             payload: line.to_string(),
             ack_token: AckToken::Noop,
+            tenant: tenant.clone(),
         };
         // Mirror `spawn_source`'s accounting so the input-queue-depth and
         // back-pressure metrics are accurate for the HTTP push source too,
@@ -4316,9 +5673,17 @@ async fn ingest_events(State(state): State<AppState>, body: String) -> Response 
 #[cfg(feature = "daemon-otlp")]
 async fn otlp_http_logs(
     State(state): State<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let tenant = match ingest_tenant(state.tenancy_enabled, identity.as_ref().map(|e| &e.0)) {
+        Ok(tenant) => tenant,
+        Err(response) => {
+            state.metrics.on_tenant_rejected("otlp_http", "no_tenant");
+            return response;
+        }
+    };
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -4429,7 +5794,7 @@ async fn otlp_http_logs(
             .with_label_values(&["http", encoding])
             .inc();
 
-        let raw_events = rsigma_runtime::logs_request_to_raw_events(&request);
+        let raw_events = rsigma_runtime::logs_request_to_raw_events_for(&request, tenant.as_ref());
         let record_count = raw_events.len();
         state.metrics.otlp_log_records.inc_by(record_count as u64);
         tracing::debug!(record_count, "OTLP logs ingested");
@@ -4523,6 +5888,8 @@ struct OtlpLogsGrpcService {
     /// authenticates its own request metadata and answers with proper gRPC
     /// status codes instead of bare HTTP 401/403.
     auth: Option<super::auth::ApiAuth>,
+    /// Whether tenancy is enabled, so a missing tenant is refused.
+    tenancy: bool,
 }
 
 #[cfg(feature = "daemon-otlp")]
@@ -4532,13 +5899,16 @@ impl rsigma_runtime::LogsService for OtlpLogsGrpcService {
         &self,
         request: tonic::Request<rsigma_runtime::ExportLogsServiceRequest>,
     ) -> Result<tonic::Response<rsigma_runtime::ExportLogsServiceResponse>, tonic::Status> {
+        let mut identity = None;
         if let Some(auth) = &self.auth {
             let authorization = request
                 .metadata()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok());
             match auth.check(authorization, super::auth::EVENTS_INGEST) {
-                super::auth::Decision::Allowed(_) => {}
+                super::auth::Decision::Allowed(allowed) => {
+                    identity = Some(allowed);
+                }
                 super::auth::Decision::Unauthorized => {
                     self.metrics
                         .api_auth_failures
@@ -4563,6 +5933,29 @@ impl rsigma_runtime::LogsService for OtlpLogsGrpcService {
                 }
             }
         }
+        let tenant = if self.tenancy {
+            match identity.as_ref().and_then(|identity| {
+                if identity.all_tenants {
+                    None
+                } else {
+                    identity.tenant.clone()
+                }
+            }) {
+                Some(tenant) => Some(tenant),
+                None => {
+                    self.metrics
+                        .api_auth_failures
+                        .with_label_values(&["forbidden"])
+                        .inc();
+                    self.metrics.on_tenant_rejected("otlp_grpc", "no_tenant");
+                    return Err(tonic::Status::permission_denied(
+                        "tenancy is enabled; the token must name exactly one tenant to ingest",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let span = tracing::debug_span!("otlp_ingest", transport = "grpc", encoding = "protobuf");
         async move {
             self.metrics
@@ -4570,7 +5963,10 @@ impl rsigma_runtime::LogsService for OtlpLogsGrpcService {
                 .with_label_values(&["grpc", "protobuf"])
                 .inc();
 
-            let raw_events = rsigma_runtime::logs_request_to_raw_events(&request.into_inner());
+            let raw_events = rsigma_runtime::logs_request_to_raw_events_for(
+                &request.into_inner(),
+                tenant.as_ref(),
+            );
             let record_count = raw_events.len();
             self.metrics.otlp_log_records.inc_by(record_count as u64);
             tracing::debug!(record_count, "OTLP logs ingested");
@@ -4598,6 +5994,51 @@ impl rsigma_runtime::LogsService for OtlpLogsGrpcService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundle_joins_only_its_own_tenants_risk_entities() {
+        let entity = |tenant: Option<&str>| rsigma_runtime::RiskEntityView {
+            tenant_id: tenant.map(|t| TenantId::new(t).unwrap()),
+            entity_type: "user".to_string(),
+            entity_value: "alice".to_string(),
+            score: 100,
+            tactic_count: 1,
+            source_count: 1,
+            result_count: 1,
+            window_start: 0,
+            window_end: 60,
+            last_fired: None,
+        };
+        let views = vec![entity(Some("a")), entity(Some("b")), entity(None)];
+        let a = TenantId::new("a").unwrap();
+
+        let kept = same_tenant_entities(views.clone(), Some(&a));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].tenant_id.as_ref(), Some(&a));
+
+        let untenanted = same_tenant_entities(views, None);
+        assert_eq!(untenanted.len(), 1);
+        assert!(untenanted[0].tenant_id.is_none());
+    }
+
+    #[test]
+    fn tenant_routing_is_limited_to_findings_file_and_nats_sinks() {
+        let check = |spec: &str, role| {
+            let (base, params) = split_query(spec);
+            check_tenant_routing(base, &params, role)
+        };
+        assert!(check("file:///out/{tenant}.ndjson?max_open=8", SinkRole::Findings).is_ok());
+        assert!(check("nats://h:4222/det.{tenant}", SinkRole::Findings).is_ok());
+        assert!(check("stdout?tenant=a", SinkRole::Findings).is_ok());
+
+        assert!(check("file:///dlq/{tenant}.ndjson", SinkRole::Dlq).is_err());
+        assert!(check("file:///dlq.ndjson?tenant=a", SinkRole::Dlq).is_err());
+        assert!(check("file:///audit.ndjson?max_open=2", SinkRole::Audit).is_err());
+        assert!(check("otlp://h:4317/{tenant}", SinkRole::Findings).is_err());
+        assert!(check("file:///{tenant}/{tenant}.ndjson", SinkRole::Findings).is_err());
+        assert!(check("file:///out.ndjson?max_open=8", SinkRole::Findings).is_err());
+        assert!(check("nats://h:4222/det.{tenant}?max_open=8", SinkRole::Findings).is_err());
+    }
 
     #[test]
     fn dropped_failure_warnings_are_rate_limited() {
@@ -4734,12 +6175,16 @@ mod tests {
                     role: Some("ingest".into()),
                     permissions: None,
                     token_env: "SHIPPER".into(),
+                    tenant: None,
+                    all_tenants: false,
                 },
                 TokenSpec {
                     name: "viewer".into(),
                     role: Some("reader".into()),
                     permissions: None,
                     token_env: "VIEWER".into(),
+                    tenant: None,
+                    all_tenants: false,
                 },
             ];
             ApiAuth::build(&[], &tokens, &[], |key| match key {
@@ -4757,6 +6202,7 @@ mod tests {
                     event_tx,
                     metrics: Arc::new(Metrics::new()),
                     auth,
+                    tenancy: false,
                 },
                 event_rx,
             )

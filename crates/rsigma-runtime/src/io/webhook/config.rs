@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+
+use rsigma_eval::TenantId;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -27,7 +29,8 @@ use zeroize::Zeroizing;
 
 use crate::enrichment::{
     EnricherKind, HttpEnricherClient, Scope, TemplateError, build_default_http_client,
-    validate_incident_template, validate_template_namespace,
+    validate_incident_template, validate_template_namespace, validate_url_tenant_position,
+    validate_webhook_body_template,
 };
 use crate::io::DeliveryConfig;
 use crate::metrics::MetricsHook;
@@ -90,6 +93,10 @@ pub struct WebhookConfig {
     /// Per-request timeout. Accepts humantime strings (`5s`, `200ms`).
     #[serde(default, with = "humantime_opt")]
     pub timeout: Option<Duration>,
+    /// OCSF schema version for `${detection.ocsf}` / `${correlation.ocsf}`.
+    /// Default `1.1.0`. A load error when set and the body does not use the variable.
+    #[serde(default)]
+    pub ocsf_version: Option<String>,
     /// Retry tuning. Overrides the daemon's `--sink-*` delivery defaults.
     #[serde(default)]
     pub retry: Option<RetryConfig>,
@@ -219,6 +226,8 @@ pub struct ScopeConfig {
     pub tags: Vec<String>,
     #[serde(default)]
     pub levels: Vec<String>,
+    #[serde(default)]
+    pub tenants: Vec<String>,
 }
 
 /// Parsed `kind:` discriminator.
@@ -307,12 +316,27 @@ pub enum WebhookConfigError {
         reference: String,
         field: &'static str,
     },
+    /// `${detection.ocsf}` / `${correlation.ocsf}` appeared outside the body,
+    /// or in the body but not as a whole JSON value.
+    MisplacedOcsf {
+        webhook_id: String,
+        reference: String,
+        field: &'static str,
+    },
+    /// `ocsf_version` was unknown, or set on a webhook whose body does not insert a finding.
+    InvalidOcsfVersion { webhook_id: String, message: String },
     /// `retry` settings were invalid (e.g. zero attempts).
     InvalidRetry { webhook_id: String, message: String },
     /// `rate_limit` settings were invalid.
     InvalidRateLimit { webhook_id: String, message: String },
     /// `scope` failed to compile.
     Scope { webhook_id: String, message: String },
+    /// A field was invalid for a reason specific to its content.
+    InvalidField {
+        webhook_id: String,
+        field: &'static str,
+        message: String,
+    },
     /// `tls` material was invalid or unreadable.
     Tls { webhook_id: String, message: String },
     /// A signing `secret_env` was unset or empty in the environment.
@@ -361,6 +385,18 @@ impl std::fmt::Display for WebhookConfigError {
                 f,
                 "webhook '{webhook_id}': malformed template reference '${{{reference}}}' in field '{field}'; expected ${{detection.*}}, ${{correlation.*}}, or ${{ENV_VAR}}"
             ),
+            WebhookConfigError::MisplacedOcsf {
+                webhook_id,
+                reference,
+                field,
+            } => write!(
+                f,
+                "webhook '{webhook_id}': '${{{reference}}}' in field '{field}' is only valid in body, as a whole JSON value (for example \"finding\": ${{{reference}}}), not inside a string"
+            ),
+            WebhookConfigError::InvalidOcsfVersion {
+                webhook_id,
+                message,
+            } => write!(f, "webhook '{webhook_id}': {message}"),
             WebhookConfigError::InvalidRetry {
                 webhook_id,
                 message,
@@ -373,6 +409,11 @@ impl std::fmt::Display for WebhookConfigError {
                 webhook_id,
                 message,
             } => write!(f, "webhook '{webhook_id}': {message}"),
+            WebhookConfigError::InvalidField {
+                webhook_id,
+                field,
+                message,
+            } => write!(f, "webhook '{webhook_id}': field '{field}': {message}"),
             WebhookConfigError::Tls {
                 webhook_id,
                 message,
@@ -440,12 +481,21 @@ fn build_one(
     }
 
     check_template(&cfg.url, kind, &cfg.id, "url")?;
+    validate_url_tenant_position(&cfg.url).map_err(|message| WebhookConfigError::InvalidField {
+        webhook_id: cfg.id.clone(),
+        field: "url",
+        message,
+    })?;
     for (name, value) in &cfg.headers {
         let field: &'static str = Box::leak(format!("headers.{name}").into_boxed_str());
         check_template(value, kind, &cfg.id, field)?;
     }
     if let Some(body) = &cfg.body {
-        check_template(body, kind, &cfg.id, "body")?;
+        match kind.as_enricher_kind() {
+            Some(ek) => validate_webhook_body_template(body, ek, &cfg.id)
+                .map_err(|te| template_error(te, kind, &cfg.id))?,
+            None => check_template(body, kind, &cfg.id, "body")?,
+        }
     }
     if kind == WebhookKind::Incident && cfg.scope.is_some() {
         return Err(WebhookConfigError::Scope {
@@ -468,16 +518,26 @@ fn build_one(
         None => reqwest::Method::POST,
     };
 
-    let scope =
-        match &cfg.scope {
-            Some(s) => Scope::new(s.rules.clone(), s.tags.clone(), s.levels.clone()).map_err(
-                |message| WebhookConfigError::Scope {
+    let scope = match &cfg.scope {
+        Some(s) => {
+            let tenants = s
+                .tenants
+                .iter()
+                .map(|tenant| TenantId::new(tenant))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| WebhookConfigError::Scope {
+                    webhook_id: cfg.id.clone(),
+                    message: error.to_string(),
+                })?;
+            Scope::new(s.rules.clone(), s.tags.clone(), s.levels.clone())
+                .map_err(|message| WebhookConfigError::Scope {
                     webhook_id: cfg.id.clone(),
                     message,
-                },
-            )?,
-            None => Scope::default(),
-        };
+                })?
+                .with_tenants(tenants)
+        }
+        None => Scope::default(),
+    };
 
     let limiter = match &cfg.rate_limit {
         Some(rl) => {
@@ -538,10 +598,33 @@ fn build_one(
     };
 
     metrics.register_webhook(&cfg.id);
+    let uses_ocsf = cfg
+        .body
+        .as_deref()
+        .is_some_and(|body| body.contains(".ocsf}"));
+    let ocsf = match cfg.ocsf_version.as_deref() {
+        None => crate::ocsf::OcsfOptions::default(),
+        Some(raw) => {
+            if !uses_ocsf {
+                return Err(WebhookConfigError::InvalidOcsfVersion {
+                    webhook_id: cfg.id.clone(),
+                    message: "ocsf_version is only valid when body uses ${detection.ocsf} or ${correlation.ocsf}".to_string(),
+                });
+            }
+            let version =
+                raw.parse()
+                    .map_err(|e: String| WebhookConfigError::InvalidOcsfVersion {
+                        webhook_id: cfg.id.clone(),
+                        message: e,
+                    })?;
+            crate::ocsf::OcsfOptions::new(version)
+        }
+    };
     let sink = WebhookSink::new(
         cfg.id, kind, method, cfg.url, headers, cfg.body, timeout, scope, limiter, client, metrics,
         signer,
-    );
+    )
+    .with_ocsf_options(ocsf);
     Ok(BuiltWebhook { sink, delivery })
 }
 
@@ -625,7 +708,11 @@ fn check_template(
         Some(ek) => validate_template_namespace(text, ek, id, field),
         None => validate_incident_template(text, id, field),
     };
-    checked.map_err(|te| match te {
+    checked.map_err(|te| template_error(te, kind, id))
+}
+
+fn template_error(te: TemplateError, kind: WebhookKind, id: &str) -> WebhookConfigError {
+    match te {
         TemplateError::CrossNamespace {
             reference, field, ..
         } => WebhookConfigError::CrossNamespace {
@@ -641,7 +728,14 @@ fn check_template(
             reference,
             field,
         },
-    })
+        TemplateError::MisplacedOcsf {
+            reference, field, ..
+        } => WebhookConfigError::MisplacedOcsf {
+            webhook_id: id.to_string(),
+            reference,
+            field,
+        },
+    }
 }
 
 /// Validate a `signing:` block and build its [`WebhookSigner`].
@@ -1018,6 +1112,77 @@ webhooks:
             "{msg}"
         );
         assert!(msg.contains("field 'body'"), "{msg}");
+    }
+
+    #[test]
+    fn ocsf_body_reference_builds_as_a_whole_json_value() {
+        build(
+            r#"
+webhooks:
+  - id: siem
+    kind: correlation
+    url: https://example.test/hook
+    body: '{"source": "rsigma", "finding": ${correlation.ocsf}}'
+"#,
+        )
+        .expect("a whole-value OCSF reference is valid");
+    }
+
+    #[test]
+    fn ocsf_version_without_a_finding_variable_is_rejected() {
+        let err = build_err(
+            r#"
+webhooks:
+  - id: siem
+    kind: detection
+    url: https://example.test/hook
+    ocsf_version: "1.3.0"
+    body: '{"source": "rsigma"}'
+"#,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("ocsf_version is only valid"), "{msg}");
+    }
+
+    #[test]
+    fn ocsf_version_1_3_0_is_accepted_with_the_finding_variable() {
+        build(
+            r#"
+webhooks:
+  - id: siem
+    kind: detection
+    url: https://example.test/hook
+    ocsf_version: "1.3.0"
+    body: '{"finding": ${detection.ocsf}}'
+"#,
+        )
+        .expect("ocsf_version 1.3.0 with a finding variable loads");
+    }
+
+    #[test]
+    fn misplaced_ocsf_reference_is_rejected_per_field() {
+        for (fields, field) in [
+            ("url: https://example.test/${detection.ocsf}", "field 'url'"),
+            (
+                "url: https://example.test/hook\n    headers:\n      X-Finding: '${detection.ocsf}'",
+                "field 'headers.X-Finding'",
+            ),
+            (
+                "url: https://example.test/hook\n    body: '{\"finding\": \"${detection.ocsf}\"}'",
+                "field 'body'",
+            ),
+        ] {
+            let err = build_err(&format!(
+                "webhooks:\n  - id: x\n    kind: detection\n    {fields}\n"
+            ));
+            assert!(
+                matches!(err, WebhookConfigError::MisplacedOcsf { .. }),
+                "{fields}: {err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{msg}");
+            assert!(msg.contains("whole JSON value"), "{msg}");
+        }
     }
 
     #[test]

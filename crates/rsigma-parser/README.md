@@ -36,9 +36,22 @@ The parser runs these checks on every detection item, and `rsigma-ir` reruns the
 | Function | Description |
 |----------|-------------|
 | `emit_rule_yaml(rule: &SigmaRule)` | Emit a rule as canonical Sigma YAML (the inverse of `parse_sigma_yaml`) |
+| `emit_correlation_yaml(rule: &CorrelationRule)` | Emit a correlation rule as canonical Sigma YAML |
+| `emit_filter_yaml(rule: &FilterRule)` | Emit a filter rule as canonical Sigma YAML |
 | `emit_collection_yaml(collection: &SigmaCollection)` | Emit every detection rule in a collection, separated by `---` |
 
 The emitter is a deterministic canonical form: named detections, logsource custom fields, and custom attributes are emitted in sorted order, `field|modifier` keys are reconstructed from the `FieldSpec`, and literal wildcards in values are escaped so a re-parse reproduces the same `SigmaString` (while `re`/`cidr`/`fieldref` values stay raw). It powers `rsigma-convert`'s reverse conversion (query to Sigma YAML). Sequences of mappings, including `rsigma.exemplars`, round-trip through emit.
+
+### Rulesets
+
+| Function | Description |
+|----------|-------------|
+| `ruleset::resolve_ruleset(name, spec, opts)` | Resolve a `RulesetSpec` from disk: walk sources, apply selectors, enforce dependency policy, apply overlays, and return a `ResolvedRuleset` with decisions and warnings |
+| `ruleset::resolve_loaded(name, spec, loaded, loader)` | Resolve from already-loaded sources and a caller-provided overlay loader |
+| `ruleset::load_sources(spec, opts)` | Walk and parse the spec's sources into candidates |
+| `ruleset::validate_spec(name, spec)` | Static validation of a spec: names, paths, selectors, policies, and overlay shapes |
+
+`ResolveOptions { confine_to }` rejects any source or overlay file outside a root. Pipelines are not resolved here, so callers confine pipeline paths themselves. The spec types derive `serde::Serialize`/`Deserialize`; with the `schema` feature they also derive `schemars::JsonSchema`.
 
 ### Formatting
 
@@ -278,7 +291,7 @@ The `rsigma.*` spelling wins when both are present. Either spelling maps to `Cor
 
 ## Filter Rules
 
-Filter rules inject exclusion conditions into referenced detection rules, enables centralized tuning without modifying original rule files. See the [Sigma Filters Specification](https://sigmahq.io/sigma-specification/specification/sigma-filters-specification.html) for the full standard.
+Filter rules inject exclusion conditions into referenced detection rules, enables centralized tuning without modifying original rule files. See the [Sigma Filters Specification](https://github.com/SigmaHQ/sigma-specification/blob/0c857d07da0e71eaaab2d667b3cce6f2c8469578/specification/sigma-filters-specification.md) for the full standard.
 
 Per the spec, `selection`, `condition`, and `rules` all live inside the `filter` section:
 

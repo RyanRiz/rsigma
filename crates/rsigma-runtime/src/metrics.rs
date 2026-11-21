@@ -62,6 +62,50 @@ pub trait MetricsHook: Send + Sync {
     /// HTTP enrichment cache lookup found an expired entry and evicted it.
     fn on_enrichment_http_cache_expiration(&self, _enricher_id: &str) {}
 
+    /// An MMDB enrichment lookup found a record and, when a field projection
+    /// was configured, produced a non-empty object.
+    fn on_enrichment_mmdb_hit(&self, _enricher_id: &str) {}
+    /// An MMDB enrichment lookup had no record for the IP, or its field
+    /// projection was empty. Counted whether or not a `default` was injected.
+    fn on_enrichment_mmdb_miss(&self, _enricher_id: &str) {}
+    /// An MMDB database reload attempt finished. `success` is false when the
+    /// old reader was kept because the file was missing, partial, or corrupt.
+    fn on_enrichment_mmdb_reload(&self, _database: &str, _success: bool) {}
+    /// Set the build epoch of the currently loaded MMDB database, so operators
+    /// can alert on staleness.
+    fn set_enrichment_mmdb_build_epoch(&self, _database: &str, _epoch_seconds: u64) {}
+    /// Pre-register an MMDB enricher's hit and miss label sets so those
+    /// counters appear on `/metrics` from startup.
+    fn register_mmdb_enricher(&self, _enricher_id: &str) {}
+    /// Pre-register an MMDB database's reload counter label sets and its
+    /// build-epoch gauge so they appear on `/metrics` from startup.
+    fn register_mmdb_database(&self, _database: &str) {}
+
+    /// A DNS enrichment query was answered from the response cache, including
+    /// cached negative answers.
+    fn on_enrichment_dns_cache_hit(&self, _enricher_id: &str) {}
+    /// A DNS enrichment query went to a nameserver, including every query when
+    /// caching is disabled.
+    fn on_enrichment_dns_cache_miss(&self, _enricher_id: &str) {}
+    /// A DNS enrichment query completed with `result`, one of `answer` (at
+    /// least one record of the queried type), `no_records` (NXDOMAIN or
+    /// NODATA), or `error` (SERVFAIL, refused, I/O, or a resolver timeout).
+    fn on_enrichment_dns_query(&self, _enricher_id: &str, _result: &'static str) {}
+    /// Pre-register a DNS enricher's cache hit and miss label sets and all
+    /// three `result` values so the counters appear on `/metrics` from
+    /// startup.
+    fn register_dns_enricher(&self, _enricher_id: &str) {}
+
+    /// Pre-register a ruleset's `kind`-labeled families and skipped counter.
+    fn register_ruleset(&self, _ruleset: &str) {}
+    /// A result was produced by `ruleset`; `kind` is `detection` or
+    /// `correlation`.
+    fn on_ruleset_match(&self, _ruleset: &str, _kind: &'static str) {}
+    /// `count` events were kept away from `ruleset` by a `when` binding.
+    fn on_ruleset_events_skipped(&self, _ruleset: &str, _count: u64) {}
+    /// Report the loaded rule counts for `ruleset`.
+    fn on_ruleset_rules_loaded(&self, _ruleset: &str, _detection: usize, _correlation: usize) {}
+
     /// Pre-register an enricher's `enricher_id` + `kind` label set so
     /// `rsigma_enrichment_total{...}` and
     /// `rsigma_enrichment_duration_seconds{...}` are emitted with their
@@ -69,6 +113,19 @@ pub trait MetricsHook: Send + Sync {
     /// scrape, even before the enricher has run. Called once per
     /// configured enricher at pipeline construction.
     fn register_enricher(&self, _enricher_id: &str, _kind: &str) {}
+
+    /// Pre-register the STIX source gauge and skip-reason counters for `source_id`.
+    fn register_stix_source(&self, _source_id: &str) {}
+    /// Set the number of active indicators for `source_id`.
+    fn set_stix_source_indicators(&self, _source_id: &str, _count: u64) {}
+    /// Count STIX objects received while resolving `source_id`.
+    fn on_stix_source_objects(&self, _source_id: &str, _count: u64) {}
+    /// Count indicators or observables skipped for `reason`.
+    ///
+    /// `reason` is one of `revoked`, `expired`, `not_yet_valid`, `low_confidence`,
+    /// `pattern_type`, `unsupported_pattern`, `unmapped_observable`, `invalid_pattern`,
+    /// or `over_limit`.
+    fn on_stix_source_skipped(&self, _source_id: &str, _reason: &'static str, _count: u64) {}
     /// Pre-register the three HTTP-cache counter label sets for an
     /// `HttpEnricher` instance so the cache counters are visible on
     /// `/metrics` from startup, even before any cache event fires.
@@ -156,6 +213,16 @@ pub trait MetricsHook: Send + Sync {
     /// `incident_event_cap`, `incident_byte_cap`, `global_byte_cap`, or
     /// `unsupported_result_kind`.
     fn on_capture_event_dropped(&self, _reason: &str) {}
+    /// Entries were evicted because a tenant hit its quota. `store` is one of
+    /// `correlation_state`, `active_alerts`, `incidents`, or `risk_entities`.
+    fn on_tenant_quota_eviction(&self, _store: &'static str) {}
+    /// Ingest was rejected because it had no tenant binding or because the
+    /// engine skipped an untenanted event. `channel` is `rest`, `otlp_http`,
+    /// `otlp_grpc`, or `engine`; `reason` is `no_tenant` or `untenanted_event`.
+    fn on_tenant_rejected(&self, _channel: &'static str, _reason: &'static str) {}
+    /// `tenant` produced a detection or correlation match. Tenants outside the
+    /// operator allowlist arrive as `other`.
+    fn on_tenant_match(&self, _tenant: &str) {}
     /// A ring incident was evicted. `reason` is `ring_full` or `ttl`.
     fn on_capture_eviction(&self, _reason: &str) {}
     /// Report the current number of incidents held in the capture ring.

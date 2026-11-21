@@ -6,7 +6,7 @@
 //! `--format json` so agents can branch on a structured envelope. The global
 //! `--output-format` is honored when the local `--format` is unset.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process;
 
@@ -22,6 +22,218 @@ use crate::output::{
 use super::defaults::defaults_partial;
 use super::resolve::{Source, env_partial, resolve_layers, to_value, value_at};
 use super::{discover, ignored_key_warning, inactive_sections, load_layered};
+use rsigma_parser::ruleset::validate_spec;
+
+/// Validate the `daemon.rulesets` selection.
+fn daemon_ruleset_errors(config: &super::RsigmaConfigPartial) -> Vec<SemanticError> {
+    let mut errors = Vec::new();
+    let defined: HashSet<&str> = config
+        .rulesets
+        .as_ref()
+        .map(|rulesets| rulesets.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let Some(daemon) = &config.daemon else {
+        return errors;
+    };
+    let list = daemon
+        .rulesets
+        .as_ref()
+        .filter(|entries| !entries.is_empty());
+    if daemon.rules.is_some() && list.is_some() {
+        errors.push(SemanticError::new(
+            "daemon",
+            "set either daemon.rules or daemon.rulesets, not both",
+        ));
+    }
+    if let Some(entries) = list {
+        ruleset_list_errors("daemon", entries, &defined, &mut errors);
+    }
+    errors
+}
+
+/// One semantic problem found while validating a config section, keyed by
+/// the dotted config path it concerns.
+#[derive(Debug, Clone)]
+struct SemanticError {
+    path: String,
+    message: String,
+}
+
+impl SemanticError {
+    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Validate the `convert` section: group names, ruleset references, and the
+/// fields a group needs after the defaults are folded in.
+fn convert_errors(config: &super::RsigmaConfigPartial) -> Vec<SemanticError> {
+    use rsigma_parser::ruleset::validate_ruleset_name;
+
+    let mut errors = Vec::new();
+    let Some(convert) = &config.convert else {
+        return errors;
+    };
+    let Some(groups) = &convert.groups else {
+        return errors;
+    };
+    let defined: HashSet<&str> = config
+        .rulesets
+        .as_ref()
+        .map(|rulesets| rulesets.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    for (name, group) in groups {
+        let path = format!("convert.groups.{name}");
+        if let Err(message) = validate_ruleset_name(name) {
+            errors.push(SemanticError {
+                path: path.clone(),
+                message: message.replace("ruleset name", "group name"),
+            });
+        }
+        let effective = convert.effective(group);
+        let Some(ruleset) = effective.ruleset.as_deref() else {
+            errors.push(SemanticError {
+                path: path.clone(),
+                message: format!("convert group '{name}' has no ruleset"),
+            });
+            continue;
+        };
+        if !defined.contains(ruleset) {
+            errors.push(SemanticError {
+                path: path.clone(),
+                message: format!("convert group '{name}' names unknown ruleset '{ruleset}'"),
+            });
+        }
+        if effective.target.is_none() {
+            errors.push(SemanticError {
+                path: path.clone(),
+                message: format!("convert group '{name}' has no target"),
+            });
+        }
+        if effective.output.is_none() {
+            errors.push(SemanticError {
+                path: path.clone(),
+                message: format!("convert group '{name}' has no output"),
+            });
+        }
+    }
+    for (name, message) in convert.output_collisions() {
+        errors.push(SemanticError::new(
+            format!("convert.groups.{name}"),
+            message,
+        ));
+    }
+    errors
+}
+
+/// Validate the `eval.ruleset`/`eval.rulesets` selection.
+fn eval_ruleset_errors(config: &super::RsigmaConfigPartial) -> Vec<SemanticError> {
+    let mut errors = Vec::new();
+    let defined: HashSet<&str> = config
+        .rulesets
+        .as_ref()
+        .map(|rulesets| rulesets.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let Some(eval) = &config.eval else {
+        return errors;
+    };
+    let list = eval.rulesets.as_ref().filter(|entries| !entries.is_empty());
+    if eval.rules.is_some() && (eval.ruleset.is_some() || list.is_some()) {
+        errors.push(SemanticError::new(
+            "eval",
+            "set either eval.rules or eval.ruleset/eval.rulesets, not both",
+        ));
+    }
+    if eval.ruleset.is_some() && list.is_some() {
+        errors.push(SemanticError::new(
+            "eval",
+            "set either eval.ruleset or eval.rulesets, not both",
+        ));
+    }
+    if let Some(name) = &eval.ruleset
+        && !defined.contains(name.as_str())
+    {
+        errors.push(SemanticError::new(
+            "eval.ruleset",
+            format!("eval.ruleset names unknown ruleset '{name}'"),
+        ));
+    }
+    if let Some(entries) = list {
+        ruleset_list_errors("eval", entries, &defined, &mut errors);
+    }
+    errors
+}
+
+/// Check a `<section>.rulesets` list for duplicate or undefined names and
+/// unknown entry or `when` keys. Schema names are checked when the classifier
+/// loads, since `--schema-config` can add schemas.
+fn ruleset_list_errors(
+    section: &str,
+    entries: &[super::RulesetEntryPartial],
+    defined: &HashSet<&str>,
+    errors: &mut Vec<SemanticError>,
+) {
+    let path = format!("{section}.rulesets");
+    let mut seen = HashSet::new();
+    for entry in entries {
+        let (name, when, tenants, unknown) = match entry {
+            super::RulesetEntryPartial::Name(name) => (name, None, None, None),
+            super::RulesetEntryPartial::Bound {
+                name,
+                when,
+                tenants,
+                unknown,
+            } => (name, when.as_ref(), tenants.as_ref(), Some(unknown)),
+        };
+        if section != "daemon" && tenants.is_some_and(|t| !t.is_empty()) {
+            errors.push(SemanticError::new(
+                &path,
+                format!(
+                    "ruleset '{name}' sets `tenants`, which is only valid under daemon.rulesets"
+                ),
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            errors.push(SemanticError::new(
+                &path,
+                format!("duplicate ruleset name '{name}'"),
+            ));
+        }
+        if !defined.contains(name.as_str()) {
+            errors.push(SemanticError::new(
+                &path,
+                format!("{section}.rulesets names unknown ruleset '{name}'"),
+            ));
+        }
+        if let Some(unknown) = unknown
+            && !unknown.is_empty()
+        {
+            errors.push(SemanticError::new(
+                &path,
+                format!(
+                    "unknown key(s) in ruleset entry '{name}': {}",
+                    unknown.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+        if let Some(when) = when
+            && !when.unknown.is_empty()
+        {
+            errors.push(SemanticError::new(
+                &path,
+                format!(
+                    "unknown key(s) in `when` of ruleset entry '{name}': {}",
+                    when.unknown.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+    }
+}
 
 /// Render protected keys dropped from project files as `[{file, key}]`.
 fn ignored_keys_json(ignored: &[(PathBuf, &'static str)]) -> Value {
@@ -89,7 +301,7 @@ pub(crate) struct ShowArgs {
     pub config: Option<PathBuf>,
 
     /// Restrict output to one section
-    #[arg(long = "for", value_parser = ["global", "daemon", "eval"])]
+    #[arg(long = "for", value_parser = ["global", "daemon", "eval", "rulesets", "convert"])]
     pub section: Option<String>,
 
     /// Output format: text (default), json, or yaml. When unset, the global
@@ -208,7 +420,24 @@ fn cmd_validate(args: ValidateArgs, ctx: OutputCtx) {
         Ok(loaded) => {
             let inactive = inactive_sections(&loaded.config);
             let unknown_count = loaded.unknown_keys.len();
-            let failed = args.strict && unknown_count > 0;
+            let mut semantic_errors: Vec<SemanticError> = loaded
+                .config
+                .rulesets
+                .as_ref()
+                .map(|rulesets| {
+                    let mut errors = Vec::new();
+                    for (name, spec) in rulesets {
+                        for message in validate_spec(name, spec) {
+                            errors.push(SemanticError::new(format!("rulesets.{name}"), message));
+                        }
+                    }
+                    errors
+                })
+                .unwrap_or_default();
+            semantic_errors.extend(eval_ruleset_errors(&loaded.config));
+            semantic_errors.extend(daemon_ruleset_errors(&loaded.config));
+            semantic_errors.extend(convert_errors(&loaded.config));
+            let failed = (args.strict && unknown_count > 0) || !semantic_errors.is_empty();
 
             let envelope = serde_json::json!({
                 "ok": !failed,
@@ -223,6 +452,13 @@ fn cmd_validate(args: ValidateArgs, ctx: OutputCtx) {
                     .collect::<Vec<_>>(),
                 "ignored_keys": ignored_keys_json(&loaded.ignored_keys),
                 "inactive_sections": inactive,
+                "semantic_errors": semantic_errors
+                    .iter()
+                    .map(|error| serde_json::json!({
+                        "path": error.path,
+                        "message": error.message,
+                    }))
+                    .collect::<Vec<_>>(),
             });
 
             let mut rows = Vec::new();
@@ -245,6 +481,13 @@ fn cmd_validate(args: ValidateArgs, ctx: OutputCtx) {
                     kind: "inactive_section".into(),
                     file: String::new(),
                     detail: section.to_string(),
+                });
+            }
+            for error in &semantic_errors {
+                rows.push(ValidateIssueRow {
+                    kind: "semantic_error".into(),
+                    file: error.path.clone(),
+                    detail: error.message.clone(),
                 });
             }
             if rows.is_empty() {
@@ -289,8 +532,16 @@ fn cmd_validate(args: ValidateArgs, ctx: OutputCtx) {
                             "warning: section '{section}' is set but inert in this build (feature disabled)"
                         );
                     }
+                    for error in &semantic_errors {
+                        eprintln!("error: {}", error.message);
+                    }
                     if failed {
-                        eprintln!("{unknown_count} unknown key(s) found (--strict)");
+                        if unknown_count > 0 {
+                            eprintln!("{unknown_count} unknown key(s) found (--strict)");
+                        }
+                        if !semantic_errors.is_empty() {
+                            eprintln!("{} configuration error(s) found", semantic_errors.len());
+                        }
                     } else {
                         eprintln!("Config is valid.");
                     }
@@ -532,4 +783,79 @@ fn resolve_local_or_global(
         return default.to_string();
     }
     default.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partial(yaml: &str) -> super::super::RsigmaConfigPartial {
+        yaml_serde::from_str(yaml).expect("valid partial")
+    }
+
+    #[test]
+    fn convert_errors_accept_a_complete_group() {
+        let config = partial(
+            "rulesets:\n  linux_edge:\n    sources: [rules]\nconvert:\n  defaults:\n    target: postgres\n  groups:\n    linux_edge_pg:\n      ruleset: linux_edge\n      output: build/linux_edge.sql\n",
+        );
+        assert!(convert_errors(&config).is_empty());
+    }
+
+    #[test]
+    fn convert_errors_report_a_missing_target_and_output() {
+        let config = partial(
+            "rulesets:\n  linux_edge:\n    sources: [rules]\nconvert:\n  groups:\n    linux_edge_pg:\n      ruleset: linux_edge\n",
+        );
+        let messages: Vec<String> = convert_errors(&config)
+            .into_iter()
+            .map(|error| error.message)
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "convert group 'linux_edge_pg' has no target")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "convert group 'linux_edge_pg' has no output")
+        );
+    }
+
+    #[test]
+    fn convert_errors_report_an_unknown_ruleset() {
+        let config = partial(
+            "convert:\n  groups:\n    g:\n      ruleset: nope\n      target: postgres\n      output: build/g.sql\n",
+        );
+        let errors = convert_errors(&config);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "convert.groups.g");
+        assert_eq!(
+            errors[0].message,
+            "convert group 'g' names unknown ruleset 'nope'"
+        );
+    }
+
+    #[test]
+    fn convert_errors_report_an_invalid_group_name() {
+        let config = partial(
+            "rulesets:\n  linux_edge:\n    sources: [rules]\nconvert:\n  groups:\n    Linux:\n      ruleset: linux_edge\n      target: postgres\n      output: build/g.sql\n",
+        );
+        let errors = convert_errors(&config);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].message,
+            "invalid group name 'Linux': must start with a-z"
+        );
+    }
+
+    #[test]
+    fn convert_errors_require_a_ruleset() {
+        let config = partial(
+            "convert:\n  groups:\n    g:\n      target: postgres\n      output: build/g.sql\n",
+        );
+        let errors = convert_errors(&config);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "convert group 'g' has no ruleset");
+    }
 }

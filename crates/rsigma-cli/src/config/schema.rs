@@ -9,9 +9,10 @@
 //! TLS key password) are deliberately absent: they stay env/flag-only so that
 //! a version-controlled config file never carries secrets.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
+use rsigma_parser::ruleset::RulesetSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,23 @@ pub(crate) trait Merge {
 fn merge_opt<T: Merge>(base: Option<T>, over: Option<T>) -> Option<T> {
     match (base, over) {
         (Some(base), Some(over)) => Some(base.merge(over)),
+        (base, over) => over.or(base),
+    }
+}
+
+/// Merge two named maps by replacing a whole entry, so a higher layer that
+/// redefines a name does not inherit fields from the lower definition.
+fn merge_named<T>(
+    base: Option<BTreeMap<String, T>>,
+    over: Option<BTreeMap<String, T>>,
+) -> Option<BTreeMap<String, T>> {
+    match (base, over) {
+        (Some(mut base), Some(over)) => {
+            for (name, value) in over {
+                base.insert(name, value);
+            }
+            Some(base)
+        }
         (base, over) => over.or(base),
     }
 }
@@ -65,6 +83,12 @@ pub(crate) struct RsigmaConfigPartial {
     /// `rsigma mcp serve` settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpPartial>,
+    /// Named rule sets: sources, selectors, dependency policy, overlays, and pipelines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rulesets: Option<BTreeMap<String, RulesetSpec>>,
+    /// `rsigma backend build` conversion groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convert: Option<ConvertPartial>,
 }
 
 impl Merge for RsigmaConfigPartial {
@@ -81,6 +105,8 @@ impl Merge for RsigmaConfigPartial {
             doc: merge_opt(self.doc, over.doc),
             hygiene: merge_opt(self.hygiene, over.hygiene),
             mcp: merge_opt(self.mcp, over.mcp),
+            rulesets: merge_named(self.rulesets, over.rulesets),
+            convert: merge_opt(self.convert, over.convert),
         }
     }
 }
@@ -119,6 +145,9 @@ pub(crate) struct DaemonPartial {
     /// Builtin pipeline names or YAML file paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipelines: Option<Vec<PathBuf>>,
+    /// Several named rulesets evaluated side by side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rulesets: Option<Vec<RulesetEntryPartial>>,
     /// External dynamic-source files or directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<PathBuf>>,
@@ -172,6 +201,69 @@ pub(crate) struct DaemonPartial {
     /// Logsource-aware evaluation (conflict-based pruning) settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logsource_routing: Option<LogsourcePartial>,
+    /// Logical multi-tenancy settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenancy: Option<TenancyPartial>,
+}
+
+/// Logical multi-tenancy settings.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct TenancyPartial {
+    /// Enable tenant isolation. Startup-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Per-tenant state caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quotas: Option<TenantQuotasPartial>,
+    /// Tenants whose match counts get their own metric label. Others count
+    /// under `other`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_tenant_allowlist: Option<Vec<String>>,
+}
+
+impl Merge for TenancyPartial {
+    fn merge(self, over: Self) -> Self {
+        Self {
+            enabled: over.enabled.or(self.enabled),
+            quotas: merge_opt(self.quotas, over.quotas),
+            metrics_tenant_allowlist: over
+                .metrics_tenant_allowlist
+                .or(self.metrics_tenant_allowlist),
+        }
+    }
+}
+
+/// Per-tenant state caps.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct TenantQuotasPartial {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_state: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_alerts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incidents: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_entities: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silences: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inhibition_sources: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_sessions: Option<usize>,
+}
+
+impl Merge for TenantQuotasPartial {
+    fn merge(self, over: Self) -> Self {
+        Self {
+            correlation_state: over.correlation_state.or(self.correlation_state),
+            active_alerts: over.active_alerts.or(self.active_alerts),
+            incidents: over.incidents.or(self.incidents),
+            risk_entities: over.risk_entities.or(self.risk_entities),
+            silences: over.silences.or(self.silences),
+            inhibition_sources: over.inhibition_sources.or(self.inhibition_sources),
+            stream_sessions: over.stream_sessions.or(self.stream_sessions),
+        }
+    }
 }
 
 impl Merge for DaemonPartial {
@@ -179,6 +271,7 @@ impl Merge for DaemonPartial {
         Self {
             rules: over.rules.or(self.rules),
             pipelines: over.pipelines.or(self.pipelines),
+            rulesets: over.rulesets.or(self.rulesets),
             sources: over.sources.or(self.sources),
             enrichers: over.enrichers.or(self.enrichers),
             #[cfg(feature = "stix-enrich")]
@@ -200,6 +293,7 @@ impl Merge for DaemonPartial {
             capture: merge_opt(self.capture, over.capture),
             schema: merge_opt(self.schema, over.schema),
             logsource_routing: merge_opt(self.logsource_routing, over.logsource_routing),
+            tenancy: merge_opt(self.tenancy, over.tenancy),
         }
     }
 }
@@ -308,6 +402,12 @@ pub(crate) struct AuthTokenPartial {
     /// refuses to start when it is unset or empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    /// Tenant this token is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// Token may see every tenant. Never implied by a role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_tenants: Option<bool>,
 }
 
 /// Server-side TLS settings (no key password; that stays env-only).
@@ -346,6 +446,10 @@ pub(crate) struct InputPartial {
     /// `unix:///path/to.sock` (newline-delimited events over a Unix socket).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// How a stdin source ends: `batch` exits at end of input with the batch
+    /// result, `stream` keeps running until a shutdown signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_mode: Option<String>,
     /// Log format: `auto`, `json`, `syslog`, `plain`, `logfmt`, `cef`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
@@ -365,12 +469,33 @@ pub(crate) struct InputPartial {
     /// JSONPath query to extract the event payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jsonpath: Option<String>,
+    /// Tenant to bind to the single selected pull source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// One NATS subscription per tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nats_tenants: Option<Vec<NatsTenantPartial>>,
+}
+
+/// One tenant-bound NATS subscription.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct NatsTenantPartial {
+    /// Exact subject this subscription consumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Tenant that owns every message from this subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// Optional NATS credentials file for this subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_file: Option<PathBuf>,
 }
 
 impl Merge for InputPartial {
     fn merge(self, over: Self) -> Self {
         Self {
             source: over.source.or(self.source),
+            stdin_mode: over.stdin_mode.or(self.stdin_mode),
             format: over.format.or(self.format),
             syslog_tz: over.syslog_tz.or(self.syslog_tz),
             syslog_strip_bom: over.syslog_strip_bom.or(self.syslog_strip_bom),
@@ -378,6 +503,8 @@ impl Merge for InputPartial {
             batch_size: over.batch_size.or(self.batch_size),
             jq: over.jq.or(self.jq),
             jsonpath: over.jsonpath.or(self.jsonpath),
+            tenant: over.tenant.or(self.tenant),
+            nats_tenants: over.nats_tenants.or(self.nats_tenants),
         }
     }
 }
@@ -742,6 +869,173 @@ impl Merge for CapturePartial {
     }
 }
 
+/// One entry in a multi-ruleset list: a bare name or a schema-bound name.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum RulesetEntryPartial {
+    /// A bare ruleset name.
+    Name(String),
+    /// A ruleset name with an optional schema binding.
+    Bound {
+        /// Ruleset name.
+        name: String,
+        /// Schemas that admit an event to this ruleset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<WhenPartial>,
+        /// Tenants that admit an event to this ruleset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenants: Option<Vec<String>>,
+        /// Unknown keys, rejected at validation time.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        unknown: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+/// A ruleset's schema binding.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct WhenPartial {
+    /// Schema names that admit an event to this ruleset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemas: Vec<String>,
+    /// Unknown keys, rejected at validation time.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unknown: BTreeMap<String, serde_json::Value>,
+}
+
+/// `rsigma backend build` conversion groups.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct ConvertPartial {
+    /// Values inherited by every group that does not set them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<ConvertGroupPartial>,
+    /// Named conversion groups, keyed by group name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<BTreeMap<String, ConvertGroupPartial>>,
+}
+
+impl Merge for ConvertPartial {
+    fn merge(self, over: Self) -> Self {
+        Self {
+            defaults: merge_opt(self.defaults, over.defaults),
+            groups: merge_named(self.groups, over.groups),
+        }
+    }
+}
+
+impl ConvertPartial {
+    /// `group` with the defaults folded in.
+    pub(crate) fn effective(&self, group: &ConvertGroupPartial) -> ConvertGroupPartial {
+        match &self.defaults {
+            Some(defaults) => defaults.clone().merge(group.clone()),
+            None => group.clone(),
+        }
+    }
+
+    /// Groups whose query output or manifest lands on a path another group
+    /// already writes, as `(group, message)` in group name order.
+    pub(crate) fn output_collisions(&self) -> Vec<(String, String)> {
+        let mut claimed: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let mut collisions = Vec::new();
+        for (name, group) in self.groups.iter().flatten() {
+            let Some(output) = self.effective(group).output else {
+                continue;
+            };
+            let manifest = manifest_path(&output);
+            for path in [output, manifest] {
+                let key: PathBuf = path
+                    .components()
+                    .filter(|component| *component != std::path::Component::CurDir)
+                    .collect();
+                if let Some(owner) = claimed.get(&key) {
+                    collisions.push((
+                        name.clone(),
+                        format!(
+                            "convert groups '{owner}' and '{name}' both write {}",
+                            path.display()
+                        ),
+                    ));
+                    break;
+                } else {
+                    claimed.insert(key, name.clone());
+                }
+            }
+        }
+        collisions
+    }
+}
+
+/// The manifest written next to a group's query output.
+pub(crate) fn manifest_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".manifest.json");
+    PathBuf::from(path)
+}
+
+/// One conversion group: a ruleset plus the target, format, and options used
+/// to convert it.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
+pub(crate) struct ConvertGroupPartial {
+    /// Named ruleset from the `rulesets` section to convert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<String>,
+    /// Conversion target backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Backend-specific output format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Conversion pipelines. Never inherited from the ruleset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipelines: Option<Vec<PathBuf>>,
+    /// Backend options, the `-O key=value` equivalents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<BTreeMap<String, String>>,
+    /// Skip rules the backend cannot convert instead of failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_unsupported: Option<bool>,
+    /// Convert without requiring a pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub without_pipeline: Option<bool>,
+    /// Query output path. The manifest is written next to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<PathBuf>,
+    /// Opaque values copied verbatim into the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+impl Merge for ConvertGroupPartial {
+    fn merge(self, over: Self) -> Self {
+        Self {
+            ruleset: over.ruleset.or(self.ruleset),
+            target: over.target.or(self.target),
+            format: over.format.or(self.format),
+            pipelines: over.pipelines.or(self.pipelines),
+            options: merge_string_map(self.options, over.options),
+            skip_unsupported: over.skip_unsupported.or(self.skip_unsupported),
+            without_pipeline: over.without_pipeline.or(self.without_pipeline),
+            output: over.output.or(self.output),
+            metadata: over.metadata.or(self.metadata),
+        }
+    }
+}
+
+/// Merge two string-keyed maps per key, with `over` winning on a collision.
+fn merge_string_map<V>(
+    base: Option<BTreeMap<String, V>>,
+    over: Option<BTreeMap<String, V>>,
+) -> Option<BTreeMap<String, V>> {
+    match (base, over) {
+        (Some(mut base), Some(over)) => {
+            for (key, value) in over {
+                base.insert(key, value);
+            }
+            Some(base)
+        }
+        (base, over) => over.or(base),
+    }
+}
+
 /// `eval` settings.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct EvalPartial {
@@ -763,12 +1057,24 @@ pub(crate) struct EvalPartial {
     pub output: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_on_detection: Option<bool>,
+    /// Finding wire shape: `native` or `ocsf` (`--finding-format`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_format: Option<String>,
+    /// OCSF schema version when `finding_format` is `ocsf` (`--ocsf-version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocsf_version: Option<String>,
     /// Schema classification and routing settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaPartial>,
     /// Logsource-aware evaluation (conflict-based pruning) settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logsource_routing: Option<LogsourcePartial>,
+    /// Named ruleset to evaluate instead of `rules` (`--ruleset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<String>,
+    /// Several named rulesets evaluated side by side (`--ruleset` repeated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rulesets: Option<Vec<RulesetEntryPartial>>,
 }
 
 impl Merge for EvalPartial {
@@ -781,8 +1087,12 @@ impl Merge for EvalPartial {
             syslog_strip_bom: over.syslog_strip_bom.or(self.syslog_strip_bom),
             output: over.output.or(self.output),
             fail_on_detection: over.fail_on_detection.or(self.fail_on_detection),
+            finding_format: over.finding_format.or(self.finding_format),
+            ocsf_version: over.ocsf_version.or(self.ocsf_version),
             schema: merge_opt(self.schema, over.schema),
             logsource_routing: merge_opt(self.logsource_routing, over.logsource_routing),
+            ruleset: over.ruleset.or(self.ruleset),
+            rulesets: over.rulesets.or(self.rulesets),
         }
     }
 }
@@ -910,6 +1220,18 @@ pub(crate) struct BacktestPartial {
     /// Strip a leading UTF-8 BOM from RFC 5424 syslog messages (default true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syslog_strip_bom: Option<bool>,
+    /// Named ruleset to backtest instead of `rules` (`--ruleset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<String>,
+    /// Path for one finding per fire (`--findings`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<PathBuf>,
+    /// Finding wire shape: `native` or `ocsf` (`--finding-format`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_format: Option<String>,
+    /// OCSF schema version when `finding_format` is `ocsf` (`--ocsf-version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocsf_version: Option<String>,
 }
 
 impl Merge for BacktestPartial {
@@ -923,6 +1245,10 @@ impl Merge for BacktestPartial {
             input_format: over.input_format.or(self.input_format),
             syslog_tz: over.syslog_tz.or(self.syslog_tz),
             syslog_strip_bom: over.syslog_strip_bom.or(self.syslog_strip_bom),
+            ruleset: over.ruleset.or(self.ruleset),
+            findings: over.findings.or(self.findings),
+            finding_format: over.finding_format.or(self.finding_format),
+            ocsf_version: over.ocsf_version.or(self.ocsf_version),
         }
     }
 }
@@ -946,6 +1272,9 @@ pub(crate) struct CoveragePartial {
     /// techniques.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_on_gaps: Option<bool>,
+    /// Named ruleset to map instead of `rules` (`--ruleset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<String>,
 }
 
 impl Merge for CoveragePartial {
@@ -956,6 +1285,7 @@ impl Merge for CoveragePartial {
             baseline: over.baseline.or(self.baseline),
             targets: over.targets.or(self.targets),
             fail_on_gaps: over.fail_on_gaps.or(self.fail_on_gaps),
+            ruleset: over.ruleset.or(self.ruleset),
         }
     }
 }
@@ -1097,6 +1427,9 @@ pub(crate) struct HygienePartial {
     /// incomplete-ads, broken-fields, deprecated, any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fail_on: Option<Vec<String>>,
+    /// Named ruleset to report on instead of `rules` (`--ruleset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<String>,
 }
 
 impl Merge for HygienePartial {
@@ -1110,6 +1443,7 @@ impl Merge for HygienePartial {
             stale_threshold: over.stale_threshold.or(self.stale_threshold),
             noisy_threshold: over.noisy_threshold.or(self.noisy_threshold),
             fail_on: over.fail_on.or(self.fail_on),
+            ruleset: over.ruleset.or(self.ruleset),
         }
     }
 }
@@ -1263,5 +1597,120 @@ mod tests {
             merged.global.expect("global").log_format,
             Some("json".into())
         );
+    }
+
+    #[test]
+    fn merge_named_replaces_a_whole_ruleset_entry() {
+        let base = RsigmaConfigPartial {
+            rulesets: Some(BTreeMap::from([
+                (
+                    "local".to_string(),
+                    RulesetSpec {
+                        description: Some("base".into()),
+                        sources: vec![PathBuf::from("base-rules")],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "vendor".to_string(),
+                    RulesetSpec {
+                        sources: vec![PathBuf::from("vendor-rules")],
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let over = RsigmaConfigPartial {
+            rulesets: Some(BTreeMap::from([(
+                "local".to_string(),
+                RulesetSpec {
+                    sources: vec![PathBuf::from("over-rules")],
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let merged = base.merge(over);
+        let rulesets = merged.rulesets.expect("rulesets");
+        assert_eq!(
+            rulesets["local"].sources,
+            [PathBuf::from("over-rules")],
+            "the higher layer must not inherit the lower entry's fields"
+        );
+        assert_eq!(rulesets["local"].description, None);
+        assert_eq!(rulesets["vendor"].sources, [PathBuf::from("vendor-rules")]);
+    }
+
+    #[test]
+    fn convert_defaults_merge_per_field_and_options_per_key() {
+        let base: RsigmaConfigPartial = yaml_serde::from_str(
+            "convert:\n  defaults:\n    format: default\n    options:\n      correlation_method: join\n      gap: 5m\n    skip_unsupported: true\n  groups:\n    linux_edge:\n      ruleset: linux_edge\n      target: postgres\n      options:\n        gap: 1m\n",
+        )
+        .expect("parses convert section");
+        let over: RsigmaConfigPartial = yaml_serde::from_str(
+            "convert:\n  defaults:\n    format: view\n    without_pipeline: true\n  groups:\n    cloud:\n      ruleset: cloud\n      target: lynxdb\n      output: build/cloud.txt\n",
+        )
+        .expect("parses override");
+
+        let merged = base.merge(over);
+        let convert = merged.convert.expect("convert section");
+        let defaults = convert.defaults.expect("defaults");
+        assert_eq!(defaults.format.as_deref(), Some("view"));
+        assert_eq!(defaults.skip_unsupported, Some(true));
+        assert_eq!(defaults.without_pipeline, Some(true));
+        let options = defaults.options.clone().expect("options");
+        assert_eq!(options["correlation_method"], "join");
+        assert_eq!(options["gap"], "5m");
+
+        let groups = convert.groups.expect("groups");
+        assert_eq!(groups.len(), 2);
+        let linux = &groups["linux_edge"];
+        assert_eq!(linux.ruleset.as_deref(), Some("linux_edge"));
+        assert_eq!(linux.target.as_deref(), Some("postgres"));
+        assert_eq!(groups["cloud"].target.as_deref(), Some("lynxdb"));
+
+        let effective = defaults.clone().merge(linux.clone());
+        assert_eq!(effective.format.as_deref(), Some("view"));
+        assert_eq!(effective.ruleset.as_deref(), Some("linux_edge"));
+        assert_eq!(effective.target.as_deref(), Some("postgres"));
+        assert_eq!(effective.skip_unsupported, Some(true));
+        assert_eq!(effective.without_pipeline, Some(true));
+        let merged_options = effective.options.expect("merged options");
+        assert_eq!(merged_options["correlation_method"], "join");
+        assert_eq!(merged_options["gap"], "1m");
+    }
+
+    #[test]
+    fn convert_groups_replace_wholesale_across_layers() {
+        let base: RsigmaConfigPartial = yaml_serde::from_str(
+            "convert:\n  groups:\n    g:\n      ruleset: base\n      target: postgres\n      options:\n        gap: 5m\n",
+        )
+        .expect("parses convert");
+        let over: RsigmaConfigPartial =
+            yaml_serde::from_str("convert:\n  groups:\n    g:\n      output: build/g.sql\n")
+                .expect("parses override");
+        let groups = base.merge(over).convert.unwrap().groups.unwrap();
+        assert_eq!(groups["g"].ruleset, None);
+        assert_eq!(groups["g"].output, Some(PathBuf::from("build/g.sql")));
+    }
+
+    #[test]
+    fn convert_group_replaces_metadata_wholesale() {
+        let base: RsigmaConfigPartial = yaml_serde::from_str(
+            "convert:\n  defaults:\n    metadata:\n      rule_group: linux\n      time_window: 5m\n  groups:\n    g:\n      metadata:\n        time_window: 1h\n        nested:\n          owner: soc\n",
+        )
+        .expect("parses metadata");
+        let convert = base.convert.expect("convert");
+        let effective = convert
+            .defaults
+            .expect("defaults")
+            .merge(convert.groups.expect("groups")["g"].clone());
+        let metadata = effective.metadata.expect("metadata");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata["time_window"], serde_json::json!("1h"));
+        assert_eq!(metadata["nested"], serde_json::json!({"owner": "soc"}));
+        assert!(!metadata.contains_key("rule_group"));
     }
 }

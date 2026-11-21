@@ -6,11 +6,13 @@ description: "RSigma daemon HTTP API for detection state: counters, correlation 
 
 The daemon's read and control endpoints for detection state: counters, correlation windows, incidents, risk, silences, the audit trail, and analyst dispositions. The [HTTP API](http-api.md#endpoint-summary) page lists every route with its permission; [authentication](http-api.md#authentication) applies to all of them.
 
+With tenancy enabled, these reads are scoped to the token's tenant, `?tenant=` only narrows, a foreign incident id is `404`, and a tenant token gets `403` on the operator-only routes (`/api/v1/status`, `/metrics`). See [Tenancy scoping](http-api.md#tenancy-scoping). {{ added "unreleased" }}
+
 ## Status and counters
 
 ### `GET /api/v1/status`
 
-Snapshot of engine counters plus uptime. The `dynamic_sources` block is present only when a pipeline declares sources.
+Snapshot of engine counters plus uptime. The `rulesets` array is present only when the daemon runs named rulesets. The `dynamic_sources` block is present only when a pipeline declares sources. {{ added "unreleased" }}
 
 ```bash
 curl -sS http://127.0.0.1:9090/api/v1/status
@@ -26,6 +28,9 @@ curl -sS http://127.0.0.1:9090/api/v1/status
   "detection_matches": 1,
   "correlation_matches": 0,
   "uptime_seconds": 19.07,
+  "rulesets": [
+    { "name": "linux_edge", "detection_rules": 4, "correlation_rules": 1, "when_schemas": [] }
+  ],
   "dynamic_sources": {
     "total": 2,
     "resolves_total": 4,
@@ -253,9 +258,9 @@ curl -sS http://127.0.0.1:9090/api/v1/silences
 
 ### `POST /api/v1/silences`
 
-Create a silence. The body is a JSON object with `matchers` (required; each `{selector, op, value}` where `op` is `=`, `!=`, `=~`, or `!~`), optional `starts_at` and `ends_at` (RFC 3339), `created_by`, and `comment`. Returns `201` with the assigned `id`. A missing matcher list or a bad regex returns `400`. Once the dynamic-silence cap (`max_silences`, default 1000) is reached it returns `429`; delete silences or raise the cap.
+Create a silence. The body is a JSON object with `matchers` (required; each `{selector, op, value}` where `op` is `=`, `!=`, `=~`, or `!~`), optional `id`, `starts_at` and `ends_at` (RFC 3339), `created_by`, and `comment`. Returns `201` with the assigned `id`. {{ added "unreleased" }} An `id` that a silence visible to the caller already uses returns `409`. With tenancy enabled, ids are unique per tenant, so a tenant can reuse an id that another tenant has and never learns that it exists. A missing matcher list or a bad regex returns `400`. Once the dynamic-silence cap (`max_silences`, default 1000) is reached it returns `429`; delete silences or raise the cap. With `daemon.tenancy.quotas.silences` set, a tenant at its quota also gets `429`. {{ added "unreleased" }}
 
-{{ added "unreleased" }} The alert pipeline's silence limits also return `400`, with an `error` and a `hint`:
+{{ added "0.27.0" }} The alert pipeline's silence limits also return `400`, with an `error` and a `hint`:
 
 - `ends_at` is required and must be no more than `max_silence_duration` (default `720h`) from now. `max_silence_duration: 0` removes the bound.
 - At least one matcher must be `=` with a non-empty value on `rule`, `match.<field>`, or `correlation.group_key.<field>`, unless `allow_broad_silences: true` is set. `rule =~ .*`, `rule != x`, or `level = high` alone is refused.
@@ -273,7 +278,7 @@ curl -sS -X POST http://127.0.0.1:9090/api/v1/silences \
 
 ### `DELETE /api/v1/silences/{id}`
 
-Remove a silence by id. Returns `200` when removed, `404` when no such silence exists.
+Remove a silence by id. Returns `200` when removed, `404` when no such silence exists. {{ added "unreleased" }} With tenancy enabled, a tenant token removes only its own silence. An `all_tenants` token may name the tenant with `?tenant=<id>`; without it, an id that several tenants use returns `409` and nothing is removed.
 
 ```bash
 curl -sS -X DELETE http://127.0.0.1:9090/api/v1/silences/0b6c...
@@ -284,6 +289,8 @@ curl -sS -X DELETE http://127.0.0.1:9090/api/v1/silences/0b6c...
 Append-only log of control-plane mutations (silences, dispositions, reload, source cache invalidation, field/schema observer resets). Enabled automatically when the daemon is started with `--state-db`; disable or tune retention with the `daemon.api.audit` config block. Data-plane ingest (`POST /api/v1/events`, OTLP) is never recorded. Each entry stores the HTTP method, matched route pattern, bearer token name (when authentication is enabled), response status, Unix timestamp, and an optional SHA-256 hex digest of the request body. The body itself is never stored. A request whose body exceeds `max_body_bytes` (default 64 KiB), whether declared via `Content-Length` or streamed, is rejected with `413` before the handler runs, and the rejected attempt is itself recorded (with a `null` digest).
 
 Auth denials (`401`/`403`) are tracked separately via `rsigma_api_auth_failures_total`, not in this log.
+
+With tenancy enabled, each entry also stores `tenant`: the token's tenant, or, for an `all_tenants` token, the tenant that its silence create, silence delete, or disposition write affected. A tenant token reads only its tenant's entries, so it also sees writes made on its behalf; an `all_tenants` token can narrow a read with `?tenant=<id>`. {{ added "unreleased" }}
 
 ### `GET /api/v1/audit`
 
@@ -329,7 +336,7 @@ curl -sS -X POST http://127.0.0.1:9090/api/v1/dispositions \
 { "accepted": 1, "duplicate": 0, "rejected": 0 }
 ```
 
-Redelivery is idempotent: records deduplicate on `(fingerprint or incident_id, verdict, rule_id)`, falling back to `(rule_id, timestamp, analyst)`. The `rule_id` is part of the identity key so an incident-scoped fan-out does not collapse per-rule records. An `incident`-scoped record with no `rule_id` resolves to the incident's contributing rules through the live incident map; an unknown incident is reported in the summary's `errors` and counted as `rejected`.
+Redelivery is idempotent: records deduplicate on `(fingerprint or incident_id, verdict, rule_id)`, falling back to `(rule_id, timestamp, analyst)`. With tenancy enabled, the tenant is part of the key and each tenant keeps its own bounded set of ids. {{ added "unreleased" }} The `rule_id` is part of the identity key so an incident-scoped fan-out does not collapse per-rule records. An `incident`-scoped record with no `rule_id` resolves to the incident's contributing rules through the live incident map; an unknown incident is reported in the summary's `errors` and counted as `rejected`.
 
 ### `GET /api/v1/dispositions`
 
@@ -365,6 +372,19 @@ curl -sS http://127.0.0.1:9090/api/v1/rules
   "rules_path": "/etc/rsigma/rules"
 }
 ```
+
+In ruleset mode the response carries a `rulesets` array and omits `rules_path`:
+
+```json
+{
+  "detection_rules": 4,
+  "correlation_rules": 1,
+  "rulesets": [
+    { "name": "linux_edge", "detection_rules": 4, "correlation_rules": 1, "when_schemas": [] }
+  ]
+}
+```
+{{ added "unreleased" }}
 
 ## See also
 

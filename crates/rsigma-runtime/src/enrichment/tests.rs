@@ -14,7 +14,8 @@ use rsigma_parser::{CorrelationType, Level};
 
 use super::{
     EnrichError, EnrichErrorKind, Enricher, EnricherKind, EnrichmentPipeline, OnError, Scope,
-    TemplateEnricher, register_builtin, validate_template_namespace,
+    TemplateEnricher, TemplateError, register_builtin, render_template, render_webhook_body,
+    validate_template_namespace,
 };
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,7 @@ fn detection_result() -> EvaluationResult {
         header: RuleHeader {
             rule_title: "Suspicious PowerShell".to_string(),
             rule_id: Some("rule-pwsh".to_string()),
+            tenant_id: None,
             level: Some(Level::High),
             tags: vec![
                 "attack.t1059.001".to_string(),
@@ -33,6 +35,7 @@ fn detection_result() -> EvaluationResult {
             ],
             custom_attributes: Arc::new(HashMap::new()),
             enrichments: None,
+            ruleset: None,
         },
         body: ResultBody::Detection(DetectionBody {
             matched_selections: vec!["selection".to_string()],
@@ -50,10 +53,12 @@ fn correlation_result() -> EvaluationResult {
         header: RuleHeader {
             rule_title: "SSH brute force".to_string(),
             rule_id: Some("corr-ssh".to_string()),
+            tenant_id: None,
             level: Some(Level::High),
             tags: vec!["attack.t1110".to_string()],
             custom_attributes: Arc::new(HashMap::new()),
             enrichments: None,
+            ruleset: None,
         },
         body: ResultBody::Correlation(CorrelationBody {
             correlation_type: CorrelationType::EventCount,
@@ -281,6 +286,101 @@ fn validator_rejects_malformed_dotted_reference() {
     )
     .unwrap_err();
     assert!(format!("{err}").contains("malformed"));
+}
+
+#[test]
+fn validator_rejects_ocsf_references_outside_a_webhook_body() {
+    for (text, kind) in [
+        ("${detection.ocsf}", EnricherKind::Detection),
+        ("https://x/${correlation.ocsf}", EnricherKind::Correlation),
+    ] {
+        let err = validate_template_namespace(text, kind, "x", "template").unwrap_err();
+        assert!(
+            matches!(err, TemplateError::MisplacedOcsf { .. }),
+            "{text}: {err}"
+        );
+        assert!(format!("{err}").contains("webhook body"), "{err}");
+    }
+}
+
+#[test]
+fn webhook_body_accepts_ocsf_as_a_whole_json_value() {
+    for body in [
+        "${detection.ocsf}",
+        r#"{"finding": ${detection.ocsf}}"#,
+        r#"{"title": "${detection.rule.title}", "findings": [${detection.ocsf}, ${detection.ocsf}]}"#,
+        r#"{"count": ${detection.fields.count}, "finding": ${detection.ocsf}}"#,
+    ] {
+        super::validate_webhook_body_template(body, EnricherKind::Detection, "x")
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+    // A body without an OCSF reference is not required to be JSON.
+    super::validate_webhook_body_template(
+        "plain ${detection.rule.title}",
+        EnricherKind::Detection,
+        "x",
+    )
+    .unwrap();
+}
+
+#[test]
+fn webhook_body_rejects_ocsf_that_is_not_a_whole_json_value() {
+    for body in [
+        r#"{"finding": "${detection.ocsf}"}"#,
+        r#"{"finding": "prefix ${detection.ocsf} suffix"}"#,
+        r#"{${detection.ocsf}: 1}"#,
+        r#"{"finding": ${detection.ocsf}x}"#,
+        "text ${detection.ocsf}",
+    ] {
+        let err =
+            super::validate_webhook_body_template(body, EnricherKind::Detection, "x").unwrap_err();
+        assert!(
+            matches!(err, TemplateError::MisplacedOcsf { field: "body", .. }),
+            "{body}: {err}"
+        );
+    }
+}
+
+#[test]
+fn webhook_body_ocsf_reference_keeps_namespace_rules() {
+    let err = super::validate_webhook_body_template(
+        r#"{"finding": ${correlation.ocsf}}"#,
+        EnricherKind::Detection,
+        "x",
+    )
+    .unwrap_err();
+    assert!(matches!(err, TemplateError::CrossNamespace { .. }), "{err}");
+}
+
+#[test]
+fn ocsf_reference_renders_raw_json_only_through_the_webhook_renderer() {
+    let result = detection_result();
+    let body = r#"{"t": "${detection.rule.title}", "finding": ${detection.ocsf}}"#;
+    let rendered =
+        super::render_template_json_with_ocsf(body, &result, || r#"{"class_uid":2004}"#.into());
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(parsed["finding"]["class_uid"], 2004);
+    assert_eq!(
+        render_template("${detection.ocsf}", &result),
+        "",
+        "the plain renderer has no finding to insert",
+    );
+    let via_webhook = render_webhook_body(body, EnricherKind::Detection, "hook", &result, || {
+        r#"{"class_uid":2004}"#.into()
+    })
+    .expect("whole-value reference");
+    assert_eq!(via_webhook, rendered);
+    let misplaced = render_webhook_body(
+        r#"{"finding": "${detection.ocsf}"}"#,
+        EnricherKind::Detection,
+        "hook",
+        &result,
+        || "{}".into(),
+    );
+    assert!(matches!(
+        misplaced,
+        Err(TemplateError::MisplacedOcsf { .. })
+    ));
 }
 
 // Note: `${}` (empty inner) does not match the `\$\{([^}]+)\}` regex at
@@ -518,7 +618,9 @@ fn registry_test_lock() -> &'static std::sync::Mutex<()> {
 fn register_builtin_rejects_reserved_names() {
     let _guard = registry_test_lock().lock().unwrap();
     super::clear_builtin_registry();
-    for reserved in ["template", "lookup", "http", "command"] {
+    for reserved in [
+        "template", "lookup", "http", "command", "stix", "mmdb", "dns",
+    ] {
         let err = register_builtin(
             reserved,
             std::sync::Arc::new(|_| Err::<Box<dyn Enricher>, _>("unused".to_string())),

@@ -19,7 +19,12 @@ mod schema;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub(crate) use schema::{Merge, RsigmaConfigPartial};
+#[cfg(feature = "daemon")]
+pub(crate) use schema::TenantQuotasPartial;
+pub(crate) use schema::{
+    ConvertGroupPartial, Merge, RsigmaConfigPartial, RulesetEntryPartial, WhenPartial,
+    manifest_path,
+};
 
 /// Load the config files and fold them with the compiled defaults and the
 /// `RSIGMA_*` environment layer into one typed partial (precedence:
@@ -32,15 +37,18 @@ pub(crate) fn load_and_merge(explicit: Option<&Path>) -> RsigmaConfigPartial {
     match load_layered(explicit) {
         Ok(loaded) => {
             for (path, key) in &loaded.unknown_keys {
-                eprintln!("warning: unknown config key '{key}' in {}", path.display());
+                warn_once(format!(
+                    "warning: unknown config key '{key}' in {}",
+                    path.display()
+                ));
             }
             for (path, key) in &loaded.ignored_keys {
-                eprintln!("{}", ignored_key_warning(path, key));
+                warn_once(ignored_key_warning(path, key));
             }
             for section in inactive_sections(&loaded.config) {
-                eprintln!(
+                warn_once(format!(
                     "warning: config section '{section}' is set but inert in this build (feature disabled)"
-                );
+                ));
             }
             defaults::defaults_partial()
                 .merge(loaded.config)
@@ -50,6 +58,20 @@ pub(crate) fn load_and_merge(explicit: Option<&Path>) -> RsigmaConfigPartial {
             eprintln!("error: {e}");
             std::process::exit(crate::exit_code::CONFIG_ERROR);
         }
+    }
+}
+
+/// Print a config warning to stderr unless this process already printed it.
+/// A command can read the layered config more than once.
+fn warn_once(message: String) {
+    static PRINTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut printed = PRINTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !printed.contains(&message) {
+        eprintln!("{message}");
+        printed.insert(message);
     }
 }
 
@@ -172,6 +194,9 @@ pub(crate) struct LoadedConfig {
     /// [`PROTECTED_KEYS`] a project file set, paired with that file. They are
     /// not part of [`Self::config`].
     pub ignored_keys: Vec<(PathBuf, &'static str)>,
+    /// Whether a project layer (`./rsigma.yaml`, `./rsigma.yml`, `.rsigmarc`)
+    /// was loaded. Tenancy refuses to start when one was.
+    pub project_layer_loaded: bool,
 }
 
 /// Return the user config directory (`$XDG_CONFIG_HOME/rsigma` or
@@ -406,6 +431,33 @@ pub(crate) const PROTECTED_KEYS: &[ProtectedKey] = &[
                         false
                     }
                 })
+        },
+    },
+    // Tenancy identity and the source binding decide which tenant an event
+    // belongs to. Turning tenancy off is the dangerous direction, so a project
+    // file may not set them at all.
+    ProtectedKey {
+        key: "daemon.tenancy",
+        strip: |c, _| take(daemon(c).map(|d| &mut d.tenancy)),
+    },
+    ProtectedKey {
+        key: "daemon.input.tenant",
+        strip: |c, _| {
+            take(
+                daemon(c)
+                    .and_then(|d| d.input.as_mut())
+                    .map(|i| &mut i.tenant),
+            )
+        },
+    },
+    ProtectedKey {
+        key: "daemon.input.nats_tenants",
+        strip: |c, _| {
+            take(
+                daemon(c)
+                    .and_then(|d| d.input.as_mut())
+                    .map(|i| &mut i.nats_tenants),
+            )
         },
     },
     // A durable consumer name could join another deployment's consumer and
@@ -669,7 +721,7 @@ fn load_file(path: &Path) -> Result<(RsigmaConfigPartial, Vec<String>), ConfigEr
             let message = if raw.contains("expected struct RsigmaConfigPartial") {
                 format!(
                     "top-level config must be a YAML mapping of sections \
-                 (global, daemon, eval, backtest, coverage, scorecard, visibility, doc, hygiene, mcp); got {raw}"
+                 (global, daemon, eval, backtest, coverage, scorecard, visibility, doc, hygiene, mcp, rulesets, convert); got {raw}"
                 )
             } else {
                 raw
@@ -699,6 +751,7 @@ fn load_files(files: Vec<(PathBuf, Layer)>) -> Result<LoadedConfig, ConfigError>
             loaded.unknown_keys.push((path.clone(), key));
         }
         if layer.is_project() {
+            loaded.project_layer_loaded = true;
             let project_dir = path.parent().unwrap_or(Path::new("."));
             for key in strip_untrusted(&mut partial, project_dir) {
                 loaded.ignored_keys.push((path.clone(), key));
@@ -933,6 +986,12 @@ daemon:
     batch_max: 64
   input:
     source: nats://127.0.0.1:4222/events
+    tenant: tenant-a
+    nats_tenants:
+      - subject: tenants.tenant-b.>
+        tenant: tenant-b
+  tenancy:
+    enabled: true
   nats:
     consumer_group: another-deployment
   state:
@@ -977,7 +1036,10 @@ daemon:
         let output = daemon.output.unwrap();
         assert!(output.sinks.is_none() && output.dlq.is_none() && output.webhooks.is_none());
         assert_eq!(output.batch_max, Some(64));
-        assert!(daemon.input.unwrap().source.is_none());
+        let input = daemon.input.unwrap();
+        assert!(input.source.is_none());
+        assert!(input.tenant.is_none() && input.nats_tenants.is_none());
+        assert!(daemon.tenancy.is_none());
         assert!(daemon.nats.unwrap().consumer_group.is_none());
         let state = daemon.state.unwrap();
         assert!(state.db.is_none());

@@ -15,7 +15,7 @@ All bodies are JSON unless otherwise noted. All responses include a `Content-Typ
 | `/healthz` | GET | always open | Liveness probe. Always 200 once the listener is up. |
 | `/readyz` | GET | always open | Readiness probe. 200 when rules and pipelines are loaded; 503 during startup or after a failed reload. |
 | `/metrics` | GET | `metrics:read` | Prometheus text format. See [Prometheus metrics](metrics.md). |
-| `/api/v1/status` | GET | `status:read` | Counters, state-entry counts, uptime, and (when configured) dynamic-source summary. |
+| `/api/v1/status` | GET | `status:read` | Counters, state-entry counts, uptime, per-ruleset rule counts, and (when configured) dynamic-source summary. {{ added "unreleased" }} |
 | `/api/v1/correlations` | GET | `correlations:read` | Compiled correlation list with per-group counts. Empty when the engine has no correlation rules. |
 | `/api/v1/correlations/state` | GET | `correlations:read` | Live per-group correlation window snapshot (current aggregate vs threshold, window entries, last alert, seconds to eviction). Filter with `?id=` and `?group=`. |
 | `/api/v1/incidents` | GET | `incidents:read` | Open incidents from the alert-pipeline grouping stage. |
@@ -25,12 +25,16 @@ All bodies are JSON unless otherwise noted. All responses include a `Content-Typ
 | `/api/v1/silences` | GET, POST | `silences:read`, `silences:write` | List silences, or create one (returns its id). |
 | `/api/v1/silences/{id}` | DELETE | `silences:write` | Remove a silence by id. |
 | `/api/v1/dispositions` | GET, POST | `dispositions:read`, `dispositions:write` | Ingest analyst dispositions, or read the per-rule false-positive ratio. Disabled by default; enable with `daemon.dispositions.enabled: true` or `--enable-dispositions`. When capture is enabled, POST also requires `capture:write`. There is no read endpoint for the capture ring or spool. |
-| `/api/v1/rules` | GET | `rules:read` | Rule counts and rules-directory path. |
+| `/api/v1/rules` | GET | `rules:read` | Rule counts and rules-directory path, or per-ruleset counts in ruleset mode. {{ added "unreleased" }} |
 | `/api/v1/reload` | POST | `reload:execute` | Trigger an immediate rules + pipelines reload. |
 | `/api/v1/events` | POST | `events:ingest` | NDJSON event ingest. Only enabled with `--input http`. |
-| `/api/v1/sources` | GET | `sources:read` | Dynamic pipeline sources currently registered. |
-| `/api/v1/sources/resolve` | POST | `sources:write` | Force re-resolution of all dynamic sources (with no body) or one specific source (with `{"source_id":"..."}`). |
-| `/api/v1/sources/resolve/{source_id}` | POST | `sources:write` | Force re-resolution of a single source by path parameter (no body). Equivalent to the body variant above; useful when the caller has to fit inside an HTTP client that does not send a JSON body on `POST`. |
+| `/api/v1/sources` | GET | `sources:read` | Dynamic sources currently registered. |
+| `/api/v1/sources/resolve` | POST | `sources:write` | Re-resolve every dynamic source. The request body is ignored. |
+| `/api/v1/sources/resolve/{source_id}` | POST | `sources:write` | Re-resolve one source. No request body. |
+| `/api/v1/sources/{source_id}/indicators` | GET | `sources:read` | List unexpired indicators of a watchlist source. |
+| `/api/v1/sources/{source_id}/indicators` | POST | `sources:write` | Add or refresh indicators. Audited. |
+| `/api/v1/sources/{source_id}/indicators` | PUT | `sources:write` | Replace the unexpired set. Audited. |
+| `/api/v1/sources/{source_id}/indicators` | DELETE | `sources:write` | Delete named indicators. Audited. |
 | `/api/v1/sources/cache/{source_id}` | DELETE | `sources:write` | Invalidate one source's cache so the next read fetches fresh. |
 | `/api/v1/fields` | GET | `fields:read` | Combined gap + broken-coverage report. Requires `--observe-fields`. |
 | `/api/v1/fields/unknown` | GET | `fields:read` | Fields seen in events that no rule references. Requires `--observe-fields`. |
@@ -49,7 +53,7 @@ The Permission column applies only when authentication is enabled; without it ev
 
 Endpoint details are split across three pages:
 
-- This page: probes, authentication, reload, event ingest, dynamic pipeline sources, and OTLP ingest.
+- This page: probes, authentication, reload, event ingest, dynamic sources, and OTLP ingest.
 - [HTTP API: Detection State](http-api-state.md): status and counters, correlations, incidents and incident bundles, risk, silences, the audit trail, dispositions, and rules.
 - [HTTP API: Live Observability](http-api-observability.md): field and schema observability, the live event tap, and the live detection tail.
 
@@ -81,6 +85,14 @@ Clients send `Authorization: Bearer <token>`. Each route requires the `resource:
 Token secrets never live in YAML: `token_env` names an environment variable, resolved once at startup, and a missing or empty variable fails startup. Token comparison is constant time. `GET /healthz` and `GET /readyz` are always unauthenticated so liveness probes need no secrets; `anonymous_permissions` grants a permission set to requests without an `Authorization` header (for example `["metrics:read"]` keeps Prometheus scraping token-free, and `["*:read"]` protects only the mutating endpoints).
 
 Failure semantics: a missing or unrecognized token gets `401 Unauthorized` (with a `WWW-Authenticate: Bearer` header); a recognized token without the required permission gets `403 Forbidden` naming the missing permission. A presented-but-invalid token is always 401, never a fallback to the anonymous grants. OTLP/gRPC clients pass the same `authorization` metadata and receive `UNAUTHENTICATED` or `PERMISSION_DENIED` gRPC status codes. Rejections are counted in `rsigma_api_auth_failures_total{reason}` and logged at warn level with the token name (never the secret). See [Security](security.md#daemon-api-authentication) for the threat-model discussion.
+
+## Tenancy scoping
+
+With `daemon.tenancy.enabled`, every route has a tenancy class and the token's binding decides what it can see. {{ added "unreleased" }} `GET /healthz` and `GET /readyz` are open. Ingest routes require a token bound to exactly one tenant; an `all_tenants` token gets `403` because it has no tenant to bind. Operator-only routes (`GET /metrics`, `GET /api/v1/status`, `POST /api/v1/reload`, the field and schema observers, dynamic sources, watchlists, STIX sources) span tenants, so a tenant token gets `403`.
+
+Tenant-scoped reads are filtered to the token's tenant: rules, correlations and correlation state, incidents and their bundles, risk entities, silences, dispositions, audit rows, the tap, and the detection stream. `?tenant=` may only narrow. A tenant token naming another tenant is `403`; an `all_tenants` token sees every tenant or one with `?tenant=`. A resource id owned by another tenant is `404`, never `403`, so ids do not leak existence. With tenancy disabled, `?tenant=` is `400`.
+
+Writes bind to the token's tenant. A tenant token's silence or disposition gets its tenant; a body `tenant` naming another tenant is `403`. An `all_tenants` token must send `tenant` on a write, or it is `400`. See [Multi-tenancy](../guide/multi-tenancy.md).
 
 ## Probes
 
@@ -149,11 +161,11 @@ curl -sS -X POST http://127.0.0.1:9090/api/v1/events \
 
 Lines that fail to parse increment `rsigma_events_parse_errors_total` and are dropped silently. To inspect parse errors, scrape `/metrics` or watch the daemon's stderr log.
 
-## Dynamic pipeline sources
+## Dynamic sources
 
 ### `GET /api/v1/sources`
 
-Lists every dynamic source registered by the loaded pipelines, with its type, refresh policy, and `required` flag.
+Lists every dynamic source registered by the daemon, with its type, declaration site, refresh policy, and `required` flag. The source may be consumed by a dynamic pipeline, a `lookup` enricher, or both.
 
 ```bash
 curl -sS http://127.0.0.1:9090/api/v1/sources
@@ -180,7 +192,7 @@ curl -sS http://127.0.0.1:9090/api/v1/sources
 }
 ```
 
-When no pipelines declare sources:
+When no dynamic sources are configured:
 
 ```json
 {"sources":[]}
@@ -188,7 +200,7 @@ When no pipelines declare sources:
 
 ### `POST /api/v1/sources/resolve`
 
-Force re-resolution of every dynamic source (with no body) or one named source (with a JSON body):
+Re-resolve every dynamic source. The request body is ignored. To re-resolve one source, use `POST /api/v1/sources/resolve/{source_id}`.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9090/api/v1/sources/resolve
@@ -196,12 +208,6 @@ curl -sS -X POST http://127.0.0.1:9090/api/v1/sources/resolve
 
 ```json
 {"status":"resolve_triggered"}
-```
-
-```bash
-curl -sS -X POST http://127.0.0.1:9090/api/v1/sources/resolve \
-  -H 'Content-Type: application/json' \
-  --data '{"source_id":"ip_blocklist"}'
 ```
 
 If no dynamic sources are configured:
@@ -212,7 +218,7 @@ If no dynamic sources are configured:
 
 ### `POST /api/v1/sources/resolve/{source_id}`
 
-Force re-resolution of one named source via a path parameter, with no request body. Equivalent to the body variant of `POST /api/v1/sources/resolve` and useful for clients that cannot send a JSON body on `POST` (some load balancers, the simplest `curl --data ''` recipes, etc.).
+Re-resolve one named source. The path is the source id. There is no request body.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9090/api/v1/sources/resolve/ip_blocklist
@@ -237,6 +243,46 @@ curl -sS -X DELETE http://127.0.0.1:9090/api/v1/sources/cache/ip_blocklist
 ```
 
 The endpoint returns `200 OK` for any source ID regardless of whether that ID is currently configured; nonexistent IDs are a no-op. If you need a strict check, list `/api/v1/sources` first and confirm the source is registered before invalidating.
+
+### Watchlist indicators
+
+{{ added "unreleased" }}
+
+`/api/v1/sources/{source_id}/indicators` reads and changes a `type: watchlist` source. The response is returned before rules finish rebuilding. A body over 4 MiB, or more than 10,000 indicators, is `413`. When `--state-db` enables the audit trail, a body over `daemon.api.audit.max_body_bytes` (default 64 KiB) is also `413`, before this handler runs.
+
+`POST` and `PUT` take:
+
+```json
+{
+  "ttl": "7d",
+  "indicators": [
+    "198.51.100.7",
+    {"value": "203.0.113.9", "ttl": "24h"},
+    {"value": "bad.example.com", "expires_at": "2026-12-01T00:00:00Z"}
+  ]
+}
+```
+
+`ttl` is optional. `POST` answers `{"source_id","added","updated","total"}`. `PUT` answers `{"source_id","total","removed"}` and drops every unexpired value the body does not name.
+
+`DELETE` takes `{"indicators":["198.51.100.7"]}` and answers `{"source_id","removed","not_found","total"}`. When `--state-db` is set, the audit trail records a SHA-256 digest of that body. The body itself is not stored.
+
+`GET` accepts `limit` (default 1000, at most 10000) and `offset` (default 0). The answer is `{"source_id","total","indicators":[{"value","added_at","expires_at"}]}`, sorted by value. `expires_at` is `null` when the indicator does not expire.
+
+| Status | When |
+|--------|------|
+| 404 | No source has that id. |
+| 409 | The source exists and is not a watchlist. |
+| 400 | The body is not the expected JSON, or an indicator value or expiry is invalid. The message names the item index. |
+| 413 | The body is over 4 MiB, the request lists more than 10,000 indicators, or, when the audit trail is enabled, the body exceeds `daemon.api.audit.max_body_bytes` (default 64 KiB). |
+| 422 | The change would exceed the source's `max_indicators`. A watchlist that a pipeline references is capped at 4096, even when `max_indicators` is higher. A successful reload computes that cap again, and a reload that stops referencing the watchlist restores `max_indicators`. |
+| 500 | The state database rejected the write. Memory is unchanged. |
+
+```bash
+curl -sS -X POST http://127.0.0.1:9090/api/v1/sources/c2_ips/indicators \
+  -H 'content-type: application/json' \
+  -d '{"indicators":["198.51.100.7"]}'
+```
 
 ## OTLP ingest
 
@@ -264,5 +310,6 @@ See [OTLP Integration](../guide/otlp-integration.md) for full agent recipes (Gra
 - [OTLP Integration](../guide/otlp-integration.md) for `/v1/logs` agent recipes.
 - [Prometheus Metrics](metrics.md) for `/metrics` definitions and alert recipes.
 - [Observability](../guide/observability.md) for the broader `tracing` and metrics story.
-- [Processing Pipelines: dynamic pipelines](../guide/processing-pipelines.md#dynamic-pipelines) for the source declarations exposed by `/api/v1/sources`.
+- [Dynamic Sources](dynamic-sources.md) for the declarations exposed by `/api/v1/sources`.
+- [Dynamic Pipelines](dynamic-pipelines.md) and [Enrichers](../guide/enrichers.md#using-dynamic-sources-with-lookup-enrichers) for the two consumers.
 - [Security: TLS termination for the API listener](security.md#tls-termination-for-the-api-listener) for the optional `daemon-tls` build feature and the `--tls-*` flag set.

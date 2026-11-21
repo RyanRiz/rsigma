@@ -56,6 +56,8 @@ jobs:
             max_len: 65536
           - target: fuzz_pipeline_sources_yaml
             max_len: 8192
+          - target: fuzz_watchlist_request
+            max_len: 4096
           - target: fuzz_alert_pipeline_config
             max_len: 4096
           - target: fuzz_extract_jq
@@ -76,10 +78,24 @@ jobs:
             max_len: 65536
           - target: fuzz_stix_pattern
             max_len: 4096
+          - target: fuzz_taxii_envelope
+            max_len: 65536
+          - target: fuzz_stix_source
+            max_len: 262144
+          - target: fuzz_stix_draft
+            max_len: 65536
           - target: fuzz_capture_spool
             max_len: 65536
           - target: fuzz_otlp_logs_decode
             max_len: 65536
+          - target: fuzz_mmdb_record
+            max_len: 65536
+          - target: fuzz_dns_answer
+            max_len: 4096
+          - target: fuzz_ruleset_resolve
+            max_len: 4096
+          - target: fuzz_ocsf_sidecar
+            max_len: 8192
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

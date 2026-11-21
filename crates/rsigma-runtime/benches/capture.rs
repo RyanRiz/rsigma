@@ -25,10 +25,12 @@ fn detection(ip: &str) -> EvaluationResult {
         header: RuleHeader {
             rule_title: "Brute force".to_string(),
             rule_id: Some("rule-1".to_string()),
+            tenant_id: None,
             level: Some(Level::High),
             tags: vec![],
             custom_attributes: Arc::new(HashMap::new()),
             enrichments: None,
+            ruleset: None,
         },
         body: ResultBody::Detection(DetectionBody {
             matched_selections: vec![],

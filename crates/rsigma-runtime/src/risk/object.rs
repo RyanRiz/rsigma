@@ -21,7 +21,7 @@ pub struct ObjectSelector {
 }
 
 /// A single extracted risk object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RiskObject {
     /// The risk-object type, e.g. `user`.
     #[serde(rename = "type")]
@@ -80,6 +80,7 @@ mod tests {
             header: RuleHeader {
                 rule_title: "t".to_string(),
                 rule_id: Some("r".to_string()),
+                tenant_id: None,
                 level: Some(Level::High),
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
@@ -89,6 +90,7 @@ mod tests {
                         .unwrap()
                         .clone(),
                 ),
+                ruleset: None,
             },
             body: ResultBody::Detection(DetectionBody {
                 matched_selections: vec![],

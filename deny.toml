@@ -3,7 +3,13 @@
 # in the audit run without breaking CI; we cannot drop transitive
 # unmaintained deps unilaterally but we want to see them.
 unmaintained = "workspace"
-ignore = []
+# chrono was marked unmaintained on 2026-11-17 and has no replacement.
+# humantime is listed only because it wraps chrono.
+# https://github.com/chronotope/chrono/issues/1768
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono has no maintained replacement" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained because it wraps chrono" },
+]
 
 [licenses]
 allow = [
@@ -21,6 +27,13 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+
+# psm, which every crate reaches through pest's stack guard, builds its
+# assembly archive with ar_archive_writer. It is a build dependency only, and
+# the LLVM exception adds a permission to Apache-2.0 without restricting it.
+[[licenses.exceptions]]
+crate = "ar_archive_writer"
+allow = ["Apache-2.0 WITH LLVM-exception"]
 
 [bans]
 multiple-versions = "warn"

@@ -28,11 +28,15 @@ cli_features! {
     "daemon-nats",
     "daemon-otlp",
     "daemon-tls",
+    "dns-enrich",
     "evtx",
     "hunt-postgres",
     "logfmt",
     "mcp",
+    "mmdb-enrich",
+    "stix-draft",
     "stix-enrich",
+    "stix-source",
     "taxii-sync",
 }
 
