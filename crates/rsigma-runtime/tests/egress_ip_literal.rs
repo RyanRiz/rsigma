@@ -38,10 +38,12 @@ fn detection() -> EvaluationResult {
         header: RuleHeader {
             rule_title: "rule".to_string(),
             rule_id: Some("rule-id".to_string()),
+            tenant_id: None,
             level: Some(Level::High),
             tags: vec![],
             custom_attributes: Arc::new(HashMap::new()),
             enrichments: None,
+            ruleset: None,
         },
         body: ResultBody::Detection(DetectionBody {
             matched_selections: vec!["selection".to_string()],

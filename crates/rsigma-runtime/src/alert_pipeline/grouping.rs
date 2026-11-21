@@ -17,10 +17,11 @@
 //! still-open incident). An incident resolves and is evicted once
 //! `resolve_timeout` elapses with no new results.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use rsigma_eval::EvaluationResult;
+use rsigma_eval::TenantId;
 use rsigma_parser::Level;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -109,6 +110,9 @@ pub struct IncidentResult {
     /// Deterministic group fingerprint (group_by) or surrogate UUIDv4
     /// (entity_graph). Stable across restarts in group_by mode.
     pub incident_id: String,
+    /// Tenant that owns this incident, when tenancy is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<TenantId>,
     /// `open` or `resolved`.
     pub state: &'static str,
     /// What produced this emission: `group_wait` / `group_interval` /
@@ -175,6 +179,7 @@ pub enum SampleMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Incident {
     id: String,
+    pub(crate) tenant: Option<TenantId>,
     first_seen: i64,
     last_seen: i64,
     last_emitted: i64,
@@ -187,13 +192,22 @@ pub(crate) struct Incident {
     rule_counts: BTreeMap<String, u64>,
     result_count: u64,
     refs: Vec<IncidentRef>,
+    /// Finding uids index-aligned with `refs`; in memory only.
+    #[serde(skip)]
+    ref_uids: Vec<Option<String>>,
     results: Vec<Value>,
+    /// Finding uids index-aligned with `results`; in memory only, so a
+    /// restored incident starts with none.
+    #[serde(skip)]
+    result_uids: Vec<Option<String>>,
 }
 
 /// A grouping outcome the driver records a metric for.
 pub(crate) struct IncidentEmission {
     pub trigger: &'static str,
     pub result: IncidentResult,
+    /// Detection Finding uids for `result`, absent from the wire.
+    pub links: crate::FindingLinks,
 }
 
 /// In-memory incident store, owned single-threaded by the sink task (or shared
@@ -201,10 +215,30 @@ pub(crate) struct IncidentEmission {
 #[derive(Debug, Default)]
 pub struct IncidentStore {
     incidents: HashMap<String, Incident>,
-    /// entity_graph: `(selector, value)` -> incident id.
-    entity_index: HashMap<(String, String), String>,
+    /// entity_graph: `(tenant, selector, value)` -> incident id.
+    entity_index: HashMap<(Option<TenantId>, String, String), String>,
     /// entity_graph: per-value occurrence count for the cardinality guard.
-    value_counts: HashMap<(String, String), u64>,
+    value_counts: HashMap<(Option<TenantId>, String, String), u64>,
+    /// Open incident ids per tenant, kept in step with `incidents`.
+    tenant_ids: HashMap<Option<TenantId>, HashSet<String>>,
+}
+
+/// A per-tenant open-incident cap and the callback run for each incident it
+/// evicts.
+pub(crate) struct TenantCap<F: FnMut()> {
+    pub(crate) max: Option<usize>,
+    pub(crate) on_evict: F,
+}
+
+#[cfg(test)]
+impl TenantCap<fn()> {
+    /// No per-tenant cap.
+    pub(crate) fn none() -> Self {
+        TenantCap {
+            max: None,
+            on_evict: || {},
+        }
+    }
 }
 
 /// A value the cardinality guard or stop-list suppressed, reported via a
@@ -254,6 +288,7 @@ impl IncidentStore {
 
     /// Assign a result to an incident, returning the incident id to annotate
     /// the pass-through result with. Records guard hits via `on_guard`.
+    #[cfg(test)]
     pub(crate) fn assign(
         &mut self,
         cfg: &GroupConfig,
@@ -261,28 +296,84 @@ impl IncidentStore {
         now: i64,
         mut on_guard: impl FnMut(OvermergeGuard),
     ) -> Option<String> {
+        self.assign_with_finding_uid(cfg, result, None, now, &mut on_guard, TenantCap::none())
+    }
+
+    /// [`Self::assign`], recording the result's OCSF finding uid on the
+    /// retained sample.
+    pub(crate) fn assign_with_finding_uid(
+        &mut self,
+        cfg: &GroupConfig,
+        result: &EvaluationResult,
+        finding_uid: Option<&str>,
+        now: i64,
+        mut on_guard: impl FnMut(OvermergeGuard),
+        mut tenant_cap: TenantCap<impl FnMut()>,
+    ) -> Option<String> {
         match cfg.mode {
-            GroupMode::GroupBy => self.assign_group_by(cfg, result, now),
-            GroupMode::EntityGraph => self.assign_entity_graph(cfg, result, now, &mut on_guard),
+            GroupMode::GroupBy => {
+                self.assign_group_by(cfg, result, finding_uid, now, &mut tenant_cap)
+            }
+            GroupMode::EntityGraph => self.assign_entity_graph(
+                cfg,
+                result,
+                finding_uid,
+                now,
+                &mut on_guard,
+                &mut tenant_cap,
+            ),
         }
+    }
+
+    /// Make room for a new incident of `tenant` under its cap by evicting the
+    /// tenant's least recently seen incident.
+    fn make_tenant_room(&mut self, tenant: Option<&TenantId>, cap: &mut TenantCap<impl FnMut()>) {
+        if let Some(max) = cap.max
+            && self.count_for_tenant(tenant) >= max
+            && self.evict_tenant_oldest(tenant)
+        {
+            (cap.on_evict)();
+        }
+    }
+
+    fn insert_incident(&mut self, incident: Incident) {
+        self.tenant_ids
+            .entry(incident.tenant.clone())
+            .or_default()
+            .insert(incident.id.clone());
+        self.incidents.insert(incident.id.clone(), incident);
+    }
+
+    fn remove_incident(&mut self, id: &str) -> Option<Incident> {
+        let incident = self.incidents.remove(id)?;
+        if let Some(ids) = self.tenant_ids.get_mut(&incident.tenant) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.tenant_ids.remove(&incident.tenant);
+            }
+        }
+        Some(incident)
     }
 
     fn assign_group_by(
         &mut self,
         cfg: &GroupConfig,
         result: &EvaluationResult,
+        finding_uid: Option<&str>,
         now: i64,
+        tenant_cap: &mut TenantCap<impl FnMut()>,
     ) -> Option<String> {
         let (id, key) = group_fingerprint(&cfg.by, result);
-        let exists = self.incidents.contains_key(&id);
-        if !exists && self.incidents.len() >= cfg.caps.max_open_incidents {
-            return None;
+        let tenant = result.header.tenant_id.clone();
+        if !self.incidents.contains_key(&id) {
+            self.make_tenant_room(tenant.as_ref(), tenant_cap);
+            if self.incidents.len() >= cfg.caps.max_open_incidents {
+                return None;
+            }
+            self.insert_incident(Incident::new(id.clone(), tenant, now, key));
         }
-        let incident = self
-            .incidents
-            .entry(id.clone())
-            .or_insert_with(|| Incident::new(id.clone(), now, key.clone()));
-        incident.absorb(result, now, cfg);
+        let incident = self.incidents.get_mut(&id)?;
+        incident.absorb(result, finding_uid, now, cfg);
         Some(id)
     }
 
@@ -290,13 +381,16 @@ impl IncidentStore {
         &mut self,
         cfg: &GroupConfig,
         result: &EvaluationResult,
+        finding_uid: Option<&str>,
         now: i64,
         on_guard: &mut impl FnMut(OvermergeGuard),
+        tenant_cap: &mut TenantCap<impl FnMut()>,
     ) -> Option<String> {
         // Extract joinable entity pairs, applying the stop-list and
         // per-value cardinality ceiling. Counters only move for values an
         // incident stores, once the result is accepted (below).
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let tenant = result.header.tenant_id.clone();
+        let mut pairs: Vec<(Option<TenantId>, String, String)> = Vec::new();
         for sel in &cfg.entities {
             let Some(value) = sel.resolve(result) else {
                 continue;
@@ -309,7 +403,7 @@ impl IncidentStore {
                 on_guard(OvermergeGuard::StopValue);
                 continue;
             }
-            let key = (sel.as_str(), value);
+            let key = (tenant.clone(), sel.as_str().to_string(), value);
             if self.value_counts.get(&key).copied().unwrap_or(0) >= cfg.caps.max_value_cardinality {
                 on_guard(OvermergeGuard::CardinalityCeiling);
                 continue;
@@ -335,12 +429,12 @@ impl IncidentStore {
 
         let survivor_id = match touched.first().cloned() {
             None => {
+                self.make_tenant_room(tenant.as_ref(), tenant_cap);
                 if self.incidents.len() >= cfg.caps.max_open_incidents {
                     return None;
                 }
                 let id = uuid::Uuid::new_v4().to_string();
-                self.incidents
-                    .insert(id.clone(), Incident::new(id.clone(), now, Vec::new()));
+                self.insert_incident(Incident::new(id.clone(), tenant.clone(), now, Vec::new()));
                 id
             }
             Some(survivor) => {
@@ -356,16 +450,16 @@ impl IncidentStore {
         // incident stores are indexed and counted: resolve and merge evict by
         // the stored set, so anything else would leak and go stale. A merge can
         // leave a set above the cap, so a value already stored still counts.
-        let mut stored: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+        let mut stored: Vec<(Option<TenantId>, String, String)> = Vec::with_capacity(pairs.len());
         if let Some(incident) = self.incidents.get_mut(&survivor_id) {
-            for (sel, value) in pairs {
+            for (tenant, sel, value) in pairs {
                 let set = incident.entities.entry(sel.clone()).or_default();
                 if set.contains(&value) || set.len() < cfg.caps.max_entities_per_incident {
                     set.insert(value.clone());
-                    stored.push((sel, value));
+                    stored.push((tenant, sel, value));
                 }
             }
-            incident.absorb(result, now, cfg);
+            incident.absorb(result, finding_uid, now, cfg);
         }
         for pair in stored {
             *self.value_counts.entry(pair.clone()).or_insert(0) += 1;
@@ -379,14 +473,16 @@ impl IncidentStore {
         if survivor == other {
             return;
         }
-        let Some(mut victim) = self.incidents.remove(other) else {
+        let Some(mut victim) = self.remove_incident(other) else {
             return;
         };
         // Repoint entity-index entries from the victim to the survivor.
         for (sel, values) in &victim.entities {
             for value in values {
-                self.entity_index
-                    .insert((sel.clone(), value.clone()), survivor.to_string());
+                self.entity_index.insert(
+                    (victim.tenant.clone(), sel.clone(), value.clone()),
+                    survivor.to_string(),
+                );
             }
         }
         if let Some(inc) = self.incidents.get_mut(survivor) {
@@ -401,11 +497,20 @@ impl IncidentStore {
             for (sel, values) in victim.entities {
                 inc.entities.entry(sel).or_default().extend(values);
             }
+            let refs_before = inc.refs.len();
+            inc.ref_uids.resize(refs_before, None);
+            victim.ref_uids.resize(victim.refs.len(), None);
             inc.refs.append(&mut victim.refs);
+            inc.ref_uids.append(&mut victim.ref_uids);
+            inc.result_uids.resize(inc.results.len(), None);
+            victim.result_uids.resize(victim.results.len(), None);
             inc.results.append(&mut victim.results);
+            inc.result_uids.append(&mut victim.result_uids);
             // Keep the per-incident cap after merging two incidents' samples.
             inc.refs.truncate(max_results);
+            inc.ref_uids.truncate(max_results);
             inc.results.truncate(max_results);
+            inc.result_uids.truncate(max_results);
         }
     }
 
@@ -422,9 +527,11 @@ impl IncidentStore {
         for (id, inc) in self.incidents.iter_mut() {
             if !inc.opened {
                 if now - inc.first_seen >= group_wait {
+                    let (result, links) = inc.to_result("open", "group_wait", cfg.include);
                     out.push(IncidentEmission {
                         trigger: "group_wait",
-                        result: inc.to_result("open", "group_wait", cfg.include),
+                        result,
+                        links,
                     });
                     inc.opened = true;
                     inc.dirty = false;
@@ -434,35 +541,41 @@ impl IncidentStore {
                 continue;
             }
             if now - inc.last_seen >= resolve {
+                let (result, links) = inc.to_result("resolved", "resolved", cfg.include);
                 out.push(IncidentEmission {
                     trigger: "resolved",
-                    result: inc.to_result("resolved", "resolved", cfg.include),
+                    result,
+                    links,
                 });
                 resolved.push(id.clone());
             } else if inc.dirty && now - inc.last_emitted >= group_interval {
+                let (result, links) = inc.to_result("open", "group_interval", cfg.include);
                 out.push(IncidentEmission {
                     trigger: "group_interval",
-                    result: inc.to_result("open", "group_interval", cfg.include),
+                    result,
+                    links,
                 });
                 inc.dirty = false;
                 inc.last_emitted = now;
                 inc.emitted_count = inc.result_count;
             } else if repeat > 0 && now - inc.last_emitted >= repeat {
+                let (result, links) = inc.to_result("open", "repeat", cfg.include);
                 out.push(IncidentEmission {
                     trigger: "repeat",
-                    result: inc.to_result("open", "repeat", cfg.include),
+                    result,
+                    links,
                 });
                 inc.last_emitted = now;
             }
         }
         for id in resolved {
-            if let Some(inc) = self.incidents.remove(&id) {
+            if let Some(inc) = self.remove_incident(&id) {
                 // Drop the resolved incident's entity values from both the index
                 // and the cardinality counters so neither grows unbounded with
                 // distinct entity values over time.
                 for (sel, values) in inc.entities {
                     for value in values {
-                        let key = (sel.clone(), value);
+                        let key = (inc.tenant.clone(), sel.clone(), value);
                         self.entity_index.remove(&key);
                         self.value_counts.remove(&key);
                     }
@@ -491,7 +604,7 @@ impl IncidentStore {
     ) -> usize {
         for inc in incidents {
             if now - inc.last_seen < resolve_secs {
-                self.incidents.insert(inc.id.clone(), inc);
+                self.insert_incident(inc);
             }
         }
         let evicted = self.enforce_caps(caps);
@@ -499,8 +612,10 @@ impl IncidentStore {
         for inc in self.incidents.values() {
             for (sel, values) in &inc.entities {
                 for value in values {
-                    self.entity_index
-                        .insert((sel.clone(), value.clone()), inc.id.clone());
+                    self.entity_index.insert(
+                        (inc.tenant.clone(), sel.clone(), value.clone()),
+                        inc.id.clone(),
+                    );
                 }
             }
         }
@@ -524,26 +639,30 @@ impl IncidentStore {
                 .collect();
             by_age.sort_unstable();
             for (_, id) in by_age.into_iter().take(excess) {
-                if let Some(inc) = self.incidents.remove(&id) {
+                if let Some(inc) = self.remove_incident(&id) {
+                    let tenant = inc.tenant.clone();
                     for (sel, values) in inc.entities {
                         for value in values {
-                            self.forget_value(&id, (sel.clone(), value));
+                            self.forget_value(&id, (tenant.clone(), sel.clone(), value));
                         }
                     }
                 }
             }
         }
 
-        let mut dropped: Vec<(String, (String, String))> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut dropped: Vec<(String, (Option<TenantId>, String, String))> = Vec::new();
         for inc in self.incidents.values_mut() {
             inc.refs.truncate(caps.max_results_per_incident);
             inc.results.truncate(caps.max_results_per_incident);
+            inc.result_uids.truncate(caps.max_results_per_incident);
+            let tenant = inc.tenant.clone();
             for (sel, values) in inc.entities.iter_mut() {
                 while values.len() > caps.max_entities_per_incident {
                     let Some(value) = values.pop_last() else {
                         break;
                     };
-                    dropped.push((inc.id.clone(), (sel.clone(), value)));
+                    dropped.push((inc.id.clone(), (tenant.clone(), sel.clone(), value)));
                 }
             }
         }
@@ -553,9 +672,64 @@ impl IncidentStore {
         excess
     }
 
+    /// Count of open incidents owned by `tenant`.
+    pub(crate) fn count_for_tenant(&self, tenant: Option<&TenantId>) -> usize {
+        self.tenant_ids
+            .get(&tenant.cloned())
+            .map_or(0, HashSet::len)
+    }
+
+    /// Evict the least recently seen incident owned by `tenant`, dropping its
+    /// entity join keys and cardinality counters. Returns whether one was
+    /// evicted.
+    pub(crate) fn evict_tenant_oldest(&mut self, tenant: Option<&TenantId>) -> bool {
+        let victim = self
+            .tenant_ids
+            .get(&tenant.cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.incidents.get(id))
+            .min_by_key(|inc| inc.last_seen)
+            .map(|inc| inc.id.clone());
+        let Some(id) = victim else {
+            return false;
+        };
+        if let Some(inc) = self.remove_incident(&id) {
+            let tenant = inc.tenant.clone();
+            for (sel, values) in inc.entities {
+                for value in values {
+                    let key = (tenant.clone(), sel.clone(), value);
+                    self.entity_index.remove(&key);
+                    self.value_counts.remove(&key);
+                }
+            }
+        }
+        true
+    }
+
+    /// Evict each tenant's least recently seen incidents until it holds at
+    /// most `max`, returning how many were evicted.
+    pub(crate) fn enforce_tenant_cap(&mut self, max: usize) -> usize {
+        let over: Vec<Option<TenantId>> = self
+            .tenant_ids
+            .iter()
+            .filter(|(_, ids)| ids.len() > max)
+            .map(|(tenant, _)| tenant.clone())
+            .collect();
+        let mut evicted = 0;
+        for tenant in over {
+            while self.count_for_tenant(tenant.as_ref()) > max
+                && self.evict_tenant_oldest(tenant.as_ref())
+            {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
     /// Drop an entity value's index entry and cardinality counter, but only
     /// while the index still attributes the value to incident `id`.
-    fn forget_value(&mut self, id: &str, key: (String, String)) {
+    fn forget_value(&mut self, id: &str, key: (Option<TenantId>, String, String)) {
         if self.entity_index.get(&key).is_some_and(|owner| owner == id) {
             self.entity_index.remove(&key);
             self.value_counts.remove(&key);
@@ -564,9 +738,10 @@ impl IncidentStore {
 }
 
 impl Incident {
-    fn new(id: String, now: i64, group_by: Vec<(String, Value)>) -> Self {
+    fn new(id: String, tenant: Option<TenantId>, now: i64, group_by: Vec<(String, Value)>) -> Self {
         Incident {
             id,
+            tenant,
             first_seen: now,
             last_seen: now,
             last_emitted: now,
@@ -579,11 +754,19 @@ impl Incident {
             rule_counts: BTreeMap::new(),
             result_count: 0,
             refs: Vec::new(),
+            ref_uids: Vec::new(),
             results: Vec::new(),
+            result_uids: Vec::new(),
         }
     }
 
-    fn absorb(&mut self, result: &EvaluationResult, now: i64, cfg: &GroupConfig) {
+    fn absorb(
+        &mut self,
+        result: &EvaluationResult,
+        finding_uid: Option<&str>,
+        now: i64,
+        cfg: &GroupConfig,
+    ) {
         self.last_seen = now;
         self.dirty = true;
         self.result_count += 1;
@@ -601,14 +784,17 @@ impl Incident {
                         rule,
                         level: result.header.level.map(|l| l.as_str().to_string()),
                     });
+                    self.ref_uids.push(finding_uid.map(str::to_string));
                 }
             }
             IncludeMode::Results => {
                 if self.results.len() < cfg.caps.max_results_per_incident {
                     let mut sample = result.clone();
                     strip_event_payloads(&mut sample);
+                    self.result_uids.resize(self.results.len(), None);
                     self.results
                         .push(serde_json::to_value(&sample).unwrap_or(Value::Null));
+                    self.result_uids.push(finding_uid.map(str::to_string));
                 }
             }
         }
@@ -619,7 +805,7 @@ impl Incident {
         state: &'static str,
         trigger: &'static str,
         include: IncludeMode,
-    ) -> IncidentResult {
+    ) -> (IncidentResult, crate::FindingLinks) {
         let group_by: serde_json::Map<String, Value> = self.group_by.iter().cloned().collect();
         let entities: serde_json::Map<String, Value> = self
             .entities
@@ -639,28 +825,45 @@ impl Incident {
             (include == IncludeMode::Refs || !self.refs.is_empty()).then(|| self.refs.clone());
         let results = (include == IncludeMode::Results || !self.results.is_empty())
             .then(|| self.results.clone());
-        IncidentResult {
-            incident_id: self.id.clone(),
-            state,
-            trigger,
-            first_seen: self.first_seen,
-            last_seen: self.last_seen,
-            max_level: self.max_level.map(|l| l.as_str().to_string()),
-            result_count: self.result_count,
-            rule_counts: self.rule_counts.clone(),
-            group_by,
-            entities,
-            refs,
-            results,
-            sample_mode: None,
-            bundle_ready: None,
-        }
+        let links = crate::FindingLinks {
+            refs: refs.as_ref().map_or_else(Vec::new, |refs| {
+                (0..refs.len())
+                    .map(|i| self.ref_uids.get(i).cloned().flatten())
+                    .collect()
+            }),
+            results: results.as_ref().map_or_else(Vec::new, |results| {
+                (0..results.len())
+                    .map(|i| self.result_uids.get(i).cloned().flatten())
+                    .collect()
+            }),
+        };
+        (
+            IncidentResult {
+                incident_id: self.id.clone(),
+                tenant_id: self.tenant.clone(),
+                state,
+                trigger,
+                first_seen: self.first_seen,
+                last_seen: self.last_seen,
+                max_level: self.max_level.map(|l| l.as_str().to_string()),
+                result_count: self.result_count,
+                rule_counts: self.rule_counts.clone(),
+                group_by,
+                entities,
+                refs,
+                results,
+                sample_mode: None,
+                bundle_ready: None,
+            },
+            links,
+        )
     }
 
     /// The read-only view served by the admin API: the emitted shape plus the
     /// retention and lifecycle facts a caller needs to interpret it.
+    /// Finding uids stay off this view.
     fn to_snapshot(&self, include: IncludeMode) -> IncidentResult {
-        let mut out = self.to_result("open", "snapshot", include);
+        let (mut out, _) = self.to_result("open", "snapshot", include);
         out.sample_mode = Some(self.sample_mode());
         out.bundle_ready = Some(self.opened);
         out
@@ -685,6 +888,11 @@ pub fn group_fingerprint(
 ) -> (String, Vec<(String, Value)>) {
     let mut buf = String::with_capacity(64);
     let mut key = Vec::with_capacity(selectors.len());
+    if let Some(tenant) = &result.header.tenant_id {
+        buf.push_str("tenant=");
+        buf.push_str(tenant.as_str());
+        buf.push('\u{1f}');
+    }
     for sel in selectors {
         let value = sel.resolve(result).unwrap_or(Value::Null);
         buf.push('\u{1f}');
@@ -731,10 +939,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: rule.to_string(),
                 rule_id: Some(rule.to_string()),
+                tenant_id: None,
                 level: Some(level),
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Detection(DetectionBody {
                 matched_selections: vec![],
@@ -907,6 +1117,82 @@ mod tests {
     }
 
     #[test]
+    fn finding_uids_ride_on_samples_but_never_on_the_wire() {
+        let refs_cfg = group_by_cfg();
+        let results_cfg = GroupConfig {
+            include: IncludeMode::Results,
+            ..group_by_cfg()
+        };
+        let mut store = IncidentStore::default();
+        let r1 = detection("r1", "10.0.0.1", "alice", Level::High);
+        let id = store
+            .assign_with_finding_uid(&refs_cfg, &r1, Some("uid-1"), 0, |_| {}, TenantCap::none())
+            .unwrap();
+        let r2 = detection("r2", "10.0.0.1", "bob", Level::Low);
+        store.assign_with_finding_uid(&results_cfg, &r2, None, 1, |_| {}, TenantCap::none());
+        let r3 = detection("r3", "10.0.0.1", "carol", Level::Low);
+        store.assign_with_finding_uid(
+            &results_cfg,
+            &r3,
+            Some("uid-3"),
+            2,
+            |_| {},
+            TenantCap::none(),
+        );
+
+        let emissions = store.tick(&results_cfg, 30);
+        assert_eq!(emissions[0].links.refs, [Some("uid-1".to_string())]);
+        assert_eq!(
+            emissions[0].links.results,
+            [None, Some("uid-3".to_string())]
+        );
+        let wire = serde_json::to_string(&emissions[0].result).unwrap();
+        assert!(!wire.contains("uid-"), "finding uids leaked: {wire}");
+        assert!(!wire.contains("finding_uid"), "{wire}");
+        let snap = store.snapshot_one(&id, results_cfg.include).unwrap();
+        let snap_wire = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !snap_wire.contains("uid-"),
+            "snapshot leaked uids: {snap_wire}"
+        );
+    }
+
+    #[test]
+    fn merged_result_uids_stay_aligned_with_their_results() {
+        let cfg = GroupConfig {
+            include: IncludeMode::Results,
+            ..entity_cfg()
+        };
+        let mut store = IncidentStore::default();
+        let a = detection("r", "10.0.0.1", "alice", Level::High);
+        store.assign_with_finding_uid(&cfg, &a, Some("uid-a"), 0, |_| {}, TenantCap::none());
+        let b = detection("r", "10.0.0.2", "bob", Level::High);
+        store.assign_with_finding_uid(&cfg, &b, None, 1, |_| {}, TenantCap::none());
+        // Bridges both incidents.
+        let c = detection("r", "10.0.0.2", "alice", Level::High);
+        let id = store
+            .assign_with_finding_uid(&cfg, &c, Some("uid-c"), 2, |_| {}, TenantCap::none())
+            .unwrap();
+        assert_eq!(store.len(), 1);
+
+        let inc = &store.incidents[&id];
+        let results = &inc.results;
+        assert_eq!(results.len(), inc.result_uids.len());
+        let pairs: Vec<(String, Option<String>)> = results
+            .iter()
+            .zip(&inc.result_uids)
+            .map(|(result, uid)| {
+                let ip = result["matched_fields"][0]["value"].as_str().unwrap();
+                let user = result["matched_fields"][1]["value"].as_str().unwrap();
+                (format!("{ip}/{user}"), uid.clone())
+            })
+            .collect();
+        assert!(pairs.contains(&("10.0.0.1/alice".to_string(), Some("uid-a".to_string()))));
+        assert!(pairs.contains(&("10.0.0.2/bob".to_string(), None)));
+        assert!(pairs.contains(&("10.0.0.2/alice".to_string(), Some("uid-c".to_string()))));
+    }
+
+    #[test]
     fn group_by_fingerprint_is_deterministic() {
         let cfg = group_by_cfg();
         let mut s1 = IncidentStore::default();
@@ -959,6 +1245,27 @@ mod tests {
             stop_values: BTreeSet::new(),
             nats_subject: None,
         }
+    }
+
+    #[test]
+    fn entity_graph_never_joins_across_tenants() {
+        let cfg = entity_cfg();
+        let mut store = IncidentStore::default();
+        let tenanted = |tenant: &str| {
+            let mut r = detection("r", "10.0.0.1", "alice", Level::High);
+            r.header.tenant_id = Some(TenantId::new(tenant).unwrap());
+            r
+        };
+        let a = store.assign(&cfg, &tenanted("a"), 0, |_| {}).unwrap();
+        let b = store.assign(&cfg, &tenanted("b"), 1, |_| {}).unwrap();
+        assert_ne!(a, b, "a shared entity value does not merge tenants");
+        assert_eq!(store.len(), 2);
+        let again = store.assign(&cfg, &tenanted("a"), 2, |_| {}).unwrap();
+        assert_eq!(again, a);
+        assert_eq!(
+            store.count_for_tenant(Some(&TenantId::new("b").unwrap())),
+            1
+        );
     }
 
     #[test]
@@ -1116,7 +1423,7 @@ mod tests {
         assert!(
             !store
                 .entity_index
-                .contains_key(&("match.User".to_string(), "bob".to_string())),
+                .contains_key(&(None, "match.User".to_string(), "bob".to_string())),
             "an over-cap value must not become a join key"
         );
 
@@ -1147,7 +1454,7 @@ mod tests {
         let cfg = entity_cfg();
         let mut store = IncidentStore::default();
         let live = assign(&mut store, &cfg, "10.0.0.2", "carol", 0).unwrap();
-        let stale_key = ("match.SourceIp".to_string(), "10.0.0.9".to_string());
+        let stale_key = (None, "match.SourceIp".to_string(), "10.0.0.9".to_string());
         store
             .entity_index
             .insert(stale_key.clone(), "resolved-incident".to_string());
@@ -1178,7 +1485,11 @@ mod tests {
         };
         assert_eq!(store.enforce_caps(&caps), 1);
         assert_eq!(store.incidents.keys().collect::<Vec<_>>(), [&newer]);
-        let mut keys: Vec<&str> = store.entity_index.keys().map(|(_, v)| v.as_str()).collect();
+        let mut keys: Vec<&str> = store
+            .entity_index
+            .keys()
+            .map(|(_, _, v)| v.as_str())
+            .collect();
         keys.sort();
         assert_eq!(keys, ["10.0.0.2", "bob"]);
         assert_eq!(store.value_counts.len(), 2);
@@ -1220,5 +1531,27 @@ mod tests {
         assert!(assign(&mut store, &cfg, "10.0.0.2", "bob", 1).is_none());
         assert_eq!(store.value_counts, before);
         assert_eq!(store.entity_index.len(), 2);
+    }
+
+    fn tenant_detection(rule: &str, ip: &str, user: &str, tenant: &str) -> EvaluationResult {
+        let mut r = detection(rule, ip, user, Level::High);
+        r.header.tenant_id = Some(TenantId::new(tenant).unwrap());
+        r
+    }
+
+    #[test]
+    fn the_same_group_key_in_two_tenants_is_two_incidents() {
+        let cfg = group_by_cfg();
+        let mut store = IncidentStore::default();
+        let a = tenant_detection("r", "10.0.0.1", "alice", "a");
+        let b = tenant_detection("r", "10.0.0.1", "alice", "b");
+        let ida = store.assign(&cfg, &a, 0, |_| {}).unwrap();
+        let idb = store.assign(&cfg, &b, 0, |_| {}).unwrap();
+        assert_ne!(ida, idb, "tenant is part of the incident id");
+        assert_eq!(store.len(), 2);
+
+        let emissions = store.tick(&cfg, 30);
+        assert_eq!(emissions.len(), 2);
+        assert!(emissions.iter().all(|e| e.result.tenant_id.is_some()));
     }
 }

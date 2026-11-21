@@ -16,7 +16,7 @@ description: "Run RSigma with Docker: the signed multi-arch ghcr.io/timescale/rs
 | Base image | `FROM scratch` (no shell, no package manager) |
 | User | `65534:65534` (`nobody:nogroup`) |
 | Entrypoint | `/rsigma` |
-| Features | built with `--all-features` (see [Feature Flags](../reference/feature-flags.md)), including `daemon`, `mcp`, `daemon-nats`, `daemon-otlp`, `daemon-tls`, `logfmt`, `cef`, `evtx`, and `daachorse-index` |
+| Features | built with `--all-features` (see [Feature Flags](../reference/feature-flags.md)), including `daemon`, `mcp`, `daemon-nats`, `daemon-otlp`, `daemon-tls`, `logfmt`, `cef`, `evtx`, `mmdb-enrich`, `dns-enrich`, `stix-source`, `stix-draft`, and `daachorse-index` |
 
 ## Pull and run
 
@@ -199,6 +199,34 @@ docker run --rm \
 
 For OTLP, expose port 9090 (HTTP/REST + OTLP/HTTP + gRPC all share one listener) and point upstream agents at `http://<host>:9090/v1/logs`. See [OTLP Integration](../guide/otlp-integration.md) for agent-side recipes.
 
+## GeoIP databases
+
+The image includes the `mmdb-enrich` feature, so `type: mmdb` enrichers work without a custom build. Databases are not bundled; mount the directory that holds them read-only and reference the file with `db_path`:
+
+```bash
+docker run --rm \
+    -e RSIGMA_API_TOKEN \
+    -v "$PWD/rules:/rules:ro" \
+    -v "$PWD/enrichers:/enrichers:ro" \
+    -v /var/lib/geoip:/var/lib/geoip:ro \
+    -p 9090:9090 \
+    ghcr.io/timescale/rsigma:latest \
+    engine daemon -r /rules/ --enrichers /enrichers/enrichers.yml \
+    --input http \
+    --api-addr 0.0.0.0:9090 --allow-plaintext \
+    --api-token-env RSIGMA_API_TOKEN
+```
+
+Mount the containing directory rather than a single file. A bind mount of one file pins that inode, so when `geoipupdate` replaces the database by writing a new file and renaming it over the old path, the container keeps seeing the old inode and the enricher never observes the change. Mounting the directory means the renamed file appears at the same path inside the container, and the enricher reloads it on its next check (about once a minute). See [Enrichers: `mmdb`](../guide/enrichers.md#mmdb-local-mmdb-lookup) for the enricher schema and reload behavior.
+
+The container runs as uid `65534`, so the database files must be readable by that user; a mode of `0644` on the host works. The enricher only reads the file, so `:ro` is correct.
+
+## DNS lookups
+
+{{ added "unreleased" }} The image includes the `dns-enrich` feature, so `type: dns` enrichers work without a custom build. With no `nameservers` configured, the enricher resolves through the `/etc/resolv.conf` that Docker provides for the container, which points at the host's resolver unless you override it. Nothing needs to be mounted.
+
+To send queries to a specific resolver, list it under `nameservers` in the enricher block, for example `["10.0.0.53"]` or `["[2001:db8::53]:5353"]`. See [Enrichers: `dns`](../guide/enrichers.md#dns-dns-lookup) for the schema and cache behavior.
+
 ## Building from source
 
 For non-standard feature combinations or local development, build the image with `docker buildx`:
@@ -231,6 +259,7 @@ FROM docker/library/alpine:3.21
 
 - [Kubernetes](kubernetes.md) for running the image in a cluster with probes, a state volume, and a restricted security context.
 - [systemd](systemd.md) for running the binary as a hardened host service.
+- [Serverless](serverless.md) for one batch run per invocation in AWS Lambda or a scheduled container job.
 - [Streaming Detection](../guide/streaming-detection.md) for daemon configuration that the container runs.
 - [Observability](../guide/observability.md) for the metrics endpoint exposed by the running container.
 - [Security Hardening](../reference/security.md) for the supply-chain controls (cosign, SLSA, SBOM, Grype scan gate).

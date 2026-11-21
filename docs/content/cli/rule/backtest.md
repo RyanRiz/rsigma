@@ -11,7 +11,7 @@ Replay an event corpus against a ruleset, diff the per-rule fire counts against 
 ## Synopsis
 
 ```text
-rsigma rule backtest [OPTIONS] --rules <RULES> --corpus <PATH>
+rsigma rule backtest [OPTIONS] [--rules <RULES> | --ruleset <NAME>] --corpus <PATH>
 ```
 
 ## Description
@@ -28,11 +28,12 @@ Without an `--expectations` file, backtest still runs and prints per-rule statis
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-r, --rules <PATH>` | required | Sigma rule file or directory of rules. May also be supplied via `backtest.rules` in a config file. |
+| `-r, --rules <PATH>` | required unless `--ruleset` | Sigma rule file or directory of rules. May also be supplied via `backtest.rules` in a config file. Conflicts with `--ruleset`. |
+| `--ruleset <NAME>` | none | Named ruleset from the configuration to backtest instead of `--rules`. May also be supplied via `backtest.ruleset`. {{ added "unreleased" }} |
 | `--corpus <PATH>` | required | Event corpus: a file or a directory walked recursively. Repeatable. Extension dispatch: `.ndjson`/`.jsonl` as NDJSON, `.evtx` via the feature-gated adapter, everything else through `--input-format`. May also be supplied via `backtest.corpus`. |
 | `--expectations <PATH>` | unset | Expectations YAML (per-rule fire-count assertions). |
 | `--unexpected <POLICY>` | `warn` | What a rule firing with no covering expectation means: `fail`, `warn`, or `ignore`. Overrides the expectations-file default. |
-| `-p, --pipeline <P>` | unset | Processing pipeline(s) to apply. Builtin names (`ecs_windows`, `fibratus_windows`, `sysmon`) or YAML file paths. Repeatable. |
+| `-p, --pipeline <P>` | unset | Processing pipeline(s) to apply. Builtin names (`ecs_windows`, `ecs_linux`, `fibratus_windows`, `sysmon`) or YAML file paths. Repeatable. |
 | `--input-format <FMT>` | `auto` | Input log format for non-NDJSON corpus files: `auto`, `json`, `syslog`, `plain`, `logfmt`, `cef`. |
 | `--syslog-tz <TZ>` | `+00:00` | Default timezone offset for RFC 3164 syslog. |
 | `--syslog-strip-bom <BOOL>` | `true` | Strip a leading UTF-8 BOM from RFC 5424 syslog messages. |
@@ -40,10 +41,13 @@ Without an `--expectations` file, backtest still runs and prints per-rule statis
 | `--jsonpath <JSONPATH>` | unset | JSONPath (RFC 9535) query to extract the event payload. |
 | `--junit <PATH>` | unset | Write a JUnit XML report (one test case per expectation, plus one per unexpected-firing rule under the `fail` policy). |
 | `--report <PATH>` | unset | Write the full JSON report to a file regardless of the stdout format. |
+| `--findings <PATH>` | unset | Write one finding per fire. Must not be the corpus, `--report`, or `--junit` path. Config key: `backtest.findings`. {{ added "unreleased" }} |
+| `--finding-format <FORMAT>` | `native` | `native` or `ocsf` for `--findings` and for stdout when no findings file is set. `ocsf` is rejected with `table`, `csv`, and `tsv`. Config key: `backtest.finding_format`. {{ added "unreleased" }} |
+| `--ocsf-version <VERSION>` | `1.1.0` | `1.1.0` or `1.3.0`. Requires `--finding-format ocsf` and `--findings`. Config key: `backtest.ocsf_version`. {{ added "unreleased" }} |
 | `--config <PATH>` | unset | Load a specific YAML config file instead of running the discovery chain. |
 | `--dry-run` | off | Print the effective `backtest` section and exit `0` without running. |
 
-The global `--output-format` applies: `table` (the TTY default) renders the human report, `json` emits the single report document, and `ndjson`/`csv`/`tsv` emit one row per rule.
+The global `--output-format` applies to the report: `table` (the TTY default) renders the human report, `json` emits the single report document, and `ndjson`/`csv`/`tsv` emit one row per rule. `--finding-format ocsf` writes one OCSF class-2004 finding per corpus fire to `--findings` and does not replace the report. The backtest summary stays on stderr and `--report` stays native JSON. {{ added "unreleased" }}
 
 ## Expectations file
 

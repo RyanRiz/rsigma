@@ -56,27 +56,33 @@ Pass `-p NAME_OR_PATH` to any subcommand that accepts pipelines (`engine eval`, 
 ```bash
 rsigma engine eval -r rules/ -p ecs_windows -e @events.ndjson
 rsigma engine daemon -r rules/ -p ecs_windows -p custom-mappings.yml
-rsigma engine eval -r rules/ -p crates/rsigma-eval/pipelines/ecs_linux.yml -e @linux-events.ndjson
+rsigma engine eval -r rules/ -p ecs_linux -e @linux-events.ndjson
 rsigma backend convert rules/ -t postgres -p crates/rsigma-convert/pipelines/ocsf_postgres.yml
 rsigma rule validate rules/ -p sysmon
+rsigma engine eval -r rules/ -p crates/rsigma-eval/pipelines/cim_events.yml -e @cim-events.ndjson
+rsigma engine eval -r rules/ -p crates/rsigma-eval/pipelines/ocsf_events.yml -e @ocsf-events.ndjson
+rsigma engine eval -r rules/ -p crates/rsigma-eval/pipelines/falcon_windows.yml -e @falcon-events.ndjson
+rsigma engine eval -r rules/ -p crates/rsigma-eval/pipelines/udm_events.yml -e @udm-events.ndjson
 ```
 
 The argument is first checked against [builtin pipelines](#builtin-pipelines). If no match, it is treated as a file path. Multiple pipelines are sorted by `priority` and applied in sequence.
 
-Shipped path-only YAML under [`crates/rsigma-eval/pipelines/`](https://github.com/timescale/rsigma/tree/main/crates/rsigma-eval/pipelines) includes [`gcp_audit.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/gcp_audit.yml) and [`ecs_linux.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/ecs_linux.yml). Pass the file path; there is no builtin short name until one is registered in `builtin_names()`. See [Builtin Pipelines](../reference/builtin-pipelines.md). {{ added "unreleased" }}
+Shipped path-only YAML under [`crates/rsigma-eval/pipelines/`](https://github.com/timescale/rsigma/tree/main/crates/rsigma-eval/pipelines) includes [`gcp_audit.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/gcp_audit.yml), [`cim_events.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/cim_events.yml), [`ocsf_events.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/ocsf_events.yml), and [`falcon_windows.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/falcon_windows.yml). Pass the file path; those names are not in `builtin_names()`. See [Canonicalizing Pipelines](../reference/canonicalizing-pipelines.md) and [Builtin Pipelines](../reference/builtin-pipelines.md). {{ added "0.27.0" }} The same directory also ships [`udm_events.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/udm_events.yml) (Google SecOps UDM nested JSON for eval). {{ added "unreleased" }}
 
 ## Builtin pipelines
 
-RSigma embeds three ready-to-use pipelines in the binary, so common cases need no external file:
+RSigma embeds four ready-to-use pipelines in the binary, so common cases need no external file:
 
 | Name | What it does |
 |------|--------------|
 | `ecs_windows` | Maps Sigma/Sysmon field names to Elastic Common Schema (ECS). Use with Winlogbeat, Elastic Agent, or any pipeline that produces ECS-shaped events. |
+| `ecs_linux` | Maps Sigma field names to ECS for `product: linux` rules. Use with Filebeat, Elastic Agent, or other Linux shippers that emit ECS JSON. |
 | `fibratus_windows` | Maps Sigma field names to Fibratus kernel-event fields. Use with `backend convert -t fibratus`. |
 | `sysmon` | Adds `EventID` conditions to route by Sysmon event type, then rewrites the logsource to `product: windows, service: sysmon`. Use when evaluating against raw Sysmon JSON. |
 
 ```bash
 rsigma engine eval -r rules/ -p ecs_windows -e '{"process.command_line": "whoami"}'
+rsigma engine eval -r rules/ -p ecs_linux -e @linux-events.ndjson
 rsigma engine daemon -r rules/ -p sysmon
 ```
 
@@ -313,7 +319,9 @@ See [Custom Attributes reference](../reference/custom-attributes.md) for the ful
 
 ## Dynamic pipelines
 
-Static pipelines hardcode every value in YAML. Dynamic pipelines let those values come from external sources at runtime: HTTP APIs, local commands, files, or NATS subjects. pySigma later added similar file, HTTP, and command placeholder transformations for conversion ([SigmaHQ/pySigma#470](https://github.com/SigmaHQ/pySigma/issues/470)), inspired by this RSigma work. RSigma's model adds features aimed at streaming engines: detached `--source` files, refresh policies (`once`, interval, `watch`, `push`, `on_demand`), NATS, include directives, and hot-reload through the daemon HTTP API, most of which might not be relevant to rule conversion.
+Static pipelines hardcode every value in YAML. Dynamic pipelines bind reusable [dynamic sources](../reference/dynamic-sources.md) into pipeline variables or transformation includes. Sources can fetch from HTTP APIs, local commands, files, or NATS subjects, and the same source can also be consumed by [`lookup` enrichers](enrichers.md#using-dynamic-sources-with-lookup-enrichers). pySigma later added similar file, HTTP, and command placeholder transformations for conversion ([SigmaHQ/pySigma#470](https://github.com/SigmaHQ/pySigma/issues/470)), inspired by this RSigma work. RSigma's model adds features aimed at streaming engines: detached `--source` files, refresh policies (`once`, interval, `watch`, `push`, `on_demand`), NATS, include directives, and hot-reload through the daemon HTTP API, most of which might not be relevant to rule conversion.
+
+The complete binding syntax is in the [Dynamic Pipelines reference](../reference/dynamic-pipelines.md). Source declaration, refresh, and error semantics are in the separate [Dynamic Sources reference](../reference/dynamic-sources.md).
 
 Typical use cases:
 - A threat-intel feed publishes IOC lists. Reference them inside an `add_condition` so detection rules update without rule edits.
@@ -323,7 +331,7 @@ Typical use cases:
 
 ### Source declaration
 
-Declare sources in a standalone YAML file with a top-level `sources:` block and load it into the daemon with the repeatable `--source` flag. The pipeline file then references each source by its `id` through `${source.<id>}` expansion inside `vars:` (or inline `include:` directives); rules pick up the resolved values via the standard Sigma `%placeholder%` syntax handled by the `value_placeholders` transformation.
+Declare sources in a standalone YAML file with a top-level `sources:` block and load it into the daemon with the repeatable `--source` flag. Declarations are independent of pipelines and can be shared with enrichers. The pipeline file references each source by its `id` through `${source.<id>}` expansion inside `vars:` (or inline `include:` directives); rules pick up the resolved values via the standard Sigma `%placeholder%` syntax handled by the `value_placeholders` transformation.
 
 ```yaml
 # sources.yml -- loaded via `--source sources.yml`
@@ -476,14 +484,15 @@ rsigma pipeline resolve -p pipeline.yml --source-file sources.yml --dry-run
 
 The daemon's hot-reload mechanism extends to dynamic sources. The triggers:
 
-| Trigger | What it re-resolves |
-|---------|---------------------|
-| Filesystem change to a `.yml`/`.yaml` rules or pipeline file | Rules + pipelines + all dynamic sources (push, watch, and interval still tick independently). |
-| `SIGHUP` | Same as above. |
-| `POST /api/v1/reload` | Same as above. |
-| `POST /api/v1/sources/resolve` | All dynamic sources only (rules not reloaded). |
-| `POST /api/v1/sources/resolve` with `{"source_id": "..."}` | One source. |
-| `DELETE /api/v1/sources/cache/{source_id}` | Invalidate one source's cache so the next read fetches fresh. |
+| Trigger | What it does |
+|---------|--------------|
+| A referenced source value changes | Rebuilds rules from cached source values. A failed rebuild keeps the previous rules. |
+| Filesystem change to a `.yml`/`.yaml` rules or pipeline file | Full reload of rules, pipelines, and dynamic sources. |
+| `SIGHUP` | Same as a full reload. |
+| `POST /api/v1/reload` | Same as a full reload. |
+| `POST /api/v1/sources/resolve` | Re-resolves every dynamic source. The body is ignored. Rules reload only when a referenced value changes. |
+| `POST /api/v1/sources/resolve/{source_id}` | Re-resolves that source. |
+| `DELETE /api/v1/sources/cache/{source_id}` | Invalidates one source's cache so the next read fetches fresh. |
 | NATS message on `rsigma.control.resolve` | Same as `POST /api/v1/sources/resolve`. |
 
 ### Security model
@@ -505,7 +514,15 @@ See [Security Hardening reference](../reference/security.md) for the full pictur
 
 ## OCSF pipelines
 
-Two OCSF (Open Cybersecurity Schema Framework) pipelines ship under [`crates/rsigma-convert/pipelines/`](https://github.com/timescale/rsigma/tree/main/crates/rsigma-convert/pipelines) and are useful as starting points for PostgreSQL-backed deployments:
+Three different OCSF touchpoints exist in RSigma; do not mix them:
+
+| Mechanism | Purpose |
+|-----------|---------|
+| [`ocsf_events.yml`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-eval/pipelines/ocsf_events.yml) under `rsigma-eval` | **Eval rule rewrite** on live OCSF JSON input (`-p path/to/ocsf_events.yml`). |
+| `?format=ocsf` on a daemon sink | **Output** serialization as OCSF Detection Finding (class 2004). See [OCSF Findings](ocsf-findings.md). |
+| `ocsf_postgres*.yml` under `rsigma-convert` | **SQL conversion** field layout for `backend convert -t postgres`. |
+
+Two convert pipelines ship under [`crates/rsigma-convert/pipelines/`](https://github.com/timescale/rsigma/tree/main/crates/rsigma-convert/pipelines) and are useful as starting points for PostgreSQL-backed deployments: {{ added "0.27.0" }}
 
 | Pipeline | What it does |
 |----------|--------------|
@@ -516,8 +533,10 @@ Use them as templates and copy/customize for your schema. They are typical examp
 
 ## See also
 
-- [Builtin Pipelines reference](../reference/builtin-pipelines.md) for the contents of `ecs_windows` and `sysmon`.
-- [Dynamic Sources reference](../reference/dynamic-sources.md) for the full source spec, extract language details, and benchmarks.
+- [Canonicalizing Pipelines](../reference/canonicalizing-pipelines.md) for supported ECS, CIM, OCSF eval, and Falcon schemas and categories.
+- [Builtin Pipelines reference](../reference/builtin-pipelines.md) for `ecs_windows`, `ecs_linux`, `sysmon`, `fibratus_windows`, and path-only canonicalizers.
+- [Dynamic Pipelines reference](../reference/dynamic-pipelines.md) for source binding through `vars:` and `include:`.
+- [Dynamic Sources reference](../reference/dynamic-sources.md) for the reusable source spec, extract languages, refresh, and errors.
 - [Custom Attributes reference](../reference/custom-attributes.md) for every `rsigma.*` and `postgres.*` knob.
 - [Security Hardening reference](../reference/security.md) for the resource limits enforced on dynamic sources.
 - [CLI reference: `pipeline resolve`](../cli/pipeline/resolve.md) for the offline source-testing command.

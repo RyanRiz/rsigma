@@ -12,21 +12,23 @@ mod daemon;
 pub(crate) mod exit_code;
 mod features;
 mod fix;
+pub(crate) mod fsutil;
 pub(crate) mod logsource_opts;
 pub(crate) mod metrics_source;
 pub(crate) mod output;
 pub(crate) mod rule_meta;
+mod ruleset;
 
 use std::path::PathBuf;
 use std::process;
 
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use commands::{
-    BacktestArgs, ClassifyArgs, ConditionArgs, ConvertArgs, CoverageArgs, DiscoverArgs, DocArgs,
-    DraftArgs, EvalArgs, ExplainArgs, FieldsArgs, FmtArgs, HuntCommands, HygieneArgs, LintArgs,
-    LintCounts, ListFormatsArgs, MigrateSourcesArgs, ParseArgs, PipelineDiffArgs, ReverseArgs,
-    ScorecardArgs, StatusArgs, StdinArgs, TailArgs, TapArgs, TestArgs, TuneArgs, ValidateArgs,
-    VisibilityArgs, dispatch_hunt,
+    BackendBuildArgs, BacktestArgs, ClassifyArgs, ConditionArgs, ConvertArgs, CoverageArgs,
+    DiscoverArgs, DocArgs, DraftArgs, EvalArgs, ExplainArgs, FieldsArgs, FmtArgs, HuntCommands,
+    HygieneArgs, LintArgs, LintCounts, ListFormatsArgs, MigrateSourcesArgs, ParseArgs,
+    PipelineDiffArgs, ReverseArgs, RulesetCommands, ScorecardArgs, StatusArgs, StdinArgs, TailArgs,
+    TapArgs, TestArgs, TuneArgs, ValidateArgs, VisibilityArgs, dispatch_hunt,
 };
 // `pipeline resolve` resolves dynamic sources, which needs the async runtime
 // (tokio) and the source resolver from rsigma-runtime. Both ship with the
@@ -70,7 +72,7 @@ struct Cli {
     /// Output format for structured CLI data (matches, fields, lint findings).
     ///
     /// Values: `json` (default on a TTY), `ndjson` (default when piped),
-    /// `table`, `csv`, `tsv`. Resolution: flag > `RSIGMA_GLOBAL__OUTPUT_FORMAT`
+    /// `table`, `csv`, `tsv`, `ocsf`. Resolution: flag > `RSIGMA_GLOBAL__OUTPUT_FORMAT`
     /// > `global.output_format` in the config file > TTY-aware default.
     ///
     /// `convert` keeps its own `-f/--format` for the backend query format and
@@ -146,6 +148,12 @@ enum Commands {
     Pipeline {
         #[command(subcommand)]
         cmd: PipelineCommands,
+    },
+
+    /// Curate named rule sets declared in rsigma.yaml (list, show, build, diff)
+    Ruleset {
+        #[command(subcommand)]
+        cmd: RulesetCommands,
     },
 
     /// Hunt an archive with converted rules, streaming matches back as events
@@ -229,7 +237,7 @@ enum RuleCommands {
     /// List all fields referenced by Sigma rules
     Fields(FieldsArgs),
 
-    /// Draft a detection rule from exemplar events (optionally vs a baseline)
+    /// Draft a detection rule from exemplar events, or from a STIX bundle with stix-draft
     Draft(DraftArgs),
 
     /// Propose a verified filter from false-positive and true-positive events
@@ -273,6 +281,9 @@ enum RuleCommands {
 enum BackendCommands {
     /// Convert Sigma rules to backend-native queries
     Convert(ConvertArgs),
+
+    /// Convert every configured group into query files and manifests
+    Build(BackendBuildArgs),
 
     /// List available conversion targets (backends)
     Targets,
@@ -395,6 +406,7 @@ fn dispatch(command: Commands, matches: &ArgMatches, ctx: output::OutputCtx) {
         Commands::Rule { cmd } => dispatch_rule(cmd, matches, ctx),
         Commands::Backend { cmd } => dispatch_backend(cmd, ctx),
         Commands::Pipeline { cmd } => dispatch_pipeline(cmd, ctx),
+        Commands::Ruleset { cmd } => commands::ruleset::dispatch(cmd, ctx),
         Commands::Hunt { cmd } => dispatch_hunt(cmd, ctx),
         #[cfg(feature = "mcp")]
         Commands::Mcp { cmd } => dispatch_mcp(cmd, ctx),
@@ -499,6 +511,7 @@ fn dispatch_rule(cmd: RuleCommands, matches: &ArgMatches, ctx: output::OutputCtx
 fn dispatch_backend(cmd: BackendCommands, ctx: output::OutputCtx) {
     match cmd {
         BackendCommands::Convert(args) => commands::cmd_convert(args, ctx),
+        BackendCommands::Build(args) => commands::cmd_build(args, ctx),
         BackendCommands::Targets => commands::cmd_list_targets(ctx),
         BackendCommands::Formats(ListFormatsArgs { target }) => {
             commands::cmd_list_formats(target, ctx)
@@ -630,48 +643,44 @@ fn init_cli_log_subscriber(format: LogFormat) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn load_pipelines(paths: &[PathBuf]) -> Vec<Pipeline> {
+    try_load_pipelines(paths).unwrap_or_else(|message| {
+        eprintln!("{message}");
+        process::exit(exit_code::CONFIG_ERROR);
+    })
+}
+
+/// Load pipelines like [`load_pipelines`], returning the first load error
+/// instead of exiting.
+pub(crate) fn try_load_pipelines(paths: &[PathBuf]) -> Result<Vec<Pipeline>, String> {
     let mut pipelines = Vec::new();
     for path in paths {
         let name = path.to_str().unwrap_or("");
         if let Some(result) = resolve_builtin_pipeline(name) {
-            match result {
-                Ok(p) => {
-                    eprintln!(
-                        "Loaded builtin pipeline: {} (priority {})",
-                        p.name, p.priority
-                    );
-                    pipelines.push(p);
-                }
-                Err(e) => {
-                    eprintln!("Error parsing builtin pipeline '{name}': {e}");
-                    process::exit(exit_code::CONFIG_ERROR);
-                }
-            }
+            let p = result.map_err(|e| format!("Error parsing builtin pipeline '{name}': {e}"))?;
+            eprintln!(
+                "Loaded builtin pipeline: {} (priority {})",
+                p.name, p.priority
+            );
+            pipelines.push(p);
         } else {
-            match parse_pipeline_file(path) {
-                Ok(p) => {
-                    eprintln!("Loaded pipeline: {} (priority {})", p.name, p.priority);
-                    if p.is_dynamic() {
-                        let source_ids: Vec<&str> = p
-                            .dynamic_references()
-                            .iter()
-                            .map(|r| r.source_id.as_str())
-                            .collect::<std::collections::BTreeSet<&str>>()
-                            .into_iter()
-                            .collect();
-                        eprintln!("  dynamic source ref(s): {}", source_ids.join(", "));
-                    }
-                    pipelines.push(p);
-                }
-                Err(e) => {
-                    eprintln!("Error loading pipeline {}: {e}", path.display());
-                    process::exit(exit_code::CONFIG_ERROR);
-                }
+            let p = parse_pipeline_file(path)
+                .map_err(|e| format!("Error loading pipeline {}: {e}", path.display()))?;
+            eprintln!("Loaded pipeline: {} (priority {})", p.name, p.priority);
+            if p.is_dynamic() {
+                let source_ids: Vec<&str> = p
+                    .dynamic_references()
+                    .iter()
+                    .map(|r| r.source_id.as_str())
+                    .collect::<std::collections::BTreeSet<&str>>()
+                    .into_iter()
+                    .collect();
+                eprintln!("  dynamic source ref(s): {}", source_ids.join(", "));
             }
+            pipelines.push(p);
         }
     }
     pipelines.sort_by_key(|p| p.priority);
-    pipelines
+    Ok(pipelines)
 }
 
 pub(crate) fn load_collection(path: &std::path::Path) -> SigmaCollection {
@@ -751,7 +760,7 @@ pub(crate) fn load_collection_multi(paths: &[PathBuf]) -> SigmaCollection {
 
 /// Print the per-rule parse error and warning counts of a loaded collection
 /// to stderr. Loading continues with the documents that parsed.
-fn report_load_diagnostics(collection: &SigmaCollection) {
+pub(crate) fn report_load_diagnostics(collection: &SigmaCollection) {
     let errors = collection.error_count();
     if errors > 0 {
         eprintln!("Warning: {errors} parse errors while loading rules");
@@ -1053,6 +1062,10 @@ mod config_default_drift {
         assert_eq!(
             daemon_default("api_addr").as_deref(),
             Some(defaults::API_ADDR)
+        );
+        assert_eq!(
+            daemon_default("stdin_mode").as_deref(),
+            Some(defaults::STDIN_MODE)
         );
         assert_eq!(
             daemon_default("input_format").as_deref(),

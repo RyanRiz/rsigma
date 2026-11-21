@@ -41,12 +41,31 @@ pub struct Metrics {
     pub source_resolve_latency: Histogram,
     pub source_cache_hits: IntCounter,
     pub source_last_resolved: GaugeVec,
+    pub source_rebuilds_total: IntCounterVec,
+    pub watchlist_indicators: IntGaugeVec,
+    pub watchlist_changes_total: IntCounterVec,
+    #[cfg(feature = "stix-source")]
+    pub stix_source_indicators: IntGaugeVec,
+    #[cfg(feature = "stix-source")]
+    pub stix_source_objects_total: IntCounterVec,
+    #[cfg(feature = "stix-source")]
+    pub stix_source_skipped_total: IntCounterVec,
     pub enrichment_total: IntCounterVec,
     pub enrichment_duration_seconds: prometheus::HistogramVec,
     pub enrichment_queue_depth: IntGauge,
     pub enrichment_http_cache_hits_total: IntCounterVec,
     pub enrichment_http_cache_misses_total: IntCounterVec,
     pub enrichment_http_cache_expirations_total: IntCounterVec,
+    pub enrichment_mmdb_hits_total: IntCounterVec,
+    pub enrichment_mmdb_misses_total: IntCounterVec,
+    pub enrichment_mmdb_reloads_total: IntCounterVec,
+    pub enrichment_mmdb_build_epoch_seconds: IntGaugeVec,
+    pub enrichment_dns_cache_hits_total: IntCounterVec,
+    pub enrichment_dns_cache_misses_total: IntCounterVec,
+    pub enrichment_dns_queries_total: IntCounterVec,
+    pub ruleset_rules_loaded: IntGaugeVec,
+    pub ruleset_matches_total: IntCounterVec,
+    pub ruleset_events_skipped_total: IntCounterVec,
     #[cfg(feature = "daemon-otlp")]
     pub otlp_requests: IntCounterVec,
     #[cfg(feature = "daemon-otlp")]
@@ -110,9 +129,20 @@ pub struct Metrics {
     pub risk_incident_results_total: IntCounter,
     pub audit_records_total: IntCounter,
     pub audit_write_errors_total: IntCounter,
+    pub tenant_rejected_total: IntCounterVec,
+    pub tenant_quota_evictions_total: IntCounterVec,
+    pub detection_matches_by_tenant_total: IntCounterVec,
 }
 
 impl Metrics {
+    /// Pre-register a tenant's match-count label so it appears on `/metrics`
+    /// from startup.
+    pub fn register_tenant(&self, tenant: &str) {
+        self.detection_matches_by_tenant_total
+            .with_label_values(&[tenant])
+            .inc_by(0);
+    }
+
     pub fn new() -> Self {
         let registry = Registry::new();
 
@@ -454,6 +484,80 @@ impl Metrics {
         registry
             .register(Box::new(source_last_resolved.clone()))
             .unwrap();
+        let source_rebuilds_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_source_rebuilds_total",
+                "Rule rebuilds triggered by a changed pipeline source value",
+            ),
+            &["result"],
+        )
+        .unwrap();
+        let _ = source_rebuilds_total.with_label_values(&["success"]);
+        let _ = source_rebuilds_total.with_label_values(&["error"]);
+        registry
+            .register(Box::new(source_rebuilds_total.clone()))
+            .unwrap();
+        let watchlist_indicators = IntGaugeVec::new(
+            Opts::new(
+                "rsigma_watchlist_indicators",
+                "Current unexpired indicators in a watchlist source",
+            ),
+            &["source_id"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(watchlist_indicators.clone()))
+            .unwrap();
+        let watchlist_changes_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_watchlist_changes_total",
+                "Watchlist indicator changes",
+            ),
+            &["source_id", "op"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(watchlist_changes_total.clone()))
+            .unwrap();
+        #[cfg(feature = "stix-source")]
+        let stix_source_indicators = IntGaugeVec::new(
+            Opts::new(
+                "rsigma_stix_source_indicators",
+                "Active indicators in a STIX source",
+            ),
+            &["source_id"],
+        )
+        .unwrap();
+        #[cfg(feature = "stix-source")]
+        registry
+            .register(Box::new(stix_source_indicators.clone()))
+            .unwrap();
+        #[cfg(feature = "stix-source")]
+        let stix_source_objects_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_stix_source_objects_total",
+                "STIX objects received while resolving a STIX source",
+            ),
+            &["source_id"],
+        )
+        .unwrap();
+        #[cfg(feature = "stix-source")]
+        registry
+            .register(Box::new(stix_source_objects_total.clone()))
+            .unwrap();
+        #[cfg(feature = "stix-source")]
+        let stix_source_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_stix_source_skipped_total",
+                "STIX indicators or observables left out of a source value",
+            ),
+            &["source_id", "reason"],
+        )
+        .unwrap();
+        #[cfg(feature = "stix-source")]
+        registry
+            .register(Box::new(stix_source_skipped_total.clone()))
+            .unwrap();
 
         let enrichment_total = IntCounterVec::new(
             Opts::new(
@@ -500,6 +604,86 @@ impl Metrics {
             &["enricher_id"],
         )
         .unwrap();
+        let enrichment_mmdb_hits_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_enrichment_mmdb_hits_total",
+                "MMDB enricher lookups that found a record and a non-empty projection",
+            ),
+            &["enricher_id"],
+        )
+        .unwrap();
+        let enrichment_mmdb_misses_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_enrichment_mmdb_misses_total",
+                "MMDB enricher lookups with no record or an empty projection",
+            ),
+            &["enricher_id"],
+        )
+        .unwrap();
+        let enrichment_mmdb_reloads_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_enrichment_mmdb_reloads_total",
+                "MMDB database reload attempts that reopened a changed file",
+            ),
+            &["database", "result"],
+        )
+        .unwrap();
+        let enrichment_mmdb_build_epoch_seconds = IntGaugeVec::new(
+            Opts::new(
+                "rsigma_enrichment_mmdb_build_epoch_seconds",
+                "Build epoch of the loaded MMDB database",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        let enrichment_dns_cache_hits_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_enrichment_dns_cache_hits_total",
+                "DNS enricher queries answered from the response cache, including cached negative answers",
+            ),
+            &["enricher_id"],
+        )
+        .unwrap();
+        let enrichment_dns_cache_misses_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_enrichment_dns_cache_misses_total",
+                "DNS enricher queries that went to a nameserver",
+            ),
+            &["enricher_id"],
+        )
+        .unwrap();
+        let enrichment_dns_queries_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_enrichment_dns_queries_total",
+                "DNS enricher queries by result: answer, no_records, or error",
+            ),
+            &["enricher_id", "result"],
+        )
+        .unwrap();
+        let ruleset_rules_loaded = IntGaugeVec::new(
+            Opts::new(
+                "rsigma_ruleset_rules_loaded",
+                "Rules loaded per ruleset by kind",
+            ),
+            &["ruleset", "kind"],
+        )
+        .unwrap();
+        let ruleset_matches_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_ruleset_matches_total",
+                "Matches produced per ruleset by kind",
+            ),
+            &["ruleset", "kind"],
+        )
+        .unwrap();
+        let ruleset_events_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_ruleset_events_skipped_total",
+                "Events kept away from a ruleset by a when binding",
+            ),
+            &["ruleset"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(enrichment_total.clone()))
@@ -518,6 +702,36 @@ impl Metrics {
             .unwrap();
         registry
             .register(Box::new(enrichment_http_cache_expirations_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_mmdb_hits_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_mmdb_misses_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_mmdb_reloads_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_mmdb_build_epoch_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_dns_cache_hits_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_dns_cache_misses_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(enrichment_dns_queries_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ruleset_rules_loaded.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ruleset_matches_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(ruleset_events_skipped_total.clone()))
             .unwrap();
 
         #[cfg(feature = "daemon-otlp")]
@@ -1117,6 +1331,59 @@ impl Metrics {
             "Audit trail SQLite or sink write failures",
         ))
         .unwrap();
+        let tenant_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_tenant_rejected_total",
+                "Ingest that had no tenant binding or was skipped for lack of one",
+            ),
+            &["channel", "reason"],
+        )
+        .unwrap();
+        for channel in ["rest", "otlp_http", "otlp_grpc", "engine"] {
+            for reason in ["no_tenant", "untenanted_event"] {
+                tenant_rejected_total
+                    .with_label_values(&[channel, reason])
+                    .inc_by(0);
+            }
+        }
+        let tenant_quota_evictions_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_tenant_quota_evictions_total",
+                "Entries evicted because a tenant hit its quota",
+            ),
+            &["store"],
+        )
+        .unwrap();
+        for store in [
+            "correlation_state",
+            "active_alerts",
+            "incidents",
+            "risk_entities",
+        ] {
+            tenant_quota_evictions_total
+                .with_label_values(&[store])
+                .inc_by(0);
+        }
+        let detection_matches_by_tenant_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_detection_matches_by_tenant_total",
+                "Detection and correlation matches per tenant",
+            ),
+            &["tenant"],
+        )
+        .unwrap();
+        detection_matches_by_tenant_total
+            .with_label_values(&["other"])
+            .inc_by(0);
+        registry
+            .register(Box::new(tenant_rejected_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(tenant_quota_evictions_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(detection_matches_by_tenant_total.clone()))
+            .unwrap();
         // Pre-materialise the fixed label sets and zero the gauges so the
         // `# HELP` / `# TYPE` lines and zero series render on the first scrape.
         for action in ["scored", "no_entity", "skipped"] {
@@ -1201,12 +1468,31 @@ impl Metrics {
             source_resolve_latency,
             source_cache_hits,
             source_last_resolved,
+            source_rebuilds_total,
+            watchlist_indicators,
+            watchlist_changes_total,
+            #[cfg(feature = "stix-source")]
+            stix_source_indicators,
+            #[cfg(feature = "stix-source")]
+            stix_source_objects_total,
+            #[cfg(feature = "stix-source")]
+            stix_source_skipped_total,
             enrichment_total,
             enrichment_duration_seconds,
             enrichment_queue_depth,
             enrichment_http_cache_hits_total,
             enrichment_http_cache_misses_total,
             enrichment_http_cache_expirations_total,
+            enrichment_mmdb_hits_total,
+            enrichment_mmdb_misses_total,
+            enrichment_mmdb_reloads_total,
+            enrichment_mmdb_build_epoch_seconds,
+            enrichment_dns_cache_hits_total,
+            enrichment_dns_cache_misses_total,
+            enrichment_dns_queries_total,
+            ruleset_rules_loaded,
+            ruleset_matches_total,
+            ruleset_events_skipped_total,
             #[cfg(feature = "daemon-otlp")]
             otlp_requests,
             #[cfg(feature = "daemon-otlp")]
@@ -1270,6 +1556,9 @@ impl Metrics {
             risk_incident_results_total,
             audit_records_total,
             audit_write_errors_total,
+            tenant_rejected_total,
+            tenant_quota_evictions_total,
+            detection_matches_by_tenant_total,
         }
     }
 
@@ -1381,6 +1670,56 @@ impl Metrics {
 
 /// Bridge from rsigma-runtime's MetricsHook trait to the Prometheus-backed Metrics struct.
 impl MetricsHook for Metrics {
+    fn on_tenant_rejected(&self, channel: &'static str, reason: &'static str) {
+        self.tenant_rejected_total
+            .with_label_values(&[channel, reason])
+            .inc();
+    }
+
+    fn on_tenant_quota_eviction(&self, store: &'static str) {
+        self.tenant_quota_evictions_total
+            .with_label_values(&[store])
+            .inc();
+    }
+
+    fn on_tenant_match(&self, tenant: &str) {
+        self.detection_matches_by_tenant_total
+            .with_label_values(&[tenant])
+            .inc();
+    }
+
+    fn register_ruleset(&self, ruleset: &str) {
+        for kind in ["detection", "correlation"] {
+            self.ruleset_rules_loaded
+                .with_label_values(&[ruleset, kind]);
+            self.ruleset_matches_total
+                .with_label_values(&[ruleset, kind]);
+        }
+        self.ruleset_events_skipped_total
+            .with_label_values(&[ruleset]);
+    }
+
+    fn on_ruleset_match(&self, ruleset: &str, kind: &'static str) {
+        self.ruleset_matches_total
+            .with_label_values(&[ruleset, kind])
+            .inc();
+    }
+
+    fn on_ruleset_events_skipped(&self, ruleset: &str, count: u64) {
+        self.ruleset_events_skipped_total
+            .with_label_values(&[ruleset])
+            .inc_by(count);
+    }
+
+    fn on_ruleset_rules_loaded(&self, ruleset: &str, detection: usize, correlation: usize) {
+        self.ruleset_rules_loaded
+            .with_label_values(&[ruleset, "detection"])
+            .set(detection as i64);
+        self.ruleset_rules_loaded
+            .with_label_values(&[ruleset, "correlation"])
+            .set(correlation as i64);
+    }
+
     fn on_parse_error(&self) {
         self.events_parse_errors.inc();
     }
@@ -1612,6 +1951,82 @@ impl MetricsHook for Metrics {
             .inc();
     }
 
+    fn on_enrichment_mmdb_hit(&self, enricher_id: &str) {
+        self.enrichment_mmdb_hits_total
+            .with_label_values(&[enricher_id])
+            .inc();
+    }
+
+    fn on_enrichment_mmdb_miss(&self, enricher_id: &str) {
+        self.enrichment_mmdb_misses_total
+            .with_label_values(&[enricher_id])
+            .inc();
+    }
+
+    fn on_enrichment_mmdb_reload(&self, database: &str, success: bool) {
+        self.enrichment_mmdb_reloads_total
+            .with_label_values(&[database, if success { "success" } else { "failure" }])
+            .inc();
+    }
+
+    fn set_enrichment_mmdb_build_epoch(&self, database: &str, epoch_seconds: u64) {
+        self.enrichment_mmdb_build_epoch_seconds
+            .with_label_values(&[database])
+            .set(epoch_seconds as i64);
+    }
+
+    fn register_mmdb_enricher(&self, enricher_id: &str) {
+        self.enrichment_mmdb_hits_total
+            .with_label_values(&[enricher_id])
+            .inc_by(0);
+        self.enrichment_mmdb_misses_total
+            .with_label_values(&[enricher_id])
+            .inc_by(0);
+    }
+
+    fn register_mmdb_database(&self, database: &str) {
+        for result in ["success", "failure"] {
+            self.enrichment_mmdb_reloads_total
+                .with_label_values(&[database, result])
+                .inc_by(0);
+        }
+        self.enrichment_mmdb_build_epoch_seconds
+            .with_label_values(&[database])
+            .set(0);
+    }
+
+    fn on_enrichment_dns_cache_hit(&self, enricher_id: &str) {
+        self.enrichment_dns_cache_hits_total
+            .with_label_values(&[enricher_id])
+            .inc();
+    }
+
+    fn on_enrichment_dns_cache_miss(&self, enricher_id: &str) {
+        self.enrichment_dns_cache_misses_total
+            .with_label_values(&[enricher_id])
+            .inc();
+    }
+
+    fn on_enrichment_dns_query(&self, enricher_id: &str, result: &'static str) {
+        self.enrichment_dns_queries_total
+            .with_label_values(&[enricher_id, result])
+            .inc();
+    }
+
+    fn register_dns_enricher(&self, enricher_id: &str) {
+        self.enrichment_dns_cache_hits_total
+            .with_label_values(&[enricher_id])
+            .inc_by(0);
+        self.enrichment_dns_cache_misses_total
+            .with_label_values(&[enricher_id])
+            .inc_by(0);
+        for result in ["answer", "no_records", "error"] {
+            self.enrichment_dns_queries_total
+                .with_label_values(&[enricher_id, result])
+                .inc_by(0);
+        }
+    }
+
     fn register_enricher(&self, enricher_id: &str, kind: &str) {
         // Pre-create label sets so `# HELP` / `# TYPE` lines for the
         // per-enricher metrics show up on the first /metrics scrape,
@@ -1701,7 +2116,54 @@ impl MetricsHook for Metrics {
             .with_label_values(&[webhook_id, "rate_limited_wait"])
             .inc();
     }
+
+    #[cfg(feature = "stix-source")]
+    fn register_stix_source(&self, source_id: &str) {
+        let _ = self.stix_source_indicators.with_label_values(&[source_id]);
+        let _ = self
+            .stix_source_objects_total
+            .with_label_values(&[source_id]);
+        for reason in STIX_SKIP_REASONS {
+            let _ = self
+                .stix_source_skipped_total
+                .with_label_values(&[source_id, reason]);
+        }
+    }
+
+    #[cfg(feature = "stix-source")]
+    fn set_stix_source_indicators(&self, source_id: &str, count: u64) {
+        self.stix_source_indicators
+            .with_label_values(&[source_id])
+            .set(count as i64);
+    }
+
+    #[cfg(feature = "stix-source")]
+    fn on_stix_source_objects(&self, source_id: &str, count: u64) {
+        self.stix_source_objects_total
+            .with_label_values(&[source_id])
+            .inc_by(count);
+    }
+
+    #[cfg(feature = "stix-source")]
+    fn on_stix_source_skipped(&self, source_id: &str, reason: &'static str, count: u64) {
+        self.stix_source_skipped_total
+            .with_label_values(&[source_id, reason])
+            .inc_by(count);
+    }
 }
+
+#[cfg(feature = "stix-source")]
+const STIX_SKIP_REASONS: &[&str] = &[
+    "revoked",
+    "expired",
+    "not_yet_valid",
+    "low_confidence",
+    "pattern_type",
+    "unsupported_pattern",
+    "unmapped_observable",
+    "invalid_pattern",
+    "over_limit",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1762,6 +2224,124 @@ mod tests {
         assert!(output.contains("rsigma_correlation_matches_by_rule_total"));
         assert!(output.contains(r#"rule_title="Corr Rule""#));
         assert!(output.contains(r#"correlation_type="event_count""#));
+    }
+
+    #[test]
+    fn mmdb_metrics_record_hits_misses_reloads_and_epoch() {
+        let m = Metrics::new();
+        m.on_enrichment_mmdb_hit("geo");
+        m.on_enrichment_mmdb_hit("geo");
+        m.on_enrichment_mmdb_miss("geo");
+        m.on_enrichment_mmdb_reload("/var/lib/geoip/city.mmdb", true);
+        m.on_enrichment_mmdb_reload("/var/lib/geoip/city.mmdb", false);
+        m.set_enrichment_mmdb_build_epoch("/var/lib/geoip/city.mmdb", 1_735_689_600);
+
+        assert_eq!(
+            m.enrichment_mmdb_hits_total
+                .with_label_values(&["geo"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            m.enrichment_mmdb_misses_total
+                .with_label_values(&["geo"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            m.enrichment_mmdb_reloads_total
+                .with_label_values(&["/var/lib/geoip/city.mmdb", "success"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            m.enrichment_mmdb_reloads_total
+                .with_label_values(&["/var/lib/geoip/city.mmdb", "failure"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            m.enrichment_mmdb_build_epoch_seconds
+                .with_label_values(&["/var/lib/geoip/city.mmdb"])
+                .get(),
+            1_735_689_600
+        );
+    }
+
+    #[test]
+    fn mmdb_label_sets_are_pre_registered_in_encoded_output() {
+        let m = Metrics::new();
+        m.register_mmdb_enricher("geo");
+        m.register_mmdb_database("/var/lib/geoip/city.mmdb");
+
+        let output = m.encode();
+        for family in [
+            "rsigma_enrichment_mmdb_hits_total",
+            "rsigma_enrichment_mmdb_misses_total",
+            "rsigma_enrichment_mmdb_reloads_total",
+            "rsigma_enrichment_mmdb_build_epoch_seconds",
+        ] {
+            assert!(output.contains(family), "missing {family}");
+        }
+        assert!(output.contains(r#"enricher_id="geo""#));
+        assert!(output.contains(r#"database="/var/lib/geoip/city.mmdb""#));
+        assert!(output.contains(r#"result="success""#));
+        assert!(output.contains(r#"result="failure""#));
+    }
+
+    #[test]
+    fn dns_metrics_record_hits_misses_and_query_results() {
+        let m = Metrics::new();
+        m.on_enrichment_dns_cache_hit("resolve");
+        m.on_enrichment_dns_cache_hit("resolve");
+        m.on_enrichment_dns_cache_miss("resolve");
+        m.on_enrichment_dns_query("resolve", "answer");
+        m.on_enrichment_dns_query("resolve", "no_records");
+        m.on_enrichment_dns_query("resolve", "error");
+
+        assert_eq!(
+            m.enrichment_dns_cache_hits_total
+                .with_label_values(&["resolve"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            m.enrichment_dns_cache_misses_total
+                .with_label_values(&["resolve"])
+                .get(),
+            1
+        );
+        for result in ["answer", "no_records", "error"] {
+            assert_eq!(
+                m.enrichment_dns_queries_total
+                    .with_label_values(&["resolve", result])
+                    .get(),
+                1,
+                "missing result {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_label_sets_are_pre_registered_in_encoded_output() {
+        let m = Metrics::new();
+        m.register_dns_enricher("resolve");
+
+        let output = m.encode();
+        for family in [
+            "rsigma_enrichment_dns_cache_hits_total",
+            "rsigma_enrichment_dns_cache_misses_total",
+            "rsigma_enrichment_dns_queries_total",
+        ] {
+            assert!(output.contains(family), "missing {family}");
+        }
+        assert!(output.contains(r#"enricher_id="resolve""#));
+        for result in ["answer", "no_records", "error"] {
+            assert!(
+                output.contains(&format!(r#"result="{result}""#)),
+                "missing result {result}"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! Hosts the `DaemonArgs` clap struct, the `cmd_daemon` entry point, and the
 //! input-format / timezone parsing helpers that used to live in `main.rs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 use clap::parser::ValueSource;
 use clap::{ArgMatches, Args};
@@ -12,6 +13,8 @@ use clap::{ArgMatches, Args};
 use crate::config;
 use crate::daemon;
 use crate::exit_code;
+use rsigma_eval::{SchemaClassifier, load_schema_config, resolve_builtin_pipeline};
+use rsigma_runtime::{PipelineRef, RulesetBinding};
 
 /// Arguments for `rsigma engine daemon` (and the deprecated `rsigma daemon`).
 #[derive(Args, Debug)]
@@ -31,6 +34,19 @@ pub(crate) struct DaemonArgs {
     /// Required unless supplied via `daemon.rules` in the config file.
     #[arg(short, long)]
     pub rules: Option<PathBuf>,
+
+    /// Named rulesets from the configuration to evaluate side by side.
+    #[arg(
+        long = "ruleset",
+        value_name = "NAME",
+        conflicts_with = "rules",
+        action = clap::ArgAction::Append
+    )]
+    pub rulesets: Vec<String>,
+
+    /// Effective ruleset entries, including config-file schema bindings.
+    #[arg(skip)]
+    pub ruleset_entries: Vec<crate::config::RulesetEntryPartial>,
 
     /// Processing pipeline(s) to apply. Accepts builtin names (ecs_windows, sysmon) or YAML file paths
     #[arg(short = 'p', long = "pipeline")]
@@ -106,6 +122,16 @@ pub(crate) struct DaemonArgs {
     #[arg(long = "max-group-entries")]
     pub max_group_entries: Option<usize>,
 
+    /// Enable logical multi-tenancy. Startup-only; requires bearer-token auth
+    /// and a tenant binding on every input source.
+    #[arg(long = "tenancy")]
+    pub tenancy: bool,
+
+    /// Per-tenant correlation state cap. Requires `--tenancy` or
+    /// `daemon.tenancy.enabled`.
+    #[arg(long = "max-tenant-state")]
+    pub max_tenant_state: Option<usize>,
+
     /// Event field name(s) for timestamp extraction in correlations
     #[arg(long = "timestamp-field")]
     pub timestamp_fields: Vec<String>,
@@ -125,6 +151,14 @@ pub(crate) struct DaemonArgs {
     /// (newline-delimited events over a Unix domain socket).
     #[arg(long = "input", default_value = config::defaults::INPUT_SOURCE)]
     pub input: String,
+
+    /// How a stdin input ends. 'batch' (default): exit at end of input with
+    /// the batch result as the exit code. 'stream': keep running after end
+    /// of input until a shutdown signal, and exit 0 like the other inputs.
+    /// Ignored for other inputs.
+    #[arg(long = "stdin-mode", default_value = config::defaults::STDIN_MODE,
+           value_parser = ["batch", "stream"])]
+    pub stdin_mode: String,
 
     /// Detection output sink (can be repeated for fan-out).
     /// Supported schemes: `stdout`, `file://<path>`,
@@ -702,6 +736,19 @@ pub(crate) fn cmd_daemon(
     );
     let capture = resolve_capture_settings(&base, args.enable_capture, dispositions.enabled);
     let api_auth = resolve_auth_settings(&base, args.api_token_env.clone());
+    let api_token_env_used = args.api_token_env.is_some();
+    let (tenancy, input_tenant, nats_tenants) =
+        match daemon::tenancy::resolve_tenancy_settings(&base, args.tenancy, args.max_tenant_state)
+        {
+            Ok(values) => values,
+            Err(message) => {
+                eprintln!("error: {message}");
+                process::exit(exit_code::CONFIG_ERROR);
+            }
+        };
+    let project_layer_loaded = config::load_layered(args.config.as_deref())
+        .map(|loaded| loaded.project_layer_loaded)
+        .unwrap_or(false);
     let state_db_from_config = base
         .daemon
         .as_ref()
@@ -709,12 +756,38 @@ pub(crate) fn cmd_daemon(
         .and_then(|s| s.db.as_ref());
     let has_state_db = args.state_db.is_some() || state_db_from_config.is_some();
     let audit = resolve_audit_settings(&base, has_state_db);
+    let tenancy_base = base.clone();
     apply_daemon_config(&mut args, matches, base);
 
+    let ruleset_tenants = config_ruleset_tenants(&args.ruleset_entries);
+    if let Err(message) = daemon::tenancy::validate_tenancy_from_config(
+        &tenancy_base,
+        &tenancy,
+        input_tenant.as_ref(),
+        &nats_tenants,
+        &daemon::tenancy::ResolvedDaemonInputs {
+            input_source: &args.input,
+            sink_specs: &args.output,
+            ruleset_tenants: &ruleset_tenants,
+            alert_pipeline: args.alert_pipeline.as_deref(),
+            risk: args.risk.as_deref(),
+            enrichers: args.enrichers.as_deref(),
+            webhooks: &args.webhooks,
+            disposition_source: dispositions.source.is_some(),
+        },
+        project_layer_loaded,
+        api_token_env_used,
+    ) {
+        eprintln!("error: {message}");
+        process::exit(exit_code::CONFIG_ERROR);
+    }
+
     let DaemonArgs {
-        config: _,
+        config,
         dry_run: _,
         rules: rules_opt,
+        rulesets: _,
+        ruleset_entries,
         pipelines: pipeline_paths,
         jq,
         jsonpath,
@@ -730,10 +803,13 @@ pub(crate) fn cmd_daemon(
         max_correlation_events,
         max_state_entries,
         max_group_entries,
+        tenancy: _cli_tenancy,
+        max_tenant_state: _cli_max_tenant_state,
         timestamp_fields,
         state_db,
         state_save_interval,
         input,
+        stdin_mode,
         output,
         buffer_size,
         batch_size,
@@ -821,10 +897,25 @@ pub(crate) fn cmd_daemon(
         allow_unauthenticated,
     } = args;
 
-    let rules_path = rules_opt.unwrap_or_else(|| {
-        eprintln!("error: no rules path; set --rules or daemon.rules in the config file");
-        process::exit(exit_code::CONFIG_ERROR);
-    });
+    let (rulesets, ruleset_classifier) = if ruleset_entries.is_empty() {
+        (Vec::new(), None)
+    } else {
+        build_ruleset_bindings(
+            ruleset_entries,
+            config.as_deref(),
+            &pipeline_paths,
+            schema_config.as_deref(),
+            schema_routing,
+        )
+    };
+    let rules_path = if rulesets.is_empty() {
+        rules_opt.unwrap_or_else(|| {
+            eprintln!("error: no rules path; set --rules, --ruleset, daemon.rules, or daemon.rulesets in the config file");
+            process::exit(exit_code::CONFIG_ERROR);
+        })
+    } else {
+        rules_opt.unwrap_or_default()
+    };
 
     #[cfg(feature = "daemon-nats")]
     let nats_auth = NatsAuthArgs {
@@ -852,6 +943,15 @@ pub(crate) fn cmd_daemon(
         rsigma_runtime::ReplayPolicy::Latest
     } else {
         rsigma_runtime::ReplayPolicy::Resume
+    };
+
+    let stdin_mode = match stdin_mode.as_str() {
+        "batch" => daemon::server::StdinMode::Batch,
+        "stream" => daemon::server::StdinMode::Stream,
+        other => {
+            eprintln!("Invalid daemon.input.stdin_mode '{other}': expected batch or stream");
+            process::exit(exit_code::CONFIG_ERROR);
+        }
     };
 
     let state_restore_mode = if clear_state {
@@ -886,6 +986,8 @@ pub(crate) fn cmd_daemon(
 
     run_daemon(
         rules_path,
+        rulesets,
+        ruleset_classifier,
         pipeline_paths,
         jq,
         jsonpath,
@@ -900,11 +1002,15 @@ pub(crate) fn cmd_daemon(
         max_correlation_events,
         max_state_entries,
         max_group_entries,
+        tenancy,
+        input_tenant,
+        nats_tenants,
         timestamp_fields,
         timestamp_fallback,
         state_db,
         state_save_interval,
         input,
+        stdin_mode,
         output,
         buffer_size,
         batch_size,
@@ -1042,6 +1148,8 @@ fn resolve_auth_settings(
                 role: Some("admin".into()),
                 permissions: None,
                 token_env: var,
+                tenant: None,
+                all_tenants: false,
             }],
             Vec::new(),
         )
@@ -1063,11 +1171,25 @@ fn resolve_auth_settings(
                     eprintln!("daemon.api.auth: token '{name}' missing 'token_env'");
                     process::exit(exit_code::CONFIG_ERROR);
                 });
+                let tenant = t
+                    .tenant
+                    .as_deref()
+                    .map(rsigma_eval::TenantId::new)
+                    .transpose();
+                let tenant = match tenant {
+                    Ok(tenant) => tenant,
+                    Err(error) => {
+                        eprintln!("daemon.api.auth: token '{name}': {error}");
+                        process::exit(exit_code::CONFIG_ERROR);
+                    }
+                };
                 TokenSpec {
                     name,
                     role: t.role,
                     permissions: t.permissions,
                     token_env,
+                    tenant,
+                    all_tenants: t.all_tenants.unwrap_or(false),
                 }
             })
             .collect();
@@ -1291,10 +1413,27 @@ fn apply_daemon_config(
         return;
     };
 
-    if !explicit("rules")
+    let cli_rules = explicit("rules");
+    let cli_rulesets = explicit("rulesets");
+    let config_list = daemon
+        .rulesets
+        .as_ref()
+        .is_some_and(|entries| !entries.is_empty());
+    if !cli_rules && !cli_rulesets && daemon.rules.is_some() && config_list {
+        eprintln!("error: set either daemon.rules or daemon.rulesets, not both");
+        process::exit(exit_code::CONFIG_ERROR);
+    }
+    if !cli_rules
+        && !cli_rulesets
         && let Some(v) = daemon.rules
     {
         args.rules = Some(v);
+    }
+    if !cli_rules
+        && !cli_rulesets
+        && let Some(entries) = daemon.rulesets
+    {
+        args.ruleset_entries = entries;
     }
     if !explicit("pipelines")
         && let Some(v) = daemon.pipelines
@@ -1378,6 +1517,11 @@ fn apply_daemon_config(
             && let Some(v) = input.source
         {
             args.input = v;
+        }
+        if !explicit("stdin_mode")
+            && let Some(v) = input.stdin_mode
+        {
+            args.stdin_mode = v;
         }
         if !explicit("input_format")
             && let Some(v) = input.format
@@ -1660,6 +1804,46 @@ fn apply_daemon_config(
     {
         args.consumer_group = Some(v);
     }
+
+    if !args.rulesets.is_empty() {
+        args.ruleset_entries = args
+            .rulesets
+            .iter()
+            .cloned()
+            .map(crate::config::RulesetEntryPartial::Name)
+            .collect();
+    }
+}
+
+/// Extract the tenant bindings declared on the resolved ruleset entries,
+/// validating each id so a typo fails startup with the ruleset name. A CLI
+/// `--ruleset` list replaces the configured entries and carries no bindings.
+fn config_ruleset_tenants(
+    entries: &[config::RulesetEntryPartial],
+) -> Vec<(String, Vec<rsigma_eval::TenantId>)> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let config::RulesetEntryPartial::Bound {
+            name,
+            tenants: Some(tenants),
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let mut parsed = Vec::new();
+        for raw in tenants {
+            match rsigma_eval::TenantId::new(raw) {
+                Ok(tenant) => parsed.push(tenant),
+                Err(error) => {
+                    eprintln!("error: ruleset '{name}': {error}");
+                    process::exit(exit_code::CONFIG_ERROR);
+                }
+            }
+        }
+        out.push((name.clone(), parsed));
+    }
+    out
 }
 
 /// Helper struct grouping TLS flags so `cmd_daemon` stays readable.
@@ -1673,8 +1857,153 @@ pub(crate) struct TlsCliArgs {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_ruleset_bindings(
+    entries: Vec<crate::config::RulesetEntryPartial>,
+    config_path: Option<&Path>,
+    pipeline_paths: &[PathBuf],
+    schema_config: Option<&Path>,
+    schema_routing: bool,
+) -> (Vec<RulesetBinding>, Option<Arc<SchemaClassifier>>) {
+    let specs = crate::ruleset::load_specs(config_path);
+    let mut seen = std::collections::HashSet::new();
+    let mut bindings = Vec::new();
+    let mut any_when = false;
+
+    for entry in entries {
+        let (name, when_schemas, tenants) = match entry {
+            crate::config::RulesetEntryPartial::Name(name) => (name, Vec::new(), Vec::new()),
+            crate::config::RulesetEntryPartial::Bound {
+                name,
+                when,
+                tenants,
+                unknown,
+            } => {
+                if !unknown.is_empty() {
+                    eprintln!(
+                        "error: ruleset '{name}' has unknown keys: {}",
+                        unknown.keys().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                    process::exit(exit_code::CONFIG_ERROR);
+                }
+                let when = when.unwrap_or(crate::config::WhenPartial {
+                    schemas: Vec::new(),
+                    unknown: Default::default(),
+                });
+                if !when.unknown.is_empty() {
+                    eprintln!(
+                        "error: ruleset '{name}' has unknown `when` keys: {}",
+                        when.unknown.keys().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                    process::exit(exit_code::CONFIG_ERROR);
+                }
+                let tenants = tenants.unwrap_or_default();
+                let mut parsed = Vec::with_capacity(tenants.len());
+                for tenant in tenants {
+                    match rsigma_eval::TenantId::new(&tenant) {
+                        Ok(tenant) => parsed.push(tenant),
+                        Err(error) => {
+                            eprintln!("error: ruleset '{name}': {error}");
+                            process::exit(exit_code::CONFIG_ERROR);
+                        }
+                    }
+                }
+                (name, when.schemas, parsed)
+            }
+        };
+        if !seen.insert(name.clone()) {
+            eprintln!("error: duplicate ruleset name '{name}'");
+            process::exit(exit_code::CONFIG_ERROR);
+        }
+        let Some(spec) = specs.get(&name) else {
+            eprintln!(
+                "error: unknown ruleset '{name}'; defined rulesets: {}",
+                specs.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+            process::exit(exit_code::CONFIG_ERROR);
+        };
+        any_when |= !when_schemas.is_empty();
+
+        let declared = if !pipeline_paths.is_empty() {
+            pipeline_paths.to_vec()
+        } else if !spec.pipelines.is_empty() {
+            crate::ruleset::ruleset_pipelines(spec)
+        } else {
+            Vec::new()
+        };
+        let mut pipelines = Vec::new();
+        for pipeline in declared {
+            let name = pipeline.to_string_lossy();
+            if let Some(result) = resolve_builtin_pipeline(&name) {
+                match result {
+                    Ok(pipeline) => pipelines.push(PipelineRef::Builtin(pipeline)),
+                    Err(error) => {
+                        eprintln!("error: builtin pipeline '{name}': {error}");
+                        process::exit(exit_code::CONFIG_ERROR);
+                    }
+                }
+            } else {
+                pipelines.push(PipelineRef::File(pipeline));
+            }
+        }
+
+        if schema_routing {
+            if when_schemas.is_empty() {
+                // allowed
+            } else {
+                eprintln!("error: ruleset '{name}' cannot use `when` with --schema-routing");
+                process::exit(exit_code::CONFIG_ERROR);
+            }
+            if !spec.pipelines.is_empty() {
+                eprintln!(
+                    "error: ruleset '{name}' has pipelines, which conflict with --schema-routing"
+                );
+                process::exit(exit_code::CONFIG_ERROR);
+            }
+        }
+
+        bindings.push(RulesetBinding {
+            name,
+            spec: spec.clone(),
+            pipelines,
+            when_schemas,
+            tenants,
+        });
+    }
+
+    if schema_routing && bindings.len() != 1 {
+        eprintln!("error: --schema-routing supports exactly one --ruleset");
+        process::exit(exit_code::CONFIG_ERROR);
+    }
+
+    let classifier = if any_when {
+        let (signatures, _) = match schema_config {
+            Some(path) => match load_schema_config(path) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("Error loading schema config: {error}");
+                    process::exit(exit_code::CONFIG_ERROR);
+                }
+            },
+            None => (Vec::new(), None),
+        };
+        let classifier = if signatures.is_empty() {
+            SchemaClassifier::builtin()
+        } else {
+            SchemaClassifier::with_user_signatures(signatures)
+        };
+        Some(Arc::new(classifier))
+    } else {
+        None
+    };
+
+    (bindings, classifier)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_daemon(
     rules_path: PathBuf,
+    rulesets: Vec<RulesetBinding>,
+    ruleset_classifier: Option<Arc<SchemaClassifier>>,
     pipeline_paths: Vec<PathBuf>,
     jq: Option<String>,
     jsonpath: Option<String>,
@@ -1689,11 +2018,15 @@ fn run_daemon(
     max_correlation_events: usize,
     max_state_entries: usize,
     max_group_entries: Option<usize>,
+    tenancy: daemon::tenancy::TenancySettings,
+    input_tenant: Option<rsigma_eval::TenantId>,
+    nats_tenants: Vec<daemon::tenancy::NatsTenantBinding>,
     timestamp_fields: Vec<String>,
     timestamp_fallback: String,
     state_db: Option<PathBuf>,
     state_save_interval: u64,
     input: String,
+    stdin_mode: daemon::server::StdinMode,
     output: Vec<String>,
     buffer_size: usize,
     batch_size: usize,
@@ -1887,9 +2220,14 @@ fn run_daemon(
 
     let config = daemon::server::DaemonConfig {
         rules_path,
+        rulesets,
+        ruleset_classifier,
         pipelines,
         pipeline_paths: file_pipeline_paths,
         corr_config,
+        tenancy,
+        input_tenant,
+        nats_tenants,
         include_event,
         match_detail,
         pretty,
@@ -1898,6 +2236,7 @@ fn run_daemon(
         state_db,
         state_save_interval,
         input,
+        stdin_mode,
         output,
         buffer_size,
         batch_size,
@@ -1956,7 +2295,13 @@ fn run_daemon(
             process::exit(exit_code::CONFIG_ERROR);
         });
 
-    rt.block_on(daemon::run_daemon(config));
+    let code = rt.block_on(daemon::run_daemon(config));
+    // Dropping the runtime closes the state database, which folds its
+    // write-ahead log back into the file.
+    drop(rt);
+    if code != exit_code::SUCCESS {
+        process::exit(code);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2296,6 +2641,22 @@ mod tests {
         let base = partial("daemon:\n  input:\n    syslog_strip_bom: false\n");
         apply_daemon_config(&mut args, &matches, base);
         assert!(args.syslog_strip_bom);
+    }
+
+    #[test]
+    fn stdin_mode_default_batch_config_stream_flag_wins() {
+        let (args, _) = parse(&["daemon", "--rules", "/r"]);
+        assert_eq!(args.stdin_mode, "batch");
+
+        let (mut args, matches) = parse(&["daemon", "--rules", "/r"]);
+        let base = partial("daemon:\n  input:\n    stdin_mode: stream\n");
+        apply_daemon_config(&mut args, &matches, base);
+        assert_eq!(args.stdin_mode, "stream");
+
+        let (mut args, matches) = parse(&["daemon", "--rules", "/r", "--stdin-mode", "batch"]);
+        let base = partial("daemon:\n  input:\n    stdin_mode: stream\n");
+        apply_daemon_config(&mut args, &matches, base);
+        assert_eq!(args.stdin_mode, "batch");
     }
 
     #[test]

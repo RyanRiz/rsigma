@@ -51,6 +51,8 @@ rsigma rule fields -r rules/ -p ecs_windows
 # Draft a detection or a grouped temporal correlation
 rsigma rule draft -e @incident.ndjson --baseline @normal.ndjson
 rsigma rule draft --groups @observed.ndjson --negative @benign.ndjson
+# Draft from a STIX 2.1 bundle (stix-draft feature)
+rsigma rule draft --from-stix indicators.json --date 2026-06-01
 
 # Propose a verified filter from classified false-positive and true-positive events
 rsigma rule tune -r rules/ --rule <RULE_ID> --fp @false-positives.ndjson --tp @true-positives.ndjson
@@ -78,7 +80,7 @@ These flags work with every subcommand, mirroring how `--log-format` does, and t
 
 ## Subcommands
 
-Commands are grouped into noun-led groups: `engine` (eval/daemon), `rule` (parse/validate/lint/fields/draft/tune/doc/test/backtest/coverage/scorecard/visibility/hygiene/condition/stdin), `backend` (convert/targets/formats), `pipeline` (resolve), `hunt` (run), and `taxii` (sync, `taxii-sync` feature).
+Commands are grouped into noun-led groups: `engine` (eval/explain/classify/discover-schemas/status/incidents/tap/tail/daemon), `rule` (parse/validate/lint/fmt/fields/draft/tune/reverse/doc/test/backtest/coverage/scorecard/visibility/hygiene/condition/stdin/migrate-sources), `backend` (convert/targets/formats), `pipeline` (diff/resolve), `ruleset` (list/show/build/diff), `hunt` (run), `mcp` (serve, `mcp` feature), `config` (init/validate/show/schema/path/reload), and `taxii` (sync/store, `taxii-sync` feature).
 
 ### `hunt run`: Execute converted rules against a PostgreSQL archive
 
@@ -120,6 +122,8 @@ rsigma taxii store \
 For TAXII feeds that require auth, pass `--bearer-token`, `--basic-user` with `--basic-password` (or `RSIGMA_TAXII_BASIC_PASSWORD`), or `--api-key`. At most one method. See [taxii sync](https://rsigma.io/cli/taxii/sync/) and [taxii store](https://rsigma.io/cli/taxii/store/).
 
 Point the daemon at the same directory with **`--stix-store`** and a `type: stix` enricher (`stix-enrich` feature) to attach store intel to firings. A store written with `--allow-custom` also needs `--stix-store-allow-custom` on the daemon. See [Enrichers](https://rsigma.io/guide/enrichers/#stix-local-stix-store-lookup).
+
+A running daemon can also poll a collection itself. `type: taxii`, and `format: stix` on a file or HTTP source, need the **`stix-source`** feature. That path expands observables into a pipeline value. It does not write an `FsStore`. See [Threat intel watchlists](https://rsigma.io/guide/threat-intel-watchlists/#stix-indicator-sources).
 
 ### `config`: YAML configuration
 
@@ -280,6 +284,7 @@ Unlike `engine eval`, the daemon stays alive after stdin reaches EOF and support
 | `--rules` / `-r` | path | required | Path to Sigma rule file or directory |
 | `--pipeline` / `-p` | repeatable | `[]` | Processing pipeline YAML file(s), applied in priority order |
 | `--input` | string | `"stdin"` | Event input source: `stdin`, `http`, or `nats://<host>:<port>/<subject>` |
+| `--stdin-mode` | string | `"batch"` | How a stdin input ends: `batch` exits at end of input with the batch result as the exit code, `stream` keeps running until a shutdown signal |
 | `--output` | repeatable | `["stdout"]` | Detection output sink (fan-out): `stdout`, `file://<path>`, `nats://<host>:<port>/<subject>` |
 | `--input-format` | string | `"auto"` | Input log format: `auto`, `json`, `syslog`, `plain`, `logfmt`\*, `cef`\* |
 | `--syslog-tz` | string | `"+00:00"` | Default timezone for RFC 3164 syslog (e.g. `+05:00`, `-08:00`) |
@@ -555,7 +560,7 @@ The `tracing` spans installed on hot paths (batch processing, source resolution,
 
 **Consumer groups:** the `--consumer-group` flag sets a shared durable consumer name. Multiple daemon instances using the same group pull from a single JetStream consumer, and NATS distributes messages for load balancing. When not specified, the consumer name is derived from the subject.
 
-**Feature flags:** the daemon subcommand requires the `daemon` feature (enabled by default). NATS flags require the `daemon-nats` feature. OTLP log ingestion (HTTP and gRPC) requires the `daemon-otlp` feature. To build without daemon dependencies: `cargo build --no-default-features`.
+**Feature flags:** the daemon subcommand requires the `daemon` feature (enabled by default). NATS flags require the `daemon-nats` feature. OTLP log ingestion (HTTP and gRPC) requires the `daemon-otlp` feature. `type: taxii` and `format: stix` require the `stix-source` feature. `rule draft --from-stix` requires the `stix-draft` feature. Without it, `rsigma rule draft --help` does not list the flag. To build without daemon dependencies: `cargo build --no-default-features`.
 
 ### `engine status`: Query a running daemon
 
@@ -1414,7 +1419,7 @@ max_concurrent_enrichments: 16
 enrichers:
   - id: <unique-string>            # required, used as a Prometheus label
     kind: detection | correlation  # required, see "Kind and template namespaces"
-    type: template | lookup | http | command | stix  # required; stix needs stix-enrich + --stix-store
+    type: template | lookup | http | command | stix | mmdb | dns  # required; stix needs stix-enrich + --stix-store, mmdb needs mmdb-enrich, dns needs dns-enrich
     inject_field: <field-name>     # required, key under enrichments.<...>
     timeout: 5s                    # optional, humantime; default 5s
     on_error: skip | null | drop   # optional; default skip
@@ -1574,7 +1579,7 @@ The pipeline writes into `RuleHeader::enrichments` lazily, so detections and cor
 
 ### Composing enrichers (recipe catalog)
 
-Operators rarely need new Rust code. Every recipe below composes one of the four primitives against a dynamic-pipelines source or a remote API. Field names like `${detection.fields.SourceIp}` are illustrative; substitute the names your pipeline actually produces.
+Operators rarely need new Rust code. Every recipe below composes one of the seven primitives against a dynamic-pipelines source, a local database, or a remote API. Field names like `${detection.fields.SourceIp}` are illustrative; substitute the names your pipeline actually produces.
 
 #### `enrich_ip_employee`: identity lookup by source IP
 
@@ -1624,7 +1629,44 @@ Same source as above, key by username instead:
 
 #### `enrich_ip_geoip`: country/city/ASN by IP
 
-Prefer `lookup` if a GeoIP dump fits in memory; fall back to `http` for vendor APIs:
+Use `mmdb` with a local GeoLite2 or GeoIP2 database. The lookup stays local, and the database is reloaded when the file changes:
+
+```yaml
+# enrichers.yml
+enrichers:
+  - id: enrich_ip_geoip
+    kind: detection
+    type: mmdb
+    inject_field: geoip
+    db_path: /var/lib/geoip/GeoLite2-City.mmdb
+    key: "${detection.fields.SourceIp}"
+    fields:
+      country: country.iso_code
+      region: subdivisions.0.iso_code
+      city: city.names.en
+    default: { country: "unknown" }
+```
+
+#### `enrich_ip_rdns`: reverse DNS for an IP
+
+Use `dns` with `record_type: PTR` to resolve an event-supplied IP address to a hostname. `extract: ".[0]"` keeps the first answer, and `default` covers addresses with no PTR record:
+
+```yaml
+# enrichers.yml
+enrichers:
+  - id: enrich_ip_rdns
+    kind: detection
+    type: dns
+    record_type: PTR
+    key: "${detection.fields.SourceIp}"
+    inject_field: src_hostname
+    extract: ".[0]"
+    default: "unknown"
+```
+
+Forward lookups take `record_type: A`, `AAAA`, or `IP` (both), and `key` then holds a hostname such as `${detection.fields.DestinationHostname}`. See [Enrichers: `dns`](https://rsigma.io/guide/enrichers/#dns-dns-lookup) for the record types and cache behavior.
+
+If the GeoIP data is already exported as JSON, use `lookup` against a dynamic source instead; fall back to `http` for vendor APIs:
 
 ```yaml
 # sources.yml
@@ -1710,17 +1752,19 @@ Pure string interpolation, no I/O. Use this any time a downstream consumer (Slac
 
 #### When to pick which primitive
 
-- Prefer `lookup` if the data is bounded and refreshes infrequently (employee directory, KEV catalog, GeoIP dump).
+- Prefer `mmdb` for GeoIP, ASN, and proxy data that ships as a MaxMind DB file.
+- Prefer `dns` for PTR, A, AAAA, MX, TXT, and the other DNS record types that a resolver can answer directly.
+- Prefer `lookup` if the data is bounded and refreshes infrequently (employee directory, KEV catalog, a JSON GeoIP dump).
 - Prefer `http` only when the data is genuinely per-result or too large to cache. Always set `cache_ttl` for rate-limited APIs.
 - Prefer `command` only when no other primitive will do (a binary parser, a vendored CLI tool, anything that already exists as a script).
 - Never use `template` for anything that could be a YAML literal.
 
 ### Bespoke (Rust-coded) enrichers
 
-The four primitives cover almost every use case via composition. A bespoke Rust-coded enricher is justified only when at least one of these holds:
+The seven primitives cover almost every use case via composition. A bespoke Rust-coded enricher is justified only when at least one of these holds:
 
 1. **It bundles non-trivial data** (e.g. a dataset committed to the repo and `include_bytes!`-ed at compile time). Recipes can't express vendored data.
-2. **It needs a parser the YAML primitives don't expose** (e.g. MaxMind's binary GeoLite2 format, the STIX 2.1 graph with parent/child resolution). Adding the parser as a generic source might cost more than just shipping the enricher.
+2. **It needs a parser the YAML primitives don't expose** (e.g. a proprietary binary format such as a PCAP-derived flow table, the STIX 2.1 graph with parent/child resolution). Adding the parser as a generic source might cost more than just shipping the enricher.
 3. **It provides a stable named contract**: downstream consumers reference a specific `enrichments.<field>` shape directly. A recipe-driven approach lets every operator choose their own `inject_field`, which is fine for ad-hoc enrichment but bad for a contract that crosses team or organisational boundaries.
 4. **It implements a non-obvious algorithm** (e.g. coalescing per-result hash lookups into one batched-GET request). This is implementable as a recipe but the implementation is fragile.
 
@@ -1742,11 +1786,11 @@ register_builtin(
 ).unwrap();
 ```
 
-Reserved names (`template`, `lookup`, `http`, `command`) are rejected at registration time; duplicate registrations of the same name are rejected to keep the global registry append-only. Bespoke types follow the same `kind` / `scope` / template rules as the four primitives; promotion does not change the YAML shape, only the `type:` value.
+Reserved names (`template`, `lookup`, `http`, `command`, `stix`, `mmdb`, `dns`) are rejected at registration time; duplicate registrations of the same name are rejected to keep the global registry append-only. Bespoke types follow the same `kind` / `scope` / template rules as the seven primitives; promotion does not change the YAML shape, only the `type:` value.
 
 ### Metrics
 
-The enrichment pipeline reports six Prometheus metrics:
+The enrichment pipeline reports thirteen Prometheus metrics:
 
 | Metric | Labels | Description |
 |---|---|---|
@@ -1756,8 +1800,15 @@ The enrichment pipeline reports six Prometheus metrics:
 | `rsigma_enrichment_http_cache_hits_total` | `enricher_id` | HTTP enricher response-cache hits |
 | `rsigma_enrichment_http_cache_misses_total` | `enricher_id` | HTTP enricher response-cache misses |
 | `rsigma_enrichment_http_cache_expirations_total` | `enricher_id` | HTTP enricher response-cache entries evicted on expiry |
+| `rsigma_enrichment_mmdb_hits_total` | `enricher_id` | MMDB lookups that found a record and a non-empty projection |
+| `rsigma_enrichment_mmdb_misses_total` | `enricher_id` | MMDB lookups with no record or an empty projection, including misses where `default` was injected |
+| `rsigma_enrichment_mmdb_reloads_total` | `database`, `result` (`success`, `failure`) | MMDB reload attempts that reopened a changed file, or failed and kept the old reader |
+| `rsigma_enrichment_mmdb_build_epoch_seconds` | `database` | Build epoch of the loaded MMDB database; alert on `time() - rsigma_enrichment_mmdb_build_epoch_seconds` |
+| `rsigma_enrichment_dns_cache_hits_total` | `enricher_id` | DNS queries answered from the response cache, including cached negative answers |
+| `rsigma_enrichment_dns_cache_misses_total` | `enricher_id` | DNS queries that went to a nameserver, including every query when caching is disabled |
+| `rsigma_enrichment_dns_queries_total` | `enricher_id`, `result` (`answer`, `no_records`, `error`) | Upstream DNS query results; `error` covers SERVFAIL, refused, I/O, and the resolver's own timeout |
 
-The `kind` label is carried even though `enricher_id` typically already encodes it (`asset_lookup_det` vs `asset_lookup_corr`), so dashboards can compute `sum by (kind)` without depending on a naming convention. Every label combination is pre-registered at startup, so all six families render at zero on the first `/metrics` scrape, before any event has fired. Filtered (kind- or scope-mismatched) calls do not increment any counters.
+The `kind` label is carried even though `enricher_id` typically already encodes it (`asset_lookup_det` vs `asset_lookup_corr`), so dashboards can compute `sum by (kind)` without depending on a naming convention. Every label combination, including the MMDB hit and miss `enricher_id` rows, both MMDB reload `result` values, and all three DNS `result` values, is pre-registered at startup, so all thirteen families render at zero on the first `/metrics` scrape, before any event has fired. Filtered (kind- or scope-mismatched) calls do not increment any counters.
 
 ## Environment Variables
 

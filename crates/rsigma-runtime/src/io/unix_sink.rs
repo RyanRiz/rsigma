@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
-use rsigma_eval::ProcessResult;
+use rsigma_eval::{ProcessResult, TenantId};
 
 use crate::error::RuntimeError;
 use crate::io::lines::{LineBatch, ResumePoint};
@@ -24,7 +24,9 @@ pub struct UnixSocketSink {
     path: PathBuf,
     stream: Option<UnixStream>,
     format: SinkFormat,
+    ocsf: crate::ocsf::OcsfOptions,
     resume: ResumePoint,
+    tenant_filter: Option<TenantId>,
 }
 
 impl UnixSocketSink {
@@ -35,8 +37,17 @@ impl UnixSocketSink {
             path: path.to_path_buf(),
             stream: Some(stream),
             format: SinkFormat::default(),
+            ocsf: crate::ocsf::OcsfOptions::default(),
             resume: ResumePoint::default(),
+            tenant_filter: None,
         })
+    }
+
+    /// Only deliver results of `tenant`.
+    #[must_use]
+    pub fn with_tenant_filter(mut self, tenant: Option<TenantId>) -> Self {
+        self.tenant_filter = tenant;
+        self
     }
 
     /// Select the wire format this sink serializes results into.
@@ -46,9 +57,19 @@ impl UnixSocketSink {
         self
     }
 
+    #[must_use]
+    pub fn with_ocsf_options(mut self, ocsf: crate::ocsf::OcsfOptions) -> Self {
+        self.ocsf = ocsf;
+        self
+    }
+
     /// The wire format this sink serializes results into.
     pub fn format(&self) -> SinkFormat {
         self.format
+    }
+
+    pub fn ocsf_options(&self) -> &crate::ocsf::OcsfOptions {
+        &self.ocsf
     }
 
     /// Serialize and deliver each entry of a `ProcessResult` as one line.
@@ -69,17 +90,27 @@ impl UnixSocketSink {
         result: &ProcessResult,
         ctx: Option<&DeliveryContext>,
     ) -> Result<(), RuntimeError> {
-        if result.is_empty() {
+        let filtered: Vec<(usize, &rsigma_eval::EvaluationResult)> = result
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                self.tenant_filter
+                    .as_ref()
+                    .is_none_or(|t| m.header.tenant_id.as_ref() == Some(t))
+            })
+            .collect();
+        if filtered.is_empty() {
             return Ok(());
         }
         let start = self.resume.start(ctx);
         let mut batch = LineBatch::default();
-        for (index, m) in result.iter().enumerate().skip(start) {
+        for (original_index, m) in filtered.iter().skip(start) {
             batch.push(&serialize_result(
                 m,
                 self.format,
                 false,
-                ctx.map(|ctx| (ctx, index)),
+                ctx.map(|ctx| (ctx, *original_index)),
+                &self.ocsf,
             )?);
         }
         match self.write_batch(&batch).await {
@@ -99,6 +130,20 @@ impl UnixSocketSink {
         let mut batch = LineBatch::default();
         batch.push(json);
         self.write_batch(&batch).await.map_err(|(_, err)| err)
+    }
+
+    /// Write a pre-serialized line when it belongs to `tenant`.
+    pub async fn send_raw_for_tenant(
+        &mut self,
+        json: &str,
+        tenant: Option<&TenantId>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(filter) = &self.tenant_filter
+            && tenant != Some(filter)
+        {
+            return Ok(());
+        }
+        self.send_raw(json).await
     }
 
     /// Write `batch`, reconnecting once if the socket has gone away. A failure

@@ -14,7 +14,7 @@ From highest to lowest:
 
 1. **CLI flags** on the command line (e.g. `--rules /tmp/r`).
 2. **Environment variables**: uniform `RSIGMA_<SECTION>__<KEY>` (see [Environment layer](#environment-layer)) plus the legacy clap-bound names listed in [Environment Variables](environment-variables.md).
-3. **Project config**: `./rsigma.yaml` (or `./rsigma.yml`) in the current directory, then the nearest `.rsigmarc` found by walking up from the current directory. Project files cannot set the security-sensitive keys listed in [Project config trust](#project-config-trust); those are ignored with a warning and resolve from the other layers. {{ added "unreleased" }}
+3. **Project config**: `./rsigma.yaml` (or `./rsigma.yml`) in the current directory, then the nearest `.rsigmarc` found by walking up from the current directory. Project files cannot set the security-sensitive keys listed in [Project config trust](#project-config-trust); those are ignored with a warning and resolve from the other layers. {{ added "0.27.0" }}
 4. **User config**: `$XDG_CONFIG_HOME/rsigma/config.yaml` (defaulting to `~/.config/rsigma/config.yaml`).
 5. **System config**: `/etc/rsigma/config.yaml`.
 6. **Compiled defaults** baked into the binary.
@@ -33,7 +33,7 @@ The `~/.config/rsigma` location is computed by honoring `XDG_CONFIG_HOME` explic
 
 ## Project config trust
 
-{{ added "unreleased" }}
+{{ added "0.27.0" }}
 
 A project file (`./rsigma.yaml`, `./rsigma.yml`, or the nearest `.rsigmarc` above the current directory) ships with whatever repository is checked out, so running `rsigma` inside a cloned repository would otherwise let that repository configure the process. Project files can still set ordinary keys such as rule paths, pipelines, and output formats, but the keys below open a listener, a write path, a subprocess, or a network client, or weaken a guard, so rsigma ignores them when they come from a project file:
 
@@ -54,6 +54,9 @@ A project file (`./rsigma.yaml`, `./rsigma.yml`, or the nearest `.rsigmarc` abov
 | `daemon.output.dlq` | Sends failed events to a sink. |
 | `daemon.output.webhooks` | Sends detections to HTTP endpoints. |
 | `daemon.input.source` | Only when it names a NATS server, which the daemon would connect to with the operator's NATS credentials, or a `unix://` path outside the project. `stdin`, `http`, and `unix://` inputs inside the project are kept. |
+| `daemon.tenancy` | Turning tenancy off is the dangerous direction, so a project file may not set it at all. {{ added "unreleased" }} |
+| `daemon.input.tenant` | Binds the single pull source to a tenant. {{ added "unreleased" }} |
+| `daemon.input.nats_tenants` | Declares the tenant of each NATS subscription. {{ added "unreleased" }} |
 | `daemon.nats.consumer_group` | Joins another deployment's durable consumer and pulls its messages. |
 | `daemon.api.addr` | Unless it is a loopback `host:port` (`127.0.0.1`, `::1`, `localhost`) or a `unix://` path inside the project. Client commands such as `engine incidents export` send the API token to this address, and the daemon binds it. |
 | `daemon.state.db` | Only when it resolves outside the project. The daemon creates and writes the SQLite file there. |
@@ -71,7 +74,7 @@ A project file (`./rsigma.yaml`, `./rsigma.yml`, or the nearest `.rsigmarc` abov
 | `daemon.engine.egress_policy` | Can turn off the SSRF defense for HTTP sources and enrichers. |
 | `daemon.engine.allow_remote_include` | Lets pipelines include remote (HTTP or NATS) sources. |
 
-The boolean opt-ins in the table (`mcp.allow_unconfined_paths`, `mcp.allow_sigma_cli`, `mcp.allow_operate_writes`, `daemon.api.allow_unauthenticated`, `daemon.api.tls.allow_plaintext`, `daemon.tap.enabled`, `daemon.tail.enabled`, `daemon.capture.enabled`, and `daemon.engine.allow_remote_include`) are ignored only when a project file sets them to `true`. A project file may still set them to `false`. {{ added "unreleased" }}
+The boolean opt-ins in the table (`mcp.allow_unconfined_paths`, `mcp.allow_sigma_cli`, `mcp.allow_operate_writes`, `daemon.api.allow_unauthenticated`, `daemon.api.tls.allow_plaintext`, `daemon.tap.enabled`, `daemon.tail.enabled`, `daemon.capture.enabled`, and `daemon.engine.allow_remote_include`) are ignored only when a project file sets them to `true`. A project file may still set them to `false`. {{ added "0.27.0" }}
 
 Each ignored key prints a warning naming the file:
 
@@ -80,6 +83,8 @@ warning: ignoring 'mcp.daemon_url' from project config ./rsigma.yaml; security-s
 ```
 
 The same keys work from every other layer: an explicit `--config <PATH>` (which replaces discovery, so the file is trusted as the operator's choice), the user config, the system config, `RSIGMA_*` environment variables, and CLI flags. To keep a protected key in a repository, commit the file under another name and pass it with `--config`. [`rsigma config validate`](../cli/config/validate.md) and [`rsigma config show`](../cli/config/show.md) list the ignored keys.
+
+With `daemon.tenancy.enabled` set, the daemon also refuses to start when any project layer was loaded at all. A project file could replace `daemon.rulesets` and drop a tenant binding, so tenancy deployments run with `engine daemon --config <PATH>`, which replaces discovery. {{ added "unreleased" }}
 
 ## Format
 
@@ -94,8 +99,41 @@ global:
   output_format: json      # json | ndjson | table | csv | tsv (maps to --output-format)
   color: auto              # auto | always | never (maps to --color)
 
+rulesets:
+  linux_edge:
+    sources: [./rules/local, ./vendor/sigma/rules/linux]
+    include:
+      - tags: ["attack.t1059*"]
+    exclude:
+      - status: [deprecated, unsupported]
+    dependencies: include
+    overlays:
+      - dir: ./overlays/linux_edge
+    pipelines: [sysmon]
+    output: ./build/linux_edge
+
+convert:
+  defaults:
+    format: default
+    skip_unsupported: true
+    options:
+      correlation_method: join
+  groups:
+    linux_edge_lynxdb:
+      ruleset: linux_edge
+      target: lynxdb
+      pipelines: [sysmon]
+      output: ./build/lynxdb/linux_edge.txt
+      metadata:
+        rule_group: linux
+        time_window: 5m
+
 daemon:
   rules: /etc/rsigma/rules
+  # rulesets:            # several named rulesets, optionally schema-bound
+  #   - linux_edge
+  #   - name: cloud_audit
+  #     when: { schemas: [aws_cloudtrail] }
   pipelines: [ecs_windows]
   sources: [/etc/rsigma/sources]
   # alert_pipeline: /etc/rsigma/alert-pipeline.yml   # dedup (see the Alert Pipeline guide)
@@ -111,7 +149,7 @@ daemon:
     batch_size: 128        # capped at buffer_size
   output:
     sinks: [stdout]        # stdout | file://... | nats://... | otlp://... | unix:///run/rsigma/out.sock (Unix)
-                           # query params: ?on_full=drop, ?format=ndjson|ocsf (line sinks), ?compression=gzip and ?timeout=10s (OTLP), TLS ?ca=/?client_cert=/?client_key=/?tls_domain=
+                           # query params: ?on_full=drop, ?format=ndjson|ocsf (line and OTLP sinks), ?ocsf_version=<v>, ?ocsf_incident_class=2004|2005, and ?ocsf_assignee_group=<name> (with format=ocsf; defaults 1.1.0 and 2004; assignee group is required for class 2005), ?compression=gzip and ?timeout=10s (OTLP), TLS ?ca=/?client_cert=/?client_key=/?tls_domain=
     drain_timeout: 5
     # webhooks: [/etc/rsigma/webhooks/]   # template-driven HTTP sinks
   correlation:
@@ -159,9 +197,16 @@ daemon:
 
 eval:
   rules: ./rules
+  # ruleset: linux_edge     # one named ruleset instead of rules
+  # rulesets:               # several named rulesets, optionally schema-bound
+  #   - linux_edge
+  #   - name: cloud_audit
+  #     when: { schemas: [aws_cloudtrail] }
   pipelines: [sysmon]
   input_format: auto
   fail_on_detection: false
+  # finding_format: native   # native | ocsf. ocsf composes with json/ndjson output.
+  # ocsf_version: "1.1.0"    # 1.1.0 | 1.3.0, only with finding_format: ocsf
   schema:
     routing: false          # opt-in: route each event to its schema's pipeline-set (or --schema-routing)
     # config: ./schema.yml
@@ -190,13 +235,18 @@ mcp:
 
 backtest:
   rules: ./rules
+  # ruleset: linux_edge     # one named ruleset instead of rules
   corpus: [./ci/corpus]
   expectations: ./ci/expectations.yml
   # unexpected: warn   # fail | warn | ignore; unset lets the expectations-file default apply
   input_format: auto
+  # findings: ./findings.ndjson
+  # finding_format: native   # native | ocsf
+  # ocsf_version: "1.1.0"
 
 coverage:
   # rules: [./rules]
+  # ruleset: linux_edge     # one named ruleset instead of rules
   # atomics: https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics/Indexes/index.yaml
   # baseline: https://raw.githubusercontent.com/SigmaHQ/sigma/master/other/sigma_attack_nav_coverage.json
   # targets: ./threat-model-techniques.txt
@@ -221,6 +271,7 @@ visibility:
 
 hygiene:
   # rules: [./rules]
+  # ruleset: linux_edge     # one named ruleset instead of rules
   # metrics: http://localhost:9090/metrics
   # fields: ./fields.json
   silent_threshold: 365d
@@ -236,7 +287,10 @@ Run [`rsigma config init`](../cli/config/init.md) to scaffold a full, commented 
 | Section | Used by | Notes |
 |---------|---------|-------|
 | `global` | every subcommand | `global.log_format`, `global.output_format`, and `global.color`. See [Output Formats](output.md) for the format/color semantics. |
+| `rulesets` | `ruleset`, `--ruleset` commands, MCP tools | Named curation of Sigma rules: sources, selectors, dependency policy, overlays, pipelines, and build output. File-only; environment variables are ignored. See [Rulesets](../guide/rulesets.md). {{ added "unreleased" }} |
+| `convert` | `backend build` | Named conversion groups: `ruleset`, `target`, `format`, `pipelines`, `options`, `skip_unsupported`, `without_pipeline`, `output`, and opaque `metadata` copied into the manifest. `defaults` fills unset group fields. Groups are file-only; `RSIGMA_CONVERT__DEFAULTS__*` works, but `convert.groups.*` is ignored. See [`backend build`](../cli/backend/build.md). {{ added "unreleased" }} |
 | `daemon` | `engine daemon` | Mirrors every non-secret daemon flag. |
+| `daemon.rulesets` | `engine daemon` | Several named rulesets evaluated side by side. Each entry is a name or `{name, when: {schemas: [...]}}`. Conflicts with `daemon.rules`. Read once at startup. See [Rulesets](../guide/rulesets.md#several-rulesets-side-by-side). {{ added "unreleased" }} |
 | `daemon.api.tls` | `engine daemon` | Inert unless the binary is built with the `daemon-tls` feature; otherwise `config validate` warns. |
 | `daemon.api.auth` | `engine daemon` | Bearer-token authentication with `resource:action` permissions (`anonymous_permissions`, `roles`, `tokens`). Absent = no authentication. Token secrets stay env-only via each token's `token_env`. Mutually exclusive with `--api-token-env`. See [HTTP API: Authentication](http-api.md#authentication). |
 | `daemon.api.audit` | `engine daemon` | Control-plane mutation audit trail (`enabled`, `max_entries`, `max_age`, `max_body_bytes`, `sink`). Requires `--state-db`; auto-enabled when a state database is configured. See [HTTP API: Audit trail](http-api-state.md#audit-trail). |
@@ -249,6 +303,7 @@ Run [`rsigma config init`](../cli/config/init.md) to scaffold a full, commented 
 | `daemon.schema` | `engine daemon` | Schema classification and routing (`observe`, `discover`, `routing`, `partition_rules`, `config`, `on_unknown`). All opt-in. See [Schema Routing](../guide/schema-routing.md). |
 | `daemon.logsource_routing` | `engine daemon` | Conflict-based logsource pruning (`enabled`, `field_map`, `event_logsource`). `strict` is accepted and ignored. Opt-in. See [Logsource-Aware Evaluation](../guide/logsource-routing.md). |
 | `eval` | `engine eval` | Mirrors the eval flag surface. |
+| `eval.ruleset`, `eval.rulesets` | `engine eval` | One named ruleset, or several evaluated side by side with optional `when` schema bindings. Set at most one of them, and neither with `eval.rules`. An empty `eval.rulesets` list counts as unset. {{ added "unreleased" }} |
 | `eval.output` | `engine eval` | Write results to this file instead of stdout (`-o, --output`). The CLI flag takes precedence. {{ added "0.25.0" }} |
 | `eval.schema` | `engine eval` | Schema routing for one-shot eval (`routing`, `config`, `on_unknown`). `observe`/`discover` have no effect here. |
 | `eval.logsource_routing` | `engine eval` | Conflict-based logsource pruning for one-shot eval (`enabled`, `field_map`, `event_logsource`). `strict` is accepted and ignored. |
@@ -286,10 +341,13 @@ Two parallel schemes are honored:
     | `RSIGMA_MCP__DAEMON_URL=http://127.0.0.1:9090` | `mcp.daemon_url` |
     | `RSIGMA_MCP__DAEMON_CA=/etc/rsigma/tls/ca.pem` | `mcp.daemon_ca` |
     | `RSIGMA_MCP__ALLOW_OPERATE_WRITES=true` | `mcp.allow_operate_writes` |
+    | `RSIGMA_EVAL__RULESET=linux_edge` | `eval.ruleset` |
 
 2. **Legacy clap-bound names** with a single underscore (`NATS_CREDS`, `RSIGMA_CONSUMER_GROUP`, `RSIGMA_TLS_KEY_PASSWORD`). These continue to work at the flag layer and are listed in [Environment Variables](environment-variables.md). Secrets are *only* readable this way.
 
 The uniform scheme is detected by the `__` separator, so it never collides with the legacy single-underscore names.
+
+`rulesets` is a file-only section. `RSIGMA_RULESETS__...` variables are ignored with `warning: ignoring environment variable <KEY>: rulesets are configured in files only`. Per-command keys such as `RSIGMA_EVAL__RULESET` work normally.
 
 ## `--dry-run` and `config show`
 

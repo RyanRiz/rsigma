@@ -18,6 +18,7 @@
 //!
 //! Detection paths:
 //! - `rule.title` / `rule.id` / `rule.level`
+//! - `tenant` (empty when the result is untenanted)
 //! - `tags` (joined with `,`)
 //! - `fields.<name>` (the matched value of `<name>` from `matched_fields`)
 //! - `event.<dotted.path>` (navigate `DetectionBody::event` by JSON segment)
@@ -26,6 +27,7 @@
 //!
 //! Correlation paths:
 //! - `rule.title` / `rule.id` / `rule.level`
+//! - `tenant` (empty when the result is untenanted)
 //! - `tags` (joined with `,`)
 //! - `type` (`event_count`, `temporal`, …)
 //! - `aggregated_value` / `timespan_secs`
@@ -35,6 +37,10 @@
 //! Incident webhooks use a third namespace, `${incident.<dotted.path>}`, that
 //! navigates the incident record (see [`render_incident_template`]). It is not
 //! valid inside enrichers, which never see incidents.
+//!
+//! `${detection.ocsf}` and `${correlation.ocsf}` insert the result's OCSF
+//! Detection Finding as raw JSON. They are valid only in a webhook body, as a
+//! whole JSON value; every other templated field rejects them at config load.
 //!
 //! Anything else (unrecognized prefix, dotted env var, etc.) is rejected at
 //! config load, **not** at runtime, so a deployment with a typo never starts
@@ -57,6 +63,14 @@ use super::{EnrichError, Enricher, EnricherKind, OnError, Scope, inject_enrichme
 /// messages can pinpoint the offending reference.
 static TEMPLATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{([^}]+)\}").unwrap());
 
+/// The path that inserts the result's OCSF finding into a webhook body.
+const OCSF_PATH: &str = "ocsf";
+
+/// Key of the object substituted for an OCSF reference when checking that a
+/// webhook body uses it as a whole JSON value. The quotes make a reference
+/// inside a string literal fail to parse.
+const OCSF_PROBE_KEY: &str = "rsigma_ocsf_probe";
+
 /// Classification of a single `${...}` reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VarRef {
@@ -71,6 +85,12 @@ enum VarRef {
     /// Anything else (dotted but unknown prefix, empty, …). Always an
     /// error at config load.
     Invalid(String),
+}
+
+impl VarRef {
+    fn is_ocsf(&self) -> bool {
+        matches!(self, VarRef::Detection(path) | VarRef::Correlation(path) if path == OCSF_PATH)
+    }
 }
 
 fn classify_ref(name: &str) -> VarRef {
@@ -105,6 +125,13 @@ pub enum TemplateError {
         reference: String,
         field: &'static str,
     },
+    /// `${detection.ocsf}` / `${correlation.ocsf}` outside a webhook body, or
+    /// inside one but not as a whole JSON value.
+    MisplacedOcsf {
+        enricher_id: String,
+        reference: String,
+        field: &'static str,
+    },
 }
 
 impl std::fmt::Display for TemplateError {
@@ -128,6 +155,14 @@ impl std::fmt::Display for TemplateError {
                 f,
                 "enricher '{enricher_id}': malformed template reference '${{{reference}}}' in field '{field}'; expected ${{detection.*}}, ${{correlation.*}}, or ${{ENV_VAR}}",
             ),
+            TemplateError::MisplacedOcsf {
+                enricher_id,
+                reference,
+                field,
+            } => write!(
+                f,
+                "enricher '{enricher_id}': '${{{reference}}}' in field '{field}' is only valid as a whole JSON value in a webhook body",
+            ),
         }
     }
 }
@@ -142,15 +177,146 @@ impl std::error::Error for TemplateError {}
 /// Called at config load time for every templated config value across every
 /// enricher; rejects the daemon startup on the first failure rather than
 /// the first runtime hit.
+///
+/// `${detection.ocsf}` and `${correlation.ocsf}` are rejected here: they are
+/// valid only in a webhook body, which is checked with
+/// `validate_webhook_body_template` instead.
 pub fn validate_template_namespace(
     text: &str,
     enricher_kind: EnricherKind,
     enricher_id: &str,
     field: &'static str,
 ) -> Result<(), TemplateError> {
+    validate_references(text, enricher_kind, enricher_id, field, false)
+}
+
+/// Reject a URL template whose tenant reference lands in the authority.
+///
+/// A `${detection.tenant}` or `${correlation.tenant}` reference changes the
+/// rendered value per result. It may appear only after the first `/` that
+/// follows the scheme and authority, so the destination host stays fixed for
+/// the webhook or HTTP enricher's client, cache, and rate limiter.
+pub fn validate_url_tenant_position(url: &str) -> Result<(), String> {
+    let tenant_refs = ["${detection.tenant}", "${correlation.tenant}"];
+    if !tenant_refs.iter().any(|needle| url.contains(needle)) {
+        return Ok(());
+    }
+    // Render with two different tenants and compare what a URL parser sees:
+    // the destination must not move between them.
+    let render = |tenant: &str| {
+        TEMPLATE_RE
+            .replace_all(url, |caps: &regex::Captures| {
+                let whole = caps.get(0).unwrap().as_str();
+                if tenant_refs.contains(&whole) {
+                    return tenant.to_string();
+                }
+                match classify_ref(caps.get(1).unwrap().as_str()) {
+                    VarRef::Env(name) => std::env::var(name).unwrap_or_default(),
+                    _ => "x".to_string(),
+                }
+            })
+            .into_owned()
+    };
+    let (one, two) = ("rsigmatenantone", "rsigmatenanttwo");
+    let fixed = match (
+        reqwest::Url::parse(&render(one)),
+        reqwest::Url::parse(&render(two)),
+    ) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.username() == b.username()
+                && a.password() == b.password()
+                && a.host_str() == b.host_str()
+                && a.port() == b.port()
+                && !a.scheme().contains(one)
+                && !a.username().contains(one)
+                && !a.password().is_some_and(|p| p.contains(one))
+                && !a.host_str().is_some_and(|h| h.contains(one))
+        }
+        _ => false,
+    };
+    if !fixed {
+        return Err(format!(
+            "url '{url}' must be an absolute URL whose scheme and authority do not use a tenant reference; \
+             ${{detection.tenant}} and ${{correlation.tenant}} are only valid in the path or query"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a webhook body template: the namespace rules of
+/// [`validate_template_namespace`], plus `${detection.ocsf}` /
+/// `${correlation.ocsf}` allowed only where a whole JSON value can stand.
+///
+/// The check substitutes a JSON object for each OCSF reference and `0` for
+/// every other reference, then requires the body to parse and to hold every
+/// substituted object. A reference inside a string literal or in key position
+/// fails. Bodies without an OCSF reference are not parsed, so a non-JSON body
+/// keeps working.
+pub(crate) fn validate_webhook_body_template(
+    text: &str,
+    kind: EnricherKind,
+    webhook_id: &str,
+) -> Result<(), TemplateError> {
+    const FIELD: &str = "body";
+    validate_references(text, kind, webhook_id, FIELD, true)?;
+
+    let mut first_ocsf: Option<String> = None;
+    let mut ocsf_count = 0usize;
+    let probe = TEMPLATE_RE.replace_all(text, |caps: &regex::Captures| {
+        let inner = caps.get(1).unwrap().as_str();
+        if classify_ref(inner).is_ocsf() {
+            ocsf_count += 1;
+            first_ocsf.get_or_insert_with(|| inner.to_string());
+            format!("{{\"{OCSF_PROBE_KEY}\":0}}")
+        } else {
+            "0".to_string()
+        }
+    });
+    let Some(reference) = first_ocsf else {
+        return Ok(());
+    };
+    let whole_values = serde_json::from_str::<serde_json::Value>(&probe)
+        .map(|value| count_ocsf_probes(&value) == ocsf_count)
+        .unwrap_or(false);
+    if whole_values {
+        Ok(())
+    } else {
+        Err(TemplateError::MisplacedOcsf {
+            enricher_id: webhook_id.to_string(),
+            reference,
+            field: FIELD,
+        })
+    }
+}
+
+fn count_ocsf_probes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) if map.len() == 1 && map.contains_key(OCSF_PROBE_KEY) => 1,
+        serde_json::Value::Object(map) => map.values().map(count_ocsf_probes).sum(),
+        serde_json::Value::Array(items) => items.iter().map(count_ocsf_probes).sum(),
+        _ => 0,
+    }
+}
+
+fn validate_references(
+    text: &str,
+    enricher_kind: EnricherKind,
+    enricher_id: &str,
+    field: &'static str,
+    allow_ocsf: bool,
+) -> Result<(), TemplateError> {
     for caps in TEMPLATE_RE.captures_iter(text) {
         let inner = caps.get(1).unwrap().as_str();
-        match classify_ref(inner) {
+        let reference = classify_ref(inner);
+        if reference.is_ocsf() && !allow_ocsf {
+            return Err(TemplateError::MisplacedOcsf {
+                enricher_id: enricher_id.to_string(),
+                reference: inner.to_string(),
+                field,
+            });
+        }
+        match reference {
             VarRef::Env(_) => {}
             VarRef::Detection(_) if enricher_kind == EnricherKind::Detection => {}
             VarRef::Correlation(_) if enricher_kind == EnricherKind::Correlation => {}
@@ -237,7 +403,7 @@ pub fn render_template(text: &str, result: &EvaluationResult) -> String {
 pub fn render_template_url(text: &str, result: &EvaluationResult) -> String {
     render_with(text, result, |source, s| match source {
         ValueSource::Env => s,
-        ValueSource::Result => url_component_escape(&s),
+        ValueSource::Result | ValueSource::Ocsf => url_component_escape(&s),
     })
 }
 
@@ -255,12 +421,48 @@ pub fn render_template_json(text: &str, result: &EvaluationResult) -> String {
     render_with(text, result, |_, s| json_escape_value(s))
 }
 
+/// Like [`render_template_json`], but `${detection.ocsf}` /
+/// `${correlation.ocsf}` insert the raw JSON `ocsf` returns, unescaped.
+///
+/// Only a webhook body validated by `validate_webhook_body_template` may
+/// contain those references, so the inserted finding always lands where a
+/// whole JSON value belongs.
+pub(crate) fn render_template_json_with_ocsf(
+    text: &str,
+    result: &EvaluationResult,
+    ocsf: impl Fn() -> String,
+) -> String {
+    render_with(text, result, |source, s| match source {
+        ValueSource::Ocsf => ocsf(),
+        ValueSource::Env | ValueSource::Result => json_escape_value(s),
+    })
+}
+
+/// Validate a webhook JSON body, then render it.
+///
+/// `${detection.ocsf}` and `${correlation.ocsf}` are inserted as raw JSON only
+/// after `validate_webhook_body_template` has accepted them as whole JSON
+/// values. A template that fails that check is not rendered.
+pub fn render_webhook_body(
+    text: &str,
+    kind: EnricherKind,
+    webhook_id: &str,
+    result: &EvaluationResult,
+    ocsf: impl Fn() -> String,
+) -> Result<String, TemplateError> {
+    validate_webhook_body_template(text, kind, webhook_id)?;
+    Ok(render_template_json_with_ocsf(text, result, ocsf))
+}
+
 /// Where a substituted value came from, so an escaper can treat operator
 /// environment values differently from evaluation-result values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueSource {
     Env,
     Result,
+    /// `${detection.ocsf}` / `${correlation.ocsf}` on a result of the
+    /// matching kind. Renders empty unless the renderer supplies a finding.
+    Ocsf,
 }
 
 /// Shared render core: substitute every `${...}` reference, then run each
@@ -274,14 +476,22 @@ fn render_with<F: Fn(ValueSource, String) -> String>(
         text,
         |var| match var {
             VarRef::Detection(path) => match &result.body {
-                ResultBody::Detection(_) => render_detection_path(&path, result),
-                ResultBody::Correlation(_) => String::new(),
+                ResultBody::Detection(_) if path == OCSF_PATH => (ValueSource::Ocsf, String::new()),
+                ResultBody::Detection(_) => {
+                    (ValueSource::Result, render_detection_path(&path, result))
+                }
+                ResultBody::Correlation(_) => (ValueSource::Result, String::new()),
             },
             VarRef::Correlation(path) => match &result.body {
-                ResultBody::Correlation(_) => render_correlation_path(&path, result),
-                ResultBody::Detection(_) => String::new(),
+                ResultBody::Correlation(_) if path == OCSF_PATH => {
+                    (ValueSource::Ocsf, String::new())
+                }
+                ResultBody::Correlation(_) => {
+                    (ValueSource::Result, render_correlation_path(&path, result))
+                }
+                ResultBody::Detection(_) => (ValueSource::Result, String::new()),
             },
-            _ => String::new(),
+            _ => (ValueSource::Result, String::new()),
         },
         escape,
     )
@@ -297,7 +507,7 @@ pub fn render_incident_template(text: &str, incident: &serde_json::Value) -> Str
 pub fn render_incident_template_url(text: &str, incident: &serde_json::Value) -> String {
     render_incident_with(text, incident, |source, s| match source {
         ValueSource::Env => s,
-        ValueSource::Result => url_component_escape(&s),
+        ValueSource::Result | ValueSource::Ocsf => url_component_escape(&s),
     })
 }
 
@@ -314,10 +524,13 @@ fn render_incident_with<F: Fn(ValueSource, String) -> String>(
     render_refs(
         text,
         |var| match var {
-            VarRef::Incident(path) => navigate_json(incident, &path)
-                .map(json_to_string)
-                .unwrap_or_default(),
-            _ => String::new(),
+            VarRef::Incident(path) => (
+                ValueSource::Result,
+                navigate_json(incident, &path)
+                    .map(json_to_string)
+                    .unwrap_or_default(),
+            ),
+            _ => (ValueSource::Result, String::new()),
         },
         escape,
     )
@@ -326,7 +539,7 @@ fn render_incident_with<F: Fn(ValueSource, String) -> String>(
 /// Substitute every `${...}` reference: env vars from the process
 /// environment, everything else through `resolve`, then run each value
 /// through `escape`.
-fn render_refs<R: Fn(VarRef) -> String, F: Fn(ValueSource, String) -> String>(
+fn render_refs<R: Fn(VarRef) -> (ValueSource, String), F: Fn(ValueSource, String) -> String>(
     text: &str,
     resolve: R,
     escape: F,
@@ -335,7 +548,7 @@ fn render_refs<R: Fn(VarRef) -> String, F: Fn(ValueSource, String) -> String>(
         .replace_all(text, |caps: &regex::Captures| {
             let (source, raw) = match classify_ref(caps.get(1).unwrap().as_str()) {
                 VarRef::Env(name) => (ValueSource::Env, std::env::var(name).unwrap_or_default()),
-                other => (ValueSource::Result, resolve(other)),
+                other => resolve(other),
             };
             escape(source, raw)
         })
@@ -377,6 +590,14 @@ fn render_detection_path(path: &str, result: &EvaluationResult) -> String {
         Some(b) => b,
         None => return String::new(),
     };
+    if path == "tenant" {
+        return result
+            .header
+            .tenant_id
+            .as_ref()
+            .map(|tenant| tenant.as_str().to_string())
+            .unwrap_or_default();
+    }
     if let Some(rest) = path.strip_prefix("rule.") {
         return render_rule_field(rest, result);
     }
@@ -430,6 +651,14 @@ fn render_correlation_path(path: &str, result: &EvaluationResult) -> String {
         Some(b) => b,
         None => return String::new(),
     };
+    if path == "tenant" {
+        return result
+            .header
+            .tenant_id
+            .as_ref()
+            .map(|tenant| tenant.as_str().to_string())
+            .unwrap_or_default();
+    }
     if let Some(rest) = path.strip_prefix("rule.") {
         return render_rule_field(rest, result);
     }
@@ -619,10 +848,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: title.to_string(),
                 rule_id: Some("rule-1".to_string()),
+                tenant_id: None,
                 level: Some(Level::High),
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Detection(DetectionBody {
                 matched_selections: vec!["selection".to_string()],
@@ -833,5 +1064,67 @@ mod tests {
             );
             assert_eq!(parsed.path_segments().unwrap().count(), 3, "{value:?}");
         }
+    }
+
+    #[test]
+    fn tenant_paths_render_the_header_tenant() {
+        let mut r = detection("Whoami", "CommandLine", serde_json::json!("whoami"));
+        r.header.tenant_id = Some(rsigma_eval::TenantId::new("tenant-a").unwrap());
+        assert_eq!(render_template("${detection.tenant}", &r), "tenant-a");
+        assert_eq!(
+            render_template_url("${detection.tenant}", &r),
+            "tenant-a",
+            "a tenant id is URL-safe"
+        );
+        r.header.tenant_id = None;
+        assert_eq!(render_template("${detection.tenant}", &r), "");
+    }
+
+    #[test]
+    fn a_tenant_reference_in_a_url_authority_is_refused() {
+        assert!(
+            validate_url_tenant_position("https://example.test/${detection.tenant}/hook").is_ok()
+        );
+        assert!(
+            validate_url_tenant_position("https://${detection.tenant}.example.test/hook").is_err()
+        );
+        assert!(
+            validate_url_tenant_position("https://${correlation.tenant}.example.test").is_err()
+        );
+        assert!(validate_url_tenant_position("https://example.test/hook").is_ok());
+        assert!(validate_url_tenant_position("https://example.test?t=${detection.tenant}").is_ok());
+        assert!(
+            validate_url_tenant_position("https://user:${detection.tenant}@example.test/").is_err()
+        );
+        assert!(validate_url_tenant_position("https://example.test:${detection.tenant}/").is_err());
+    }
+
+    #[test]
+    fn a_tenant_reference_cannot_reach_the_host_without_a_double_slash() {
+        for url in [
+            "https:${detection.tenant}/hook",
+            "https:/${detection.tenant}/hook",
+            "https:\\\\${detection.tenant}/hook",
+            "${detection.tenant}.example.test/hook",
+        ] {
+            assert!(validate_url_tenant_position(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_env_reference_is_resolved_before_the_authority_check() {
+        // SAFETY: test-only variable with a unique name.
+        unsafe { std::env::set_var("RSIGMA_TEST_TENANT_URL_BASE", "https://") };
+        assert!(
+            validate_url_tenant_position(
+                "${RSIGMA_TEST_TENANT_URL_BASE}${detection.tenant}.example.test/hook"
+            )
+            .is_err()
+        );
+        unsafe { std::env::set_var("RSIGMA_TEST_TENANT_URL_HOST", "https://example.test") };
+        assert!(
+            validate_url_tenant_position("${RSIGMA_TEST_TENANT_URL_HOST}/${detection.tenant}")
+                .is_ok()
+        );
     }
 }

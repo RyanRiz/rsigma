@@ -4,6 +4,274 @@ All notable changes to RSigma are documented in this file. Each entry correspond
 
 ## [Unreleased]
 
+### Daemon batch runs over stdin (#714)
+
+`rsigma engine daemon --input stdin` is a one-shot batch runner for serverless and cron callers. It reads stdin to end of input, evaluates every event, drains every sink and the dead-letter queue, saves `--state-db`, and exits. A correlation window that spans batches fires in the run that completes it, and after exit the state database is a single file with no `-wal` or `-shm` sidecar.
+
+A stdin run whose stored state cannot be restored now exits `3` instead of starting fresh. A stdin run that did not complete cleanly exits `4` (`RUNTIME_ERROR`) after logging one summary line: a signal stopped it before end of input, reading stdin failed, output reached neither a sink nor the DLQ, the final state save failed, or a pipeline task panicked. Parse errors without a `--dlq` and `on_full=drop` queue drops do not fail a run.
+
+`--stdin-mode stream` (config `daemon.input.stdin_mode`) opts a stdin daemon out of the batch contract for a long-running pipe. It keeps running after end of input until a shutdown signal, restores state with a warning and a fresh start when the stored snapshot cannot be restored, and exits `0`. The default is `batch`.
+
+The library surface adds `StdinReadStatus` and `StdinSource::read_status`, which report whether the stdin reader stopped on a read error rather than at end of input.
+
+Breaking changes: with `--input stdin`, an unrestorable stored snapshot now exits `3` instead of starting fresh, and an interrupted run, a stdin read error, lost output, or a failed final save now exits `4` instead of `0`. HTTP, NATS, and unix-socket inputs keep their warn-and-start-fresh restore and exit `0` at shutdown. Pass `--stdin-mode stream` to keep that behavior for stdin, with the daemon now staying up after end of input.
+
+See [Daemon batch runs](https://rsigma.io/cli/engine/daemon/#batch-runs). A new [Serverless](https://rsigma.io/deployment/serverless/) deployment page covers an AWS Lambda handler over Kinesis and a wrapper for scheduled container jobs.
+
+### Fibratus output rejects unsafe field names and escapes YAML line breaks (security, #734)
+
+The Fibratus backend passed field names through unchanged, so a field name such as `ps.name = evil or 1 = 1 or ps.name` rewrote the logic of the generated filter expression, in detection rules and in a correlation's `group-by` and `value_count` field ([GHSA-98v4-pmv2-h8qq](https://github.com/timescale/rsigma/security/advisories/GHSA-98v4-pmv2-h8qq)). The YAML rule envelope also split block scalars only on `\n` and wrote label keys unquoted, while YAML loaders such as the one Fibratus uses also break lines on `\r`, NEL, U+2028, and U+2029. A carriage return in a value, field name, or description, or a newline in a tag, could end the `condition`, `description`, or `labels` block and add top-level keys such as an `action` list with `kill` or `isolate` ([GHSA-gx4c-rpx5-2w58](https://github.com/timescale/rsigma/security/advisories/GHSA-gx4c-rpx5-2w58)).
+
+- A field name must be a Fibratus identifier: a letter or `_`, then letters, digits, `_`, `.`, or `$`, with optional `[...]` index segments such as `evt.arg[exe]`. Any other field name fails conversion with `invalid Fibratus field name`. Unmapped Sigma names such as `Image` still convert. In the SigmaHQ rule set, only hyphenated web-log fields such as `cs-uri-query` are affected.
+- A `condition` or `description` that a block scalar cannot carry is written as an escaped double-quoted scalar, and inline values and label keys with a line break or another non-printable character are double-quoted with escapes. Correlation conversion decodes a double-quoted condition from a referenced rule.
+
+**Breaking changes:** `rsigma_convert::backends::fibratus::shared::sanitize_field` is replaced by `field_ident`, which returns `Result<&str>` and rejects names outside Fibratus identifier syntax.
+
+### STIX ids are validated before they name a store file (security, #733)
+
+`StixId::parse` checked only the `--` delimiter and the UUID, and `FsStore` used the id as a file name under `objects/`. With `--allow-custom`, a bundle passed to `rsigma taxii store` or a collection read by `rsigma taxii sync` could carry an id such as `../../x--<uuid>` or `/tmp/x--<uuid>` and write a JSON file outside the store ([GHSA-g52x-rcvw-c2qw](https://github.com/timescale/rsigma/security/advisories/GHSA-g52x-rcvw-c2qw)).
+
+- A STIX id parses only when its type name is 3 to 250 characters of `a-z`, `0-9`, and `-`, starting with a letter, as STIX 2.1 requires, and its UUID is in hyphenated form.
+- `FsStore` checks the file name for every id before it writes or deletes and fails with `StoreError::InvalidObjectId`, so an id built with `StixId::generate` from an unchecked type name cannot escape the store either.
+
+**Breaking changes:** `StixIdError` gains the `InvalidTypeName` and `NonHyphenatedUuid` variants. Ids that broke the STIX type-name rules, such as uppercase or two-character type names, no longer parse, and an `FsStore` that already holds such an id fails to open until the file is removed.
+
+### Multi-tenant daemon (#732)
+
+`rsigma engine daemon` can serve several tenants in one process while keeping their state apart. A tenant comes only from an operator binding: the bearer token that authenticated a REST or OTLP ingest request, the configured tenant of the single selected pull source, or a NATS subscription declared for one tenant. Event fields, client headers, NATS message headers, and OTLP attributes are never identity. A token declares exactly one of `tenant: <id>` or `all_tenants: true`; `all_tenants` is not implied by a role, and an `all_tenants` token cannot ingest because it has no tenant to bind. A tenant id is 1 to 64 ASCII letters, digits, `_`, and `-`; a `.` is refused so an id is always one NATS subject token.
+
+Every stateful key includes the tenant: correlation windows, dedup fingerprints, incident ids and entity join keys, inhibition sources, silences, risk entities, disposition buckets, and capture bundle identities. Hashes change only for tenanted results, so untenanted output is unchanged. Correlation, alert-pipeline, risk, and disposition snapshots move to version 2, which nests state under `tenants`; version 1 snapshots stay readable as the untenanted bucket, and a restore discards entries that do not match the current tenancy mode and logs the counts.
+
+Named rulesets can bind to tenants. A bound ruleset receives only events whose tenant is listed, while an unbound ruleset receives every tenant's events with its state still keyed per tenant. `daemon.tenancy.quotas` caps correlation state, active alerts, incidents, and risk entities per tenant; at a tenant's cap a new entry evicts its own expired entries first, then its stalest entries, a restore or reload trims each tenant to its quota, and the global caps remain as a backstop. The `silences`, `inhibition_sources`, and `stream_sessions` quotas refuse a tenant's new dynamic silence (`429`), inhibition source, or tap and tail session (`409`) at its cap, so one tenant cannot take every slot of a shared control. Disposition idempotency ids are kept per tenant, and `max_seen_ids` bounds each tenant's set.
+
+With tenancy enabled, startup refuses without bearer-token auth, with a quota of 0, with anonymous permissions, with a token that declares both or neither binding, with a tenant-bound token secret shorter than 32 bytes, with a non-HTTP source that has no tenant binding (checked after CLI flags such as `--input` apply), with a disposition pull source (a record's own `tenant` field is never identity), with overlapping `nats_tenants` subjects or a repeated tenant, with two tenant ids that differ only by case, with a project config layer loaded, and with a ruleset binding no token, `input.tenant`, or `nats_tenants` entry can produce. With tenancy disabled, startup refuses any tenant binding, any quota, any `{tenant}` or `tenant=` sink, and any non-empty webhook or enricher `scope.tenants`.
+
+The API scopes every route to a tenancy class. Tenant tokens get `403` on operator-only routes that span tenants (`/metrics`, `/api/v1/status`, field and schema observers, dynamic sources, watchlists, STIX sources, and reload). Tenant-scoped reads, including the tap and the detection stream, are filtered to the token's tenant; `?tenant=` only narrows, and a tenant token naming another tenant gets `403`. A resource id owned by another tenant is `404`, so ids do not leak existence. Silences and dispositions written by a tenant token are bound to its tenant. A silence id must be unique among the silences its tenant can see, so a reused id returns `409`, and an `all_tenants` delete of an id that several tenants use returns `409` until `?tenant=` names one. An `all_tenants` token must send `tenant` on a write. The audit trail records an `all_tenants` token's silence and disposition writes under the tenant they affected, so that tenant's audit reads include them.
+
+Findings sinks can filter by tenant with `tenant=<id>`, route NATS subjects with `{tenant}` as a whole token into one wildcard JetStream stream, and route file paths with `{tenant}` as a whole path component; file sinks create the tenant's directory and keep a bounded LRU of per-tenant handles. `{tenant}` may appear once, only in a file path or a NATS subject (including the alert pipeline and risk `nats_subject` keys), and the DLQ and audit sinks refuse `{tenant}`, `tenant=`, and `max_open=`. A result without a tenant on a `{tenant}` subject or path is a permanent delivery failure and reaches the DLQ. OTLP sinks carry `tenant_id` as a log-record attribute. The HTTP enrichment response cache includes the rendered headers in its key, so a header that carries the tenant or an event field never shares a cached response. Three metric families report tenancy: `rsigma_tenant_rejected_total`, `rsigma_tenant_quota_evictions_total`, and `rsigma_detection_matches_by_tenant_total`, the last bucketing tenants outside `daemon.tenancy.metrics_tenant_allowlist` under `other`. `rsigma_rule_false_positive_ratio` sums each rule across tenants, so one tenant's verdicts no longer overwrite the series after a restore or prune.
+
+The MCP `create_silence` and `post_disposition` tools accept an optional `tenant` argument. The library gains `TenantId`, `tenant_at`, `WithTenant`, the `_for_tenant` and `_for_tenants` evaluation methods, `TenantStateSnapshot`, `ImportStats`, `Scope::with_tenants`, tenant bindings on rulesets, and three `MetricsHook` methods.
+
+The architecture and detection-loop diagrams show tenancy, several rulesets in one daemon, watchlist and STIX indicator sources, rebuilds on source change, `backend build`, and `rule draft --from-stix`.
+
+**Breaking changes:** `RuleHeader.tenant_id`, `RawEvent.tenant`, `CorrelationSnapshot.tenants`, `GroupStateInfo.tenant`, `RulesetUnit.tenants`, `RulesetStats.tenants`, `CorrelationConfig.require_tenant` and `max_state_entries_per_tenant`, both `ScopeConfig.tenants`, and `RulesetBinding.tenants` need defaults in struct literals, and so does the new `CacheKey.headers_hash`. `SilenceStore::remove_scoped` returns `SilenceRemoval`, whose `Removed` variant carries the removed silence's tenant, and `SilenceStore::try_add` also refuses a duplicate id. `CaptureRing::snapshot_incident` takes the tenant, `DispositionStore::restore` takes the tenancy flag, and `AlertPipelineConfigError` and `RiskConfigError` gain a `NatsSubject` variant. Correlation, alert-pipeline, risk, and disposition snapshots move to version 2, which older releases cannot read. Path-mode output and existing daemon behavior are unchanged with tenancy off.
+
+### Draft rules from STIX indicators (#731)
+
+`rsigma rule draft --from-stix` reads a STIX 2.1 bundle, or a single indicator, and prints one Sigma rule per logsource. It needs the `stix-draft` feature. The Docker image includes it, because that image is built with `--all-features`.
+
+A rule is drafted only from simple equality and `IN` comparisons. `ipv4` and `ipv6` become `DestinationIp` on `network_connection`. An IPv6 address is written in RFC 5952 form. An `ipv6_cidr` value is kept as written. CIDR values use `|cidr`. Domains become `QueryName` on `dns_query`. URLs become `c-uri` on `proxy`. File hashes share one `Hashes|contains` selection on `process_creation`. File names become `TargetFilename|endswith` on `file_event`. Registry keys become `TargetObject|contains` on `registry_set`. The hive is removed and the remaining path is wrapped in backslashes, so the rule matches a Sysmon `TargetObject` that uses a short hive and appends the value name. Email, mutex, MAC, and ASN values are not drafted. An indicator that also has a mapped value is still used. Revoked indicators are skipped. Expired and not-yet-valid indicators are skipped unless `--include-expired` is set. An indicator whose `valid_until` equals the clock is expired.
+
+The title comes from `--title`, or from the indicator name when one indicator contributes, or from `Indicators: <category> (<n>)`. The description is built from the indicator names and descriptions and capped at 1,000 characters. References are the external-reference URLs. MITRE ATT&CK kill-chain phases become `attack.<phase>` tags, with hyphens turned into underscores. The level is `high` only when every contributing indicator has confidence of at least 85. The rule id is a UUID v5 of the mapped logsource category and the indicator ids, so the same input yields the same id. `--date` sets the date. When it is omitted, the date is today (UTC), including for drafts from events. A `--date` that is not `YYYY-MM-DD` exits 3. `--observable` and `--include-expired` are rejected when `--from-stix` is absent.
+
+`--emit report` prints JSON with `rules`, `used`, and `skipped`. The command exits 0 when it emits a rule, 1 when the bundle parses and nothing is draftable, 2 when the input cannot be parsed, and 3 when the flags conflict, `--date` is not `YYYY-MM-DD`, or an observable kind is unknown. A bundle that repeats an object id is a parse failure. The parser reports `duplicate bundle object id`, and the command exits 2. It does not pick the newer copy.
+
+`rsigma-eval` adds `draft_rule_from_values`, `ValueDraftSpec`, and `ValueSelection`. The crate does not depend on `rstix`. `DraftError` gains `NoSelections`, `BadSelection`, and `EmptyTitle`.
+
+**Breaking.** Exhaustive matches on `DraftError` must handle the new variants.
+
+### pySigma 2.1.0 and dependency follow-up for #723 (#730)
+
+Rolls up the Dependabot PRs that opened after #723. The pySigma engine image moves to pySigma 2.1.0 (#728), with `requirements.txt` re-resolved for Python 3.13 against packages released on or before 2026-11-12, which also brings `jq` 1.13.0, `certifi` 2026.10.23, and `types-pyyaml` 6.0.12.20261111. The `test` backend still matches pySigma's output. CI: `taiki-e/install-action` v2.90.3, repinned by commit SHA (#729). Held back: the `python:3.15-slim` base image (#727), because `google-re2` publishes no Python 3.15 wheel and the slim image has no compiler to build it from source; `tikv-jemallocator` 0.7.0 (#425) remains excluded after the measured musl daemon throughput regression.
+
+### `cargo deny` accepts `ar_archive_writer`, and `psm` moves to 0.1.32 (#726)
+
+`psm` 0.1.28 and later build their assembly archive with `ar_archive_writer`, licensed `Apache-2.0 WITH LLVM-exception`, which `cargo deny` rejected because it matches license expressions literally. `deny.toml` now allows that license for `ar_archive_writer` alone, and `psm`, which every crate reaches through `pest`'s stack guard, moves from 0.1.27 to 0.1.32 in all three lockfiles. `ar_archive_writer` is a build dependency of `psm`, so nothing from it is linked into rsigma, and the LLVM exception only adds a permission to Apache-2.0.
+
+### VS Code extension declares VS Code 1.91 and packages again (#725)
+
+`npm run package` in `editors/vscode` failed because `@types/vscode` had moved past the `^1.75.0` engine requirement, which `vsce` refuses. `vscode-languageclient` 11 already needs VS Code 1.91, so `engines.vscode` is now `^1.91.0` and `@types/vscode` is pinned to `~1.91.0`, which also makes the compiler reject APIs newer than the declared minimum. Dependabot no longer proposes minor or major `@types/vscode` updates; raise it together with the engine. The editor docs state the 1.91 requirement.
+
+### Dependency updates, `async-nats` header panic fix, and Fibratus harness toolchain (#723)
+
+Rolls up the compatible Dependabot PRs (#700, #701, #702, #703, #704) plus the updates queued past the 7-day cooldown, with `Cargo.lock`, `fuzz/Cargo.lock`, `ci/wasm-smoke/Cargo.lock`, and `editors/vscode/package-lock.json` regenerated against current `main`. Security: `async-nats` 0.51 to 0.52 stops a `\r` in a received header value from panicking the connection task, which let any client allowed to publish on a subject the daemon consumes stop its NATS source. A header value with a line break now has each `\r` or `\n` replaced by a space. The Fibratus engine test harness, which never ships, moves `golang.org/x/net` to 0.62.0, `golang.org/x/crypto` to 0.59.0, `golang.org/x/text` to 0.44.0, `github.com/antchfx/xpath` to 1.3.9, and `github.com/yuin/goldmark` to 1.8.7, and pins `toolchain go1.26.11` so CI stops building it with Go 1.26.0. That clears the critical and high advisories `grype` and `govulncheck` reported in it. The pySigma engine image moves to pySigma 2.0.2 (#701), which replaces `diskcache` (GHSA-w8v5-vhqr-4h9v, unsafe pickle deserialization) with `diskcache-community`. Rust: `rusqlite` 0.41 to 0.42 with bundled SQLite 3.54.1, `jsonschema` 0.60 to 0.61.2, `toml` 1.2.1 (#704), `ureq` 3.5.2 (#703), `rmcp` 3.10.0, `rustls-webpki` 0.103.17, and `webpki-roots` 1.0.12, which removes the Buypass Class 2 and 3, Certigna, DigiCert Trusted Root G4, and QuoVadis Root CA 1 G3 and 3 G3 roots, so outbound HTTPS clients that use the bundled trust store no longer accept servers chaining to them. `jsonschema` 0.61 drops the duplicate `fancy-regex` 0.19 and `hashbrown` 0.16 copies. CI: `taiki-e/install-action` v2.90.1, `docker/login-action` v4.8.0, `github/codeql-action/upload-sarif` v4.39.3, `sigstore/cosign-installer` v4.1.3, and `zizmorcore/zizmor-action` v0.8.1, repinned by commit SHA (#702). VS Code: `@types/vscode` 1.146.0 (#700) and `@vscode/vsce` 4.1.1. Not taken because they are inside the cooldown: `async-nats` 0.53, `rusqlite` 0.43, `cel` 0.16, `rmcp` 3.11, and `@docmd/core` 0.10. Held back: `testcontainers` 0.28.0 waits for a `testcontainers-modules` release that accepts it; `reqwest` 0.13 changes the trust store of the outbound HTTP clients and needs its own change; `tikv-jemallocator` 0.7.0 (#425) remains excluded after the measured musl daemon throughput regression. None of them has a known vulnerability.
+
+### Fuzz crate builds again and is checked on every PR (#724)
+
+`fuzz_ocsf_sidecar` stopped compiling when `RuleHeader` gained its `ruleset` field (#712), which broke the weekly fuzz workflow. The target sets the field again, and the CI `Check` job now runs `cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked`, so a change that breaks a fuzz target fails its own PR instead of the next scheduled run.
+
+### STIX indicator sources (#722)
+
+A dynamic source can turn STIX 2.1 indicators into a value the daemon already knows how to use. `type: taxii` polls a TAXII 2.1 collection. `format: stix` on a file or HTTP source reads a STIX bundle. Both need the `stix-source` feature. Without it, the daemon exits 3 and names the feature.
+
+The value is a JSON object. Every observable kind named in `stix.observables` is present, as a sorted array, empty when nothing matched, so `${source.ti.ipv4}` does not dangle. Array values escape `\`, `*`, and `?`, so a Sigma `|expand` comparison stays exact. `indicators` maps each raw value to at most 16 metadata objects, ordered by confidence descending and then by id. An indicator is kept when its pattern type is `stix`, it is not revoked, `valid_from` is not after the resolve time, `valid_until` is unset or still ahead, confidence is unset or at least `min_confidence`, the pattern is a simple comparison, and at least one comparison is a configured observable. An indicator whose comparisons are all unmapped does not take a `max_indicators` slot. Versions of the same id keep the greatest `modified`. A newer revoked version removes the indicator. Indicators expire at the first refresh after `valid_until`, so the refresh interval is the expiry granularity.
+
+A TAXII source polls indicators of spec version 2.1. The first poll reads from the start of the collection. Later polls ask for objects added after the last page's `X-TAXII-Date-Added-Last`. One poll reads at most `max_indicators` plus one page of objects. When the server still has more, that poll keeps what it applied, logs a warning, and the next refresh continues from one microsecond before the last page's added-date, so objects that share that date are read again instead of skipped. A collection larger than one poll therefore loads across refreshes, and with `refresh: once` only the first poll's objects load. A poll fails when a budget stop cannot move the cursor (the last page has no added-date, or one added-date covers more objects than the budget), when a page does not advance the cursor, or when HTTP 416 recovery would repeat the same filter. A failed poll keeps the pages it applied and leaves the cursor and the previous value in place, so `on_error: use_cached` keeps serving it and the next poll reads those pages again. The cursor is not saved across a restart. The process keeps the indicators that are in the value. Indicators that lose the cap stay while the retained set is under twice `max_indicators`, so a freed slot can be filled from them; past that bound they are dropped until a restart reads the collection again. Not-yet-valid indicators use the room left under that bound. Revoked and expired ids are remembered only as a `modified` time, capped with `max_indicators`, so an older copy cannot return and the set does not grow with feed churn. Skip counters count an indicator when that resolve leaves it out, and they do not count it again while it stays out. The client uses the daemon egress policy, does not follow redirects, and does not use a proxy. Credentials are the names of environment variables, read when the resolver is built. A missing variable is a startup error that names the variable.
+
+`Pattern::simple_observables` extracts the values. TAXII envelope parsing enforces the same depth, string, and object-count limits as bundle parsing. `PollBudget` is non-exhaustive and is built with `PollBudget::new` or `PollBudget::for_indicators`. `TaxiiClient::poll_object_pages` delivers each page and returns when the budget is reached. `TaxiiClient::poll_objects` collects those pages and returns `PollBudgetExceeded` at that stop, because it cannot resume. `TaxiiTimestamp::adjust_micros` shifts a timestamp by microseconds.
+
+**Breaking changes.** Code that matches on `SourceType` or `DataFormat` exhaustively must handle `Taxii` and `Stix`. `SourceType::File` and `SourceType::Http` gain a `stix` field: set it to `None` when the source is not `format: stix`. A TAXII envelope that exceeds the parse limits now fails instead of being parsed.
+
+### LynxDB output rejects unsafe field names and expands template placeholders once (security, #719)
+
+The LynxDB backend rendered field names verbatim, so a field name such as `Image=* OR CommandLine` rewrote the logic of the generated `search` or `where` stage. It also substituted `{rule.title}`, `{rule.id}`, and pipeline state keys into the finished query after the detection was rendered, so a field name or regex value of `{rule.title}` was replaced by the raw title, which could close a quoted string and append pipeline stages such as `| stats count by host` ([GHSA-f96v-37xh-p653](https://github.com/timescale/rsigma/security/advisories/GHSA-f96v-37xh-p653)).
+
+- A field name must start with a letter or `_` and contain only letters, digits, `_`, `.`, `:`, and `-`. LynxDB has no quoted identifier syntax, so any other field name fails conversion with `invalid LynxDB field name`. Every field name in the SigmaHQ rule set already fits.
+- Query template placeholders are substituted in a single pass with `render_query_template`, so placeholder text inside a rule's values stays literal. Pipeline state still takes precedence over the default `index`.
+
+**Breaking changes.** A rule or pipeline that maps a field to a name outside LynxDB identifier syntax now fails to convert for LynxDB. Such a name did not convert to a working query before.
+
+### PostgreSQL output escapes quotes in field names and expands template placeholders once (security, #718)
+
+The PostgreSQL backend wrapped mixed-case field names in double quotes without doubling a `"` inside the name, so a Sigma rule with a field name such as `CommandLine" OR 1=1; --` broke out of the identifier and added its own SQL. The backend also substituted `{rule.title}` and `{rule.id}` into the finished query after the detection was rendered, so a string value of `{rule.title}` was replaced by the raw title, and a single quote in the title closed the string literal, in JSONB mode as well ([GHSA-799c-444p-fhj7](https://github.com/timescale/rsigma/security/advisories/GHSA-799c-444p-fhj7)).
+
+- A `"` inside a quoted field name is doubled (`"a""b"`). This covers detection fields, `fields:` projections, and correlation `group-by` and aggregate fields in every output format.
+- Query template placeholders are substituted in a single pass, so placeholder text inside a rule's values stays literal.
+- In a `query_expression_placeholders` template, `{rule.title}` and `{rule.id}` render with single quotes doubled, for use inside a string literal.
+- `rsigma-convert` adds `render_query_template`, which substitutes `{name}` placeholders in one pass. `text_finish_query` uses it, so backends built on it no longer expand placeholder text that appears in a rule's values.
+
+No breaking changes.
+
+### Watchlist sources and rebuilds on source change (#716)
+
+A dynamic source with `type: watchlist` holds indicators pushed over the daemon HTTP API. Nothing is fetched. `POST`, `PUT`, and `DELETE /api/v1/sources/{source_id}/indicators` add, replace, and delete values, and `GET` lists the unexpired ones. Each value is compared exactly, after surrounding whitespace is removed. An empty value, a value longer than `max_value_length` (default 2048 bytes), or a value containing an ASCII control character is rejected. Expiry comes from the item's `expires_at`, then the item's `ttl`, then the request `ttl`, then the source `default_ttl`. When none of those is set, the indicator stays until it is deleted. A sweeper drops expired indicators about every 10 seconds.
+
+A successful change asks the daemon to rebuild rules from the cached source values. The HTTP response returns before that rebuild finishes. The same rebuild runs when any referenced source, not only a watchlist, gets a new value, so a file or HTTP refresh updates the rules that name it without a full reload. A result that arrives while another is still queued is not dropped: every referenced cache value is compared with the value the running rules compiled. A failed rebuild keeps the previous rules. An empty placeholder expansion matches nothing. A list written as `Field: []` in a rule is unchanged. Placeholder expansion still stops at 4096 combinations. A watchlist that a pipeline references is capped at that many indicators, and a push past the cap returns 422 and changes nothing. A watchlist that no pipeline references keeps `max_indicators`, which is how a `lookup` enricher holds a larger set. A successful reload or rebuild computes that cap again, so a pipeline edit that starts or stops referencing the watchlist changes it.
+
+With `--state-db`, indicators are written through before the response. Writes to the indicator API are serialized, and a failed write rolls back only the source it changed, so another request's accepted indicators stay. The response is 500. A restart loads unexpired rows, leaves out rows past the source cap and logs how many, and deletes expired ones. The rows left out stay in the database until a later write replaces the set. Rows whose source is no longer a declared watchlist stay in the database and are not loaded. `--clear-state` deletes the table. Without `--state-db`, the set lives in memory only.
+
+`POST`, `PUT`, and `DELETE` require `sources:write` and are audited. `GET` requires `sources:read` and is not audited. `DELETE` carries a JSON body. The audit trail records a SHA-256 digest of that body and does not store the body itself. A request may carry at most 10,000 indicators and 4 MiB. When the audit trail is enabled, a body larger than `daemon.api.audit.max_body_bytes` (default 64 KiB) is rejected with 413 before the handler runs. `max_indicators` (default 100,000) caps the stored set. An `expires_at` that is not later than the current time is rejected. `refresh`, `format`, `extract`, and `timeout` are rejected on a watchlist, and the ids `resolve` and `cache` are reserved.
+
+**Breaking changes.** Rules that reference a dynamic source now change when that source's value changes, without `POST /api/v1/reload`. Code that matches on `SourceType` exhaustively must handle the `Watchlist` variant.
+
+### Conversion manifest (#717)
+
+`rsigma.yaml` gains a `convert:` section. It holds `defaults` and named `groups`; a group sets `ruleset`, `target`, `format`, `pipelines`, `options` (the `-O key=value` equivalents), `skip_unsupported`, `without_pipeline`, `output`, and an opaque `metadata` map. Group fields override the defaults field by field, `options` merge per key, and groups replace wholesale across config layers. Pipelines come only from the group or the defaults, never from the ruleset. Groups are file-only; `RSIGMA_CONVERT__DEFAULTS__*` works, but `convert.groups.*` is ignored.
+
+`rsigma backend build` runs every group, or the groups named with repeatable `--group`, in name order. For each group it writes the queries to `output` and a manifest to `<output>.manifest.json`. The manifest records the group, ruleset, target, format, pipelines, output, generator, query count, one entry per detection or correlation document with its canonical hash and conversion status (`converted`, `skipped`, `failed`, or `no_query` when the backend returned nothing of its own for the rule), and the group's `metadata` copied verbatim. A failed group does not stop the others: the command exits `2` when any rule failed to convert without `skip_unsupported`, `3` for configuration errors, and `1` for drift under `--check`, which writes nothing. A pipeline that fails to load fails only its group, and groups whose output or manifest paths collide are rejected before anything is written. Delegated targets materialize the resolved ruleset before sigma-cli runs, pass their pipeline names to sigma-cli untouched, and omit per-rule status from the manifest.
+
+`config validate` reports configuration errors as `semantic_errors` entries with a dotted config `path` and a `message`, and covers the `convert` section: group names, ruleset references, the fields a group needs after defaults, and groups that write the same files. `config show --for convert` and the `RSIGMA_CONVERT__DEFAULTS__*` environment layer are supported.
+
+No breaking changes.
+
+### Several rulesets side by side (#715)
+
+`rsigma-eval` adds `RulesetEngines`, a fan-out over independent named rulesets. Each `RulesetUnit` owns its compiled engine, pipelines, and correlation state; results carry the ruleset name, `when` bindings route by classified schema, and skipped events and routing outcomes are counted per unit. Classification runs once per event, and only when a unit has a `when` binding. `skipped_totals` reads the skip counts and `take_skipped` drains them. `CorrelationSnapshot` carries a per-ruleset map, with `has_collection_state` and `window_entries` helpers. A single-engine snapshot imports into a fan-out with one unit and a one-ruleset snapshot imports into a `CorrelationEngine`; any other layout mismatch fails the import instead of dropping state silently. `RuleFieldSet::extend` unions field sets, and `RuleHeader` gains an optional `ruleset` name. `UnitEngine` and `RulesetEnginesError` are `#[non_exhaustive]`.
+
+`engine eval` takes a repeatable `--ruleset`, and `eval.rulesets` configures several entries with optional `when` schema bindings. Results in ruleset mode carry `ruleset`, table, CSV, and TSV output gain a leading `RULESET` column, `--stats` reports per-ruleset matches and skipped events, and `--dump-correlation-state` prints a map keyed by ruleset name. A CLI `--ruleset` list replaces the configured list and carries no `when`; `--schema-routing` is allowed with exactly one ruleset and no ruleset pipelines. An empty `eval.rulesets` list counts as unset. `config validate` reports undefined or duplicate names, unknown entry and `when` keys, and conflicting rule selections in `eval` and `daemon`. OCSF findings from a named ruleset carry `unmapped.ruleset`.
+
+MCP `evaluate_events` accepts a `rulesets` list, stamps results with the ruleset name, and returns a per-ruleset matches summary. An empty list, a duplicate name, or more names than the server defines is rejected before any ruleset is resolved. MCP has no `when` bindings.
+
+`engine daemon` accepts `--ruleset` and `daemon.rulesets`, loading several rulesets with per-ruleset pipelines and correlation state. Rule, overlay, and pipeline files hot-reload, dynamic pipeline sources resolve as in path mode, and parse errors follow the same rules as path mode (a ruleset whose rules all fail to parse, or any parse error under `--strict-rules`, keeps the old engine). The ruleset list itself is startup-only. The daemon now also watches a bare rule file name such as `rules.yml` through the working directory. `/api/v1/status` and `/api/v1/rules` gain per-ruleset rule counts, `rsigma engine status` renders them, and the daemon exports `rsigma_ruleset_rules_loaded`, `rsigma_ruleset_matches_total`, and `rsigma_ruleset_events_skipped_total`. `rsigma-runtime` exposes `RuntimeEngine::with_rulesets`, `RuntimeEngine::take_ruleset_skipped`, `RuleSource`, `RulesetBinding`, `PipelineRef`, `load_pipelines`, and `watch_paths(source, pipeline_paths)`.
+
+Breaking changes: `RuleHeader` gains a public `ruleset` field, so struct literals must add `ruleset: None`. `CorrelationSnapshot` gains a public `rulesets` map, `CorrelationInfo` and `GroupStateInfo` gain an optional `ruleset` field, and the MCP `EvaluateInput` gains a public `rulesets` field; struct literals must add the corresponding defaults. `MetricsHook` gains four methods with no-op defaults. Path-mode output and existing daemon behavior are unchanged.
+
+### Rulesets (#712)
+
+A `rulesets:` section in `rsigma.yaml` declares named curations of Sigma rules. Each ruleset lists source files or directories, selectors that include or exclude candidates by id, name, title, tags, level, status, kind, logsource, or path, and a dependency policy for correlation references. `dependencies: include` pulls a referenced rule back in, while `drop` removes a correlation whose references are not kept and warns. Metadata overlays can set or append level, status, description, author, tags, references, false positives, fields, and custom attributes without editing the vendor files. Overlays validate exemplars and ADS attributes after application, so an overlay can add `rsigma.exemplars` for a vendored rule and `rule test` replays them. An overlay cannot set a standard Sigma or engine key through `custom_attributes`, and an empty `set` or `append` is rejected.
+
+The `rsigma ruleset` command group lists and shows declared rulesets, materializes one into canonical YAML with a deterministic `ruleset.lock.json` whose digests do not depend on line endings, and compares a resolved ruleset with that lockfile. `ruleset build --check` gates committed build output, and `ruleset diff --fail-on-change` gates selector and overlay changes. The build output loads directly with `engine eval --rules` or `engine daemon --rules`.
+
+`engine eval`, `engine explain`, `rule validate`, `rule fields`, `rule tune`, `rule doc`, `rule test`, `rule backtest`, `rule coverage`, `rule visibility`, `rule hygiene`, `backend convert`, `pipeline diff`, and `hunt run` accept `--ruleset <NAME>`, with a new `--config` flag where one was missing. `eval.ruleset`, `backtest.ruleset`, `coverage.ruleset`, and `hygiene.ruleset` supply the same selection from the configuration. Commands that take pipelines use an explicit `-p` first, then the ruleset's pipelines, then the section's configured pipelines; `pipeline diff`, `backend convert`, and `hunt run` never use a ruleset's pipelines. `rule lint` and `rule fmt` stay on raw files.
+
+The MCP tools `validate_rules`, `evaluate_events`, `list_fields`, `convert_rules`, and `test_exemplars` accept a `ruleset` input alongside `yaml` and `path`, resolving it from the server's configuration and confining every source, overlay, and pipeline file to `--rules-dir` when one is set.
+
+`rsigma-parser` gains a public `ruleset` module with `resolve_ruleset`, `resolve_loaded`, `load_sources`, `validate_spec`, and the spec, selector, overlay, and decision types, plus `emit_correlation_yaml` and `emit_filter_yaml`. `RulesetError` and `Decision` are `#[non_exhaustive]`. The `schema` feature derives `schemars::JsonSchema` for the ruleset types. `RsigmaMcp::with_rulesets` hands the MCP server its rulesets. `emit_rule_yaml` now writes a detection's `timeframe`, which it previously dropped.
+
+`rsigma-cli` now depends on `sha2` unconditionally, so a `--no-default-features` build includes it.
+
+The detection-loop, architecture, and crate dependency diagrams show `ruleset build` and the `ruleset` command group.
+
+### OCSF finding output depth (#711)
+
+`engine eval` accepts `--finding-format native|ocsf` and `--ocsf-version`, and `rule backtest` accepts `--findings`, `--finding-format`, and `--ocsf-version` (CLI `ocsf` feature, implied by `daemon`). On eval, OCSF composes with JSON or NDJSON output; `table`, `csv`, and `tsv` are a config error. Backtest writes OCSF findings only to `--findings` and keeps the report on stdout in the selected `--output-format`.
+
+Class 2004 findings always set `metadata.profiles` to `security_control`, and append `host` when an `actor` is present. Dedup summaries use `finding_info.uid` `dedup-<fingerprint>-<first_seen>` and lift the window onto `count`, `start_time`, and `end_time`. Risk events set `finding_info.types` to `Risk Event`. A detection whose enrichments carry `incident_id` sets `metadata.correlation_uid` to that id.
+
+Line sinks accept `?format=ocsf` with optional `?ocsf_version=1.1.0|1.3.0` (default `1.1.0`), optional `?ocsf_incident_class=2004|2005` (default `2004`), and `?ocsf_assignee_group=<name>`, which is required when the class is 2005 and rejected otherwise. Class 2005 incidents list contributing Detection Finding uids minted before the alert pipeline runs. `incident_finding_2005`, `risk_incident_finding_2005`, their `*_opts` and `*_with_opts` variants, and the `*_in_class` functions return `Result` and refuse to emit a class-2005 finding that has no assignee group. OTLP sinks accept `format=ocsf`, keep the native log attributes (`rule_title`, `rule_id`, `level`, `tags`), and put the finding JSON string in the log-record body. Webhook bodies may use `${detection.ocsf}` and `${correlation.ocsf}` as whole JSON values, and an optional `ocsf_version` field selects `1.1.0` or `1.3.0`.
+
+**Breaking:** `TickOutput` and `RiskOutput` gain `finding_links`, index-aligned with `incidents`. A struct literal must add the field: use `Vec::new()` when the caller does not track finding uids, or the links returned with the tick or risk result when it does. Those uids are not part of the incident JSON.
+
+See [OCSF Findings](https://rsigma.io/guide/ocsf-findings/) and [Output formats](https://rsigma.io/reference/output/).
+
+### Documentation home page redesign, flat anchor aliases, and fragment validation (#710)
+
+The `rsigma.io` home page opens with a split hero, a tabbed quick-run snippet (`Evaluate`, `Daemon`, `Convert`, `Rust`), a tabbed install bar, a four-card benchmark strip, the detection-loop diagram paired with workflow cards, grouped downstream integrations, and a minimal footer, with focus mode (`Alt+F`) enabled site-wide. The version-tag legend moves to [Release Notes](https://rsigma.io/release-notes/#version-tags).
+
+Because `docmd` prefixes nested heading IDs with ancestor slugs, `docmd-plugin-rsigma` now injects flat `<span id="..." class="docmd-anchor-alias">` anchors on unique H2-H4 headings so existing cross-links, changelog entries, and SVG diagram fragments resolve directly without breaking TOC highlighting, and `onPostBuild` validates every internal HTML and SVG `#fragment` link at build time. The Sigma v2.1.0 specification links across the docs and READMEs are pinned to the exact `v2.1.0` commit, `assets/architecture.svg` updates three mismatched fragments, and the getting-started, Neovim, privacy, and WASM ABI pages add missing feature flags, CLI groups, and cross-links.
+
+### DNS enricher (#708)
+
+`rsigma-runtime` adds a `type: dns` enricher that resolves forward and reverse DNS queries for an event-supplied value and injects the answers under `enrichments.<field>`. The `record_type` value selects the query: the pseudo-type `IP` runs an A and an AAAA query and merges them, and the data types `A`, `AAAA`, `ANAME`, `CAA`, `CERT`, `CNAME`, `CSYNC`, `HINFO`, `HTTPS`, `MX`, `NAPTR`, `NS`, `OPENPGPKEY`, `PTR`, `SMIMEA`, `SOA`, `SRV`, `SSHFP`, `SVCB`, `TLSA`, and `TXT` are supported. `PTR` requires an IP address in `key`, and every other type rejects one. The injected value is a JSON array of presentation-format strings filtered to the queried type, with the trailing root dot stripped from the record types whose text ends in a domain name, TXT character-strings joined the way SPF and DKIM consumers expect, and duplicates removed. `extract` and `extract_type` apply to the array.
+
+Answers and negative answers are cached in hickory's response cache. Record TTLs are capped by `cache_ttl` (default 5m), and NXDOMAIN and NODATA answers are cached for the SOA negative TTL capped by `negative_cache_ttl` (default 1m). Transient errors such as timeouts and SERVFAIL are never cached, and setting both TTLs to `0s` disables the cache. `cache_max_entries` (default 10000) bounds the cache. `nameservers` takes `IP` or `IP:port` entries and falls back to the system resolver when empty. A miss injects `default` when it is set and otherwise reports a miss, and `on_error` applies to timeouts and resolver errors.
+
+The daemon exposes `rsigma_enrichment_dns_cache_hits_total`, `rsigma_enrichment_dns_cache_misses_total`, and `rsigma_enrichment_dns_queries_total{result}`, so operators can watch cache effectiveness and resolver health. The enricher is gated behind the `dns-enrich` feature in `rsigma-runtime` and the CLI, and is included in the prebuilt binaries and the Docker image.
+
+The library surface adds `DnsEnricher`, `DnsRecordType`, `DnsResolverConfig`, and `SUPPORTED_DNS_RECORD_TYPES`, plus four `MetricsHook` methods for cache hits, cache misses, query results, and label pre-registration.
+
+Breaking changes: `EnricherConfig` has four new public fields, so code that builds it with a struct literal must add `record_type: None`, `nameservers: Vec::new()`, `negative_cache_ttl: None`, and `cache_max_entries: None`. YAML configs are unaffected.
+
+See [Enrichers](https://rsigma.io/guide/enrichers/#dns-dns-lookup) and [Prometheus metrics](https://rsigma.io/reference/metrics/).
+
+### The rsigma agent skill covers schema pipelines, hunting, and rule set review (#707)
+
+The `skills/rsigma` skill now tells agents to pass a canonicalizing pipeline with `-p` for ECS, Splunk CIM, OCSF, CrowdStrike Falcon, and Google SecOps UDM events, and notes that the path-only pipelines ship in the repository rather than in release binaries. It adds the `hunt` and `taxii` groups, `engine incidents`, and the `rule` review commands (`coverage`, `scorecard`, `visibility`, `hygiene`, `doc`), and lists the features each command needs. It also covers the bounded API silences, `--strict-rules` and the `rsigma_rule_parse_errors` gauge, and the daemon enrichers, including `mmdb`.
+
+### UDM canonicalizing pipeline (#705)
+
+Adds path-only `udm_events.yml` for Google SecOps UDM-shaped eval input (Chronicle / Bindplane-style nested JSON). Maps the portable five Sigma categories with `metadata.event_type` gates.
+
+### Native MMDB enricher (#706)
+
+`rsigma-runtime` adds a `type: mmdb` enricher that looks up an IP address in an operator-supplied MaxMind DB file and injects the decoded record under `enrichments.<field>`. Any MMDB layout works (GeoLite2 and GeoIP2 City or ASN, IP2Location, IP2Proxy, and databases you build yourself) because records are decoded generically into JSON, and an optional `fields:` map projects values through dotted paths where numeric segments are array indexes. Entries that name the same `db_path` share one loaded reader, for both detection and correlation kinds.
+
+The database is checked for replacement about once a minute. A changed file is reopened and swapped in off the hot path, and the previous reader stays active if the reopen fails. Replace databases atomically; a single-file bind mount pins the original inode, so mount the containing directory instead. `default` covers a miss or an empty projection, and `on_error` covers key and decode errors.
+
+The daemon exposes `rsigma_enrichment_mmdb_hits_total`, `rsigma_enrichment_mmdb_misses_total`, `rsigma_enrichment_mmdb_reloads_total`, and `rsigma_enrichment_mmdb_build_epoch_seconds`, so operators can alert on a stale database and watch the miss-to-hit ratio. The enricher is gated behind the `mmdb-enrich` feature in `rsigma-runtime` and the CLI, and is included in the prebuilt binaries and the Docker image.
+
+The library surface adds `MmdbEnricher`, `MmdbDatabase`, `MmdbFields`, and `MmdbLookupError`, six `MetricsHook` methods for hits, misses, reloads, build epoch, and label pre-registration, and an `EnrichersConfigError::Database` variant for a database that fails to open at config load.
+
+Breaking changes: `EnrichersConfigError` is not `#[non_exhaustive]`, so an exhaustive `match` on it needs an arm for `Database`. `EnricherConfig` has three new public fields, so code that builds it with a struct literal must add `db_path: None`, `key: None`, and `fields: BTreeMap::new()`. YAML configs are unaffected.
+
+See [Enrichers](https://rsigma.io/guide/enrichers/#mmdb-local-mmdb-lookup) and [Prometheus metrics](https://rsigma.io/reference/metrics/).
+
+## [0.27.0] - 2026-11-12
+
+**TL;DR**
+RSigma v0.27.0 adds `rsigma rule fmt`, a Sigma formatter that keeps comments, adds canonicalizing pipelines for ECS Linux, Splunk CIM, OCSF, and CrowdStrike Falcon, and closes security gaps in project config files, MCP HTTP, API silences, and the egress policy.
+* Formatter: `rsigma rule fmt` rewrites rules, correlations, filters, and action-chain fragments into one canonical layout, keeps comments, anchors, and tags, and refuses any rewrite that would change the parsed document. `--check`, `--diff`, `--write`, and `--stdout` cover CI, review, and editor use. The MCP server exposes it as `format_rules`, the LSP advertises document and range formatting, and `rsigma-parser` exposes `format_yaml` behind the default `fmt` feature (#673).
+* Pipelines: `-p ecs_linux` is a new builtin for ECS-shaped Linux events, and the path-only `cim_events.yml`, `ocsf_events.yml`, and `falcon_windows.yml` rewrite rules for Splunk CIM, live OCSF JSON, and Falcon Windows sensor events (#674, #675, thanks to @SecurityEnthusiast).
+* Security: a `./rsigma.yaml` or `.rsigmarc` in a cloned repository can no longer open MCP server gates or configure daemon sources, enrichers, sinks, or API access (#655, #656). MCP HTTP requires a token off loopback and validates `Origin` (#659). API silences are bounded in duration and scope (#658). The egress policy covers IP-literal URLs, redirects, IPv6 forms of IPv4 addresses, and more cloud metadata addresses (#654). MCP `evaluate_events` refuses `${ENV_VAR}` in template enrichers (#653), delegated `convert_rules` no longer follows symlinks out of the rules root (#657), and the VS Code extension ignores `rsigma.serverPath` in workspace settings (#651).
+* Dependencies: `rmcp` 3.9.0 for RUSTSEC-2026-0462 (#696), `minimatch` 11.0.3 in the VS Code extension for GHSA-g3hv-75wg-m249 along with the Dependabot roll-up (#672), and `yamlpath` and `yamlpatch` 1.32.0 (#697). The MSRV moves to Rust 1.97.1 (#695).
+* Breaking: `mcp serve --http` on a non-loopback address refuses to start without `--auth-token` or `--allow-unauthenticated` (#659). Protected `mcp.*` and `daemon.*` keys in project config files are ignored, and jq filters lose the `env` builtin (#655, #656). API silences need `ends_at` and a scoped `=` matcher, and `POST /api/v1/silences` returns `409` without an alert pipeline (#658). In the libraries, `rsigma-mcp`'s `http_router_with` and `serve_http_with` take `HttpOptions` (#659), `AlertPipeline::new` takes `SilenceLimits` (#658), and the `rsigma-parser` emitter quotes and orders its output differently (#673). See the migration notes in the entries below.
+* Docs and CI: every docs page has a meta description and link preview (#676), breadcrumb structured data passes Google validation (#677), the dynamic sources and canonicalizing pipelines references describe current behavior directly (#691, #692, #694), docs-only PRs skip the build and test jobs behind one `CI result` check (#669), and CI runs for merge queues and stacked PRs (#652).
+
+### YAML edit dependencies 1.32.0 (#697)
+
+The rule formatter and fixer move from `yamlpath` 1.27.0 and `yamlpatch` 1.26.1 to 1.32.0, now that their `tree-sitter-iter` dependency is compatible with the workspace MSRV. The parser and fuzz harness move their direct `tree-sitter` dependency from 0.26 to the required 0.27 release.
+
+### Bound MCP client response bodies (#696)
+
+`rmcp` moves from 3.8.0 to 3.9.0 to resolve RUSTSEC-2026-0462. Streamable HTTP clients now reject successful JSON response bodies larger than 16 MiB and error response bodies larger than 64 KiB instead of buffering unbounded data from a malicious or compromised MCP server.
+
+### Rust 1.97.1 MSRV (#695)
+
+The workspace MSRV and the compiler pinned for local development, CI, release binaries, crates.io publishing, performance runs, backend engine tests, and the Docker builder move from Rust 1.96.0 to 1.97.1. Fuzzing remains on its separately pinned nightly toolchain. Formatter test patterns follow the new Clippy guidance.
+
+### User-facing docs state current behavior directly (#694)
+
+Processing-pipeline, testing, and `rstix` library pages now describe supported behavior and engineering constraints directly instead of framing them through the issues and pull requests that introduced them. Explicit design-decision sections retain their rationale while using product and specification language.
+
+### Canonicalizing pipelines reference (#692)
+
+The Canonicalizing Pipelines page now presents the shipped ECS, CIM, OCSF, and Falcon pipelines as product documentation instead of framing them around their tracking issue. It places the unreleased marker below the title, gives every pipeline an exact `-p` invocation, and separates supported categories, exclusions, and the three OCSF surfaces more clearly.
+
+### Dynamic source documentation separates reusable sources from consumers (#691)
+
+The Dynamic Sources reference now documents source declarations, fetch types, refresh, errors, and limits independently of their consumers. A new Dynamic Pipelines reference covers `${source.*}`, `vars:`, and `include:` binding, while the Enrichers guide makes clear that `lookup` enrichers can consume the same shared source cache without a pipeline. Navigation, API, metrics, security, CLI, and library pages use the same consumer-neutral terminology.
+
+### Canonicalizing pipelines for ECS Linux, Splunk CIM, OCSF, and CrowdStrike Falcon (#674, #675)
+
+Canonicalizing pipelines rewrite Sigma rule field names to match the schema of the indexed events, and run only when selected with `-p`. Each new pipeline covers the portable categories `process_creation`, `network_connection`, `file_event`, `image_load`, and `dns_query`.
+
+- **ECS Linux:** `-p ecs_linux` is a new builtin that maps Sysmon-style Sigma fields to ECS for `product: linux` rules, matching the corresponding `ecs_windows` blocks. Use it with Filebeat, Elastic Agent, or other Linux shippers that emit ECS JSON.
+- **Splunk CIM:** `cim_events.yml` maps the same categories to Splunk CIM field names.
+- **OCSF:** `ocsf_events.yml` rewrites rules for OCSF JSON events on input. It is separate from the `?format=ocsf` sink output, which writes OCSF findings, and from the `ocsf_postgres.yml` conversion pipeline.
+- **CrowdStrike Falcon:** `falcon_windows.yml` covers Falcon Windows sensor JSON and gates each category on its `event_simpleName` values.
+
+The CIM, OCSF, and Falcon pipelines ship under `crates/rsigma-eval/pipelines/` and load by path, such as `-p crates/rsigma-eval/pipelines/cim_events.yml`. The builtins are now `ecs_windows`, `ecs_linux`, `fibratus_windows`, and `sysmon`, which the MCP `list_builtin_pipelines` and `resolve_pipeline` tools list too, and `gcp_audit.yml` stays path-only. Windows-only categories on non-ECS targets, Falcon macOS and Linux events, and `NetworkConnectIP6` are out of scope. See [Canonicalizing Pipelines](https://rsigma.io/reference/canonicalizing-pipelines/) for the scope and [Builtin Pipelines](https://rsigma.io/reference/builtin-pipelines/) for the field maps.
+
 ### Docs site breadcrumb structured data passes Google validation (#677)
 
 Google Search Console rejected the breadcrumb structured data on most rsigma.io pages with `Missing field "item"`. docmd builds the trail from the sidebar, so a navigation group without a page of its own, such as Reference, rule, or Deploy and Detect, became a breadcrumb entry with no URL. The docs plugin now drops those entries and renumbers the rest, so every entry links to a page. The visible sidebar and breadcrumbs are unchanged.
@@ -13,10 +281,6 @@ Google Search Console rejected the breadcrumb structured data on most rsigma.io 
 Every page on rsigma.io now has a written meta description in its frontmatter, so search results, link previews, and `llms.txt` show a summary of the page instead of an empty description. The docs plugin fails the build when a page has no description or one over 160 characters. The home page title and heading now read "RSigma: Sigma Detection Engineering Toolkit in Rust" instead of "Welcome to RSigma's documentation!".
 
 The RSigma social banner, which now lists the formatter among the capabilities, is committed as `assets/social-banner.png`, and every page references it through `og:image` and `twitter:image`, with its size and alt text. The docs plugin also adds `og:site_name`, a schema.org `SoftwareApplication` description of RSigma on the home page with the version and license from `Cargo.toml`, and a `<lastmod>` to every sitemap entry from the last commit to the page's source, or to the root file it inlines, such as `CHANGELOG.md` for the release notes. The home page no longer declares a structured-data search URL, because the site search does not read a query from the URL.
-
-### Path-only `ecs_linux` pipeline for ECS-shaped Linux events (#674)
-
-Adds [`crates/rsigma-eval/pipelines/ecs_linux.yml`](crates/rsigma-eval/pipelines/ecs_linux.yml): load with `-p crates/rsigma-eval/pipelines/ecs_linux.yml` (not a builtin short name). Maps Sysmon-style Sigma fields to ECS for `product: linux` in `process_creation`, `network_connection`, `image_load`, `file_event`, and `dns_query`, matching the corresponding `ecs_windows` blocks. Integration tests in `crates/rsigma-eval/tests/ecs_linux_pipeline.rs` pin synthetic ECS events for each category; [Builtin Pipelines](docs/content/reference/builtin-pipelines.md) includes the full field map, [Processing Pipelines](docs/content/guide/processing-pipelines.md) documents path-only use, and [`crates/rsigma-eval/README.md`](crates/rsigma-eval/README.md) links the file. Issue: [#330](https://github.com/timescale/rsigma/issues/330).
 
 ### `rsigma rule fmt` formats Sigma rules and keeps their comments (#673)
 
@@ -128,6 +392,8 @@ A `template` enricher passed to the MCP server's `evaluate_events` tool, inline 
 `rsigma.serverPath` is the program the extension starts, and it starts on opening any folder with a `.yml` or `.yaml` file. A repository could commit a `.vscode/settings.json` that pointed it at a script of its own, and a developer who opened and trusted that folder would run the script. The setting now has `machine` scope, so VS Code reads it only from user settings, or from remote settings in a remote window, and ignores it in a workspace or folder `.vscode/settings.json`.
 
 Migration: if you set `rsigma.serverPath` in a `.vscode/settings.json`, VS Code now ignores it and the extension starts `rsigma-lsp` from `$PATH`, or fails to start if it is not there. Move the value to your user settings, or to remote settings for Remote-SSH, WSL, and Dev Containers, where the path is on the remote host. Settings Sync does not carry `machine`-scoped values, so set a custom path on each machine.
+
+[v0.26.0...v0.27.0](https://github.com/timescale/rsigma/compare/v0.26.0...v0.27.0)
 
 ## [0.26.0] - 2026-11-02
 
@@ -3607,6 +3873,7 @@ First release of rsigma -- a Sigma detection toolkit in Rust. Ships a parser, ev
 
 Initial crates.io publish. Reserved the `rsigma` crate name with a minimal CLI binary (parser + evaluator only, no linter/LSP/pipelines/correlation). Superseded the same day by v0.2.0, which is the first feature-complete release.
 
+[0.27.0]: https://github.com/timescale/rsigma/releases/tag/v0.27.0
 [0.26.0]: https://github.com/timescale/rsigma/releases/tag/v0.26.0
 [0.25.0]: https://github.com/timescale/rsigma/releases/tag/v0.25.0
 [0.24.0]: https://github.com/timescale/rsigma/releases/tag/v0.24.0

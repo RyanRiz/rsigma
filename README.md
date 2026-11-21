@@ -12,7 +12,7 @@
     <a href="https://github.com/timescale/rsigma/actions/workflows/ci.yml"><img src="https://github.com/timescale/rsigma/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="https://rsigma.io"><img src="https://img.shields.io/badge/docs-website-blue" alt="Documentation" /></a>
     <a href="https://crates.io/crates/rsigma"><img src="https://img.shields.io/crates/v/rsigma.svg" alt="crates.io" /></a>
-    <a href="https://github.com/timescale/rsigma/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.96.0-blue" alt="MSRV" /></a>
+    <a href="https://github.com/timescale/rsigma/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.97.1-blue" alt="MSRV" /></a>
     <a href="https://ghcr.io/timescale/rsigma"><img src="https://img.shields.io/badge/ghcr.io-rsigma-blue?logo=docker" alt="Docker" /></a>
     <a href="https://github.com/timescale/rsigma/releases/latest"><img src="https://img.shields.io/github/v/release/timescale/rsigma" alt="GitHub Release" /></a>
     <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
@@ -57,6 +57,7 @@ Full documentation, including guides, CLI reference, and library API docs, lives
 ### Deploy
 
 * **[CI integration](https://rsigma.io/guide/ci-cd/):** Gates a rule repository in one pull-request check with the [`timescale/rsigma-action`](https://github.com/timescale/rsigma-action) GitHub Action, wrapping lint, validate, fields-drift diff, backtest, and coverage
+* **[Rulesets](https://rsigma.io/guide/rulesets/):** Curates vendored rules into named rulesets with selectors, dependency policies, and metadata overlays, then materializes a reproducible build with a lockfile for the daemon or CI
 * **[Configuration](https://rsigma.io/reference/configuration/):** Layers settings from YAML config files, environment variables, and CLI flags, managed with the `rsigma config` command group
 * **[Signed artifacts](https://rsigma.io/deployment/docker/):** Ships multi-arch Docker images with cosign signatures, SBOM, and SLSA Build L3 provenance, plus prebuilt binaries for Linux, macOS, and Windows
 
@@ -66,7 +67,9 @@ Full documentation, including guides, CLI reference, and library API docs, lives
 * **[Streaming daemon](https://rsigma.io/guide/streaming-detection/):** Runs as a long-lived detection daemon with hot-reload, Prometheus metrics, stdin/HTTP/NATS/OTLP/Unix-socket input, and async sinks (stdout, file, NATS, OTLP, webhook, Unix socket) with per-sink retry, DLQ, and a per-sink wire format (native NDJSON or [OCSF Detection Finding](https://rsigma.io/guide/ocsf-findings/) JSON)
 * **[Input formats](https://rsigma.io/guide/input-formats/):** Ingests JSON, syslog (RFC 3164/5424), logfmt, CEF, EVTX (Windows Event Log), plain text, and OTLP logs with format auto-detection
 * **[Processing pipelines](https://rsigma.io/guide/processing-pipelines/):** Maps fields and transforms rules with pySigma-compatible pipelines (transformations, conditions, finalizers)
-* **[Dynamic pipelines](https://rsigma.io/reference/dynamic-sources/):** Populates any pipeline value from external sources (HTTP, files, commands, NATS) with template expansion, auto-refresh, and extraction via jq, JSONPath, or CEL
+* **[Dynamic pipelines](https://rsigma.io/reference/dynamic-sources/):** Populates any pipeline value from external sources (HTTP, files, commands, NATS, TAXII, STIX bundles) with template expansion, auto-refresh, and extraction via jq, JSONPath, or CEL
+* **[STIX indicator sources](https://rsigma.io/guide/threat-intel-watchlists/#stix-indicator-sources):** Polls a TAXII 2.1 collection or reads a STIX bundle and expands the observables into a pipeline value (`stix-source`)
+* **[Draft from a STIX indicator](https://rsigma.io/cli/rule/draft/#draft-from-a-stix-indicator):** Drafts Sigma rules from a STIX 2.1 bundle or one indicator (`stix-draft`)
 * **[Schema recognition](https://rsigma.io/cli/engine/classify/):** Recognizes which schema each event uses (ECS, Sysmon, CEF, OCSF, or user-defined) with `engine classify`, watches a live daemon for unrecognized sources, and mines candidate signatures with `engine discover-schemas`
 * **[Schema routing](https://rsigma.io/guide/schema-routing/):** Builds one engine per pipeline set and dispatches each classified event to its engine, feeding a shared correlation store
 * **[Logsource routing](https://rsigma.io/guide/logsource-routing/):** Skips rules whose logsource conflicts with an event's declared `product`/`service`/`category`, so a mixed-product stream only pays for the rules that can match
@@ -79,7 +82,7 @@ Full documentation, including guides, CLI reference, and library API docs, lives
 
 ### Alert & Triage
 
-* **[Enrichment](https://rsigma.io/guide/enrichers/):** Injects context (asset info, IP reputation, identity, GeoIP, runbook URLs, ...) into detection and correlation results via `template`, `lookup`, `http`, and `command` primitives
+* **[Enrichment](https://rsigma.io/guide/enrichers/):** Injects context (asset info, IP reputation, identity, GeoIP, runbook URLs, ...) into detection and correlation results via `template`, `lookup`, `http`, `command`, `stix`, `mmdb`, and `dns` primitives
 * **[Risk-based alerting](https://rsigma.io/guide/risk-based-alerting/):** Scores each firing per entity (user, host, source IP) and raises a single incident when an entity's accumulated risk crosses a threshold
 * **[Alert pipeline](https://rsigma.io/guide/alert-pipeline/):** Silences, inhibits, and deduplicates results, then groups the survivors into incidents, modeled on Alertmanager
 * **[Webhook alerts](https://rsigma.io/guide/webhooks/):** Delivers detections to Slack, Teams, Discord, PagerDuty, or any HTTP endpoint with templated payloads, HMAC request signing, per-webhook retry, rate limiting, and DLQ
@@ -321,7 +324,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for full Criterion results across all subsyst
 ## Reference
 
 - [pySigma](https://github.com/SigmaHQ/pySigma): reference Python implementation
-- [Sigma Specification V2.1.0](https://github.com/SigmaHQ/sigma-specification): formal specification
+- [Sigma Specification V2.1.0](https://github.com/SigmaHQ/sigma-specification/tree/0c857d07da0e71eaaab2d667b3cce6f2c8469578/specification): formal specification
 - [sigma-rust](https://github.com/jopohl/sigma-rust): Pratt parsing approach
 - [sigmars](https://github.com/crowdalert/sigmars): correlation support patterns
 - [sigma_engine](https://github.com/SigmaHQ/sigma_engine): official SigmaHQ Rust library for parsing and matching Sigma rules against events

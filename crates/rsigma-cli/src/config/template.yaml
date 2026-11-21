@@ -26,6 +26,13 @@ global:
 daemon:
   # Path to a Sigma rule file or directory.
   rules: /etc/rsigma/rules
+  # Several named rulesets evaluated side by side, optionally schema-bound.
+  # Conflicts with `rules`; changing the list needs a restart.
+  # rulesets:
+  #   - vendor-windows
+  #   - name: cloud-audit
+  #     when:
+  #       schemas: [aws_cloudtrail]
   # Builtin pipeline names (ecs_windows, sysmon) or YAML file paths.
   pipelines: []
   # External dynamic-source files or directories (repeatable).
@@ -95,6 +102,9 @@ daemon:
   input:
     # Event source: stdin | http | nats://host:port/subject
     source: stdin
+    # How a stdin source ends: batch (exit at end of input with the batch
+    # result) | stream (keep running until a shutdown signal).
+    stdin_mode: batch
     # Log format: auto | json | syslog | plain | logfmt | cef
     format: auto
     # Default timezone offset for RFC 3164 syslog.
@@ -314,6 +324,15 @@ daemon:
 eval:
   # Default rules path for `rsigma engine eval`.
   # rules: ./rules
+  # Named ruleset from the `rulesets` section to evaluate instead of `rules`.
+  # ruleset: vendor-windows
+  # Several rulesets evaluated side by side, optionally bound to schemas.
+  # CLI `--ruleset` entries carry no `when`; use this list for bindings.
+  # rulesets:
+  #   - vendor-windows
+  #   - name: cloud-audit
+  #     when:
+  #       schemas: [aws_cloudtrail]
   # pipelines: [sysmon]
   input_format: auto
   syslog_tz: "+00:00"
@@ -322,6 +341,9 @@ eval:
   # Write results to a file instead of stdout (NDJSON unless --output-format is set).
   # output: ./detections.ndjson
   fail_on_detection: false
+  # Finding wire shape for each fire: native (default) or ocsf.
+  # finding_format: native
+  # ocsf_version: "1.1.0"
   # Schema routing for `engine eval` (see daemon.schema for details). `observe`
   # has no effect here; eval has no schema observer.
   schema:
@@ -354,6 +376,10 @@ backtest:
   syslog_tz: "+00:00"
   # Strip a leading UTF-8 BOM from RFC 5424 syslog messages. Set false to keep it.
   syslog_strip_bom: true
+  # One finding per fire. Must not collide with the corpus, report, or junit path.
+  # findings: ./findings.ndjson
+  # finding_format: native
+  # ocsf_version: "1.1.0"
 
 coverage:
   # Default rule file(s) or directory(ies) to map onto ATT&CK (repeatable).
@@ -460,3 +486,48 @@ mcp:
   # Register create_silence and post_disposition (`--allow-operate-writes`).
   # Off by default; requires daemon_url.
   # allow_operate_writes: false
+
+# Named rule sets: curated sources, selectors, dependency policy, overlays,
+# and pipelines. Pass `--ruleset <name>` in place of `--rules` to any
+# rule-loading command, set `ruleset:` in the eval, backtest, coverage, or
+# hygiene section, or build a deployable tree with
+# `rsigma ruleset build`. Sources and overlay paths resolve against the
+# working directory. Rulesets are file-only: the environment layer cannot set
+# them.
+# rulesets:
+#   vendor-windows:
+#     description: Vendored Windows process-creation detections.
+#     sources:
+#       - ./vendor/sigma/rules/windows
+#     include:
+#       - tags: ["attack.t1059*"]
+#     exclude:
+#       - status: [deprecated]
+#     overlays:
+#       - id: aaaaaaaa-0000-4000-8000-000000000001
+#         set:
+#           level: high
+#     pipelines: [sysmon]
+
+# Conversion groups for `rsigma backend build`. Each group names a ruleset
+# from the `rulesets` section and writes its converted queries plus a
+# `<output>.manifest.json` manifest. `defaults` fills fields a group leaves
+# unset; a group's `options` merge per key over the defaults. Pipelines come
+# only from this section, never from the ruleset. `metadata` is copied into
+# the manifest verbatim. Groups are file-only: the environment layer can set
+# `defaults` but not a group.
+# convert:
+#   defaults:
+#     format: default
+#     options:
+#       correlation_method: join
+#     skip_unsupported: false
+#   groups:
+#     linux_edge_lynxdb:
+#       ruleset: vendor-windows
+#       target: lynxdb
+#       pipelines: [sysmon]
+#       output: build/lynxdb/linux_edge.txt
+#       metadata:
+#         rule_group: linux
+#         time_window: 5m

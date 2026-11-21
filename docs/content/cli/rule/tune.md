@@ -11,8 +11,8 @@ Propose a verified Sigma filter rule from false-positive and true-positive exemp
 ## Synopsis
 
 ```text
-rsigma rule tune --rules <PATH> --fp <JSON|@PATH> --tp <JSON|@PATH> [OPTIONS]
-rsigma rule tune --rules <PATH> --from-dispositions <SPOOL_DIR> [OPTIONS]
+rsigma rule tune [--rules <PATH> | --ruleset <NAME>] --fp <JSON|@PATH> --tp <JSON|@PATH> [OPTIONS]
+rsigma rule tune [--rules <PATH> | --ruleset <NAME>] --from-dispositions <SPOOL_DIR> [OPTIONS]
 ```
 
 ## Description
@@ -23,12 +23,14 @@ The command verifies two invariants before printing anything. First, every suppl
 
 ## Inputs
 
-- `-r, --rules <PATH>`: Sigma rule file or directory.
+- `-r, --rules <PATH>`: Sigma rule file or directory. Conflicts with `--ruleset`.
+- `--ruleset <NAME>`: named ruleset from the configuration to tune instead of `--rules`. {{ added "unreleased" }}
+- `--config <PATH>`: rsigma config file. Overrides config-file discovery. {{ added "unreleased" }}
 - `--rule <ID|TITLE>`: target rule id, with exact-title fallback. Required for a ruleset containing more than one detection rule.
 - `--fp <JSON|@PATH>`: false-positive events as one inline JSON event or an NDJSON/EVTX file. When omitted, reads NDJSON from stdin. Conflicts with `--from-dispositions`.
 - `--tp <JSON|@PATH>`: required true-positive events as one inline JSON event or an NDJSON/EVTX file. Required unless `--from-dispositions` is set. Conflicts with `--from-dispositions`.
 - `--from-dispositions <SPOOL_DIR>`: read versioned capture bundles written by `engine daemon`. Derives each rule's FP and TP sets from provenance `matches`. Rejects unknown major versions, unsupported bundle kinds, and malformed documents with the file path. Errors when a rule has FP evidence and no TP protection set. Optional `--rule` narrows the run; otherwise every represented detection rule is tuned. Needs the default `daemon` feature; a `--no-default-features` build exits `3` with a rebuild hint. {{ added "0.22.0" }}
-- `-p, --pipeline <PATH|NAME>`: repeatable processing pipeline applied before profiling and verification (`ecs_windows`, `fibratus_windows`, `sysmon`, or YAML paths). Emitted fields and logsource reflect the transformed rule.
+- `-p, --pipeline <PATH|NAME>`: repeatable processing pipeline applied before profiling and verification (`ecs_windows`, `ecs_linux`, `fibratus_windows`, `sysmon`, or YAML paths). Emitted fields and logsource reflect the transformed rule.
 
 ## Tuning controls
 

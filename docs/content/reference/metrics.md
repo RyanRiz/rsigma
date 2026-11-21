@@ -4,11 +4,11 @@ description: "Every Prometheus metric the RSigma daemon exposes on /metrics: eva
 
 # Prometheus Metrics
 
-The `engine daemon` exposes Prometheus metrics on `GET /metrics` on the same `--api-addr` as the REST API. The full definition catalogue under `--all-features` (which is how the prebuilt release archives and the GHCR Docker image are built) is {{ rsigma.metrics.names }} metric names: {{ rsigma.metrics.always }} are always registered, and the OTLP ({{ rsigma.metrics.otlp }}) and TLS ({{ rsigma.metrics.tls }}) families are feature-gated on `daemon-otlp` and `daemon-tls` respectively. The runtime exposes the ones that have ever fired in a given process. The three field-observer surfaces always render their `# HELP`/`# TYPE` lines (and stay at zero unless `--observe-fields` was passed); the others follow the lazy-registration pattern documented per section below.
+The `engine daemon` exposes Prometheus metrics on `GET /metrics` on the same `--api-addr` as the REST API. The full definition catalogue under `--all-features` (which is how the prebuilt release archives and the GHCR Docker image are built) is {{ rsigma.metrics.names }} metric names: {{ rsigma.metrics.always }} are always registered, and the OTLP ({{ rsigma.metrics.otlp }}), TLS ({{ rsigma.metrics.tls }}), and STIX source ({{ rsigma.metrics.stix }}) families are feature-gated on `daemon-otlp`, `daemon-tls`, and `stix-source` respectively. The runtime exposes the ones that have ever fired in a given process. The three field-observer surfaces always render their `# HELP`/`# TYPE` lines (and stay at zero unless `--observe-fields` was passed); the others follow the lazy-registration pattern documented per section below.
 
 The exact source of truth is the [`daemon/metrics`](https://github.com/timescale/rsigma/blob/main/crates/rsigma-cli/src/daemon/metrics.rs) module.
 
-## Engine core (26 metrics)
+## Engine core (32 metrics)
 
 These always show up. They cover ingest, matches, queue depth, back-pressure, reloads, and resource usage.
 
@@ -24,6 +24,12 @@ These always show up. They cover ingest, matches, queue depth, back-pressure, re
 | `rsigma_correlation_state_entries` | gauge | none | Active entries in the correlation state. Watch versus the `max_state_entries` cap (default 100000). |
 | `rsigma_reloads_total` | counter | none | Total reload attempts (file watcher, SIGHUP, `POST /api/v1/reload`). |
 | `rsigma_reloads_failed_total` | counter | none | Reload attempts that were refused, for example a compile error, every rule failing to parse, or any parse error under `--strict-rules`. The previous rules stay active. |
+| `rsigma_ruleset_rules_loaded` | gauge | `ruleset`, `kind` | Rules loaded per named ruleset, split into detection and correlation counts. Stays absent unless the daemon runs named rulesets. {{ added "unreleased" }} |
+| `rsigma_ruleset_matches_total` | counter | `ruleset`, `kind` | Matches produced per named ruleset, split into detection and correlation. Stays absent unless the daemon runs named rulesets. {{ added "unreleased" }} |
+| `rsigma_ruleset_events_skipped_total` | counter | `ruleset` | Events kept away from a named ruleset by its `when` schema binding. Stays absent unless the daemon runs named rulesets. {{ added "unreleased" }} |
+| `rsigma_tenant_rejected_total` | counter | `channel`, `reason` | Ingest that had no tenant binding or was skipped for lack of one. `channel` is `rest`, `otlp_http`, `otlp_grpc`, or `engine`; `reason` is `no_tenant` or `untenanted_event`. Registered unconditionally. {{ added "unreleased" }} |
+| `rsigma_tenant_quota_evictions_total` | counter | `store` | Entries evicted because a tenant hit its quota. `store` is `correlation_state`, `active_alerts`, `incidents`, or `risk_entities`. {{ added "unreleased" }} |
+| `rsigma_detection_matches_by_tenant_total` | counter | `tenant` | Detection and correlation matches per tenant. Tenants outside `daemon.tenancy.metrics_tenant_allowlist` count under `other`, so the label set stays bounded. Registered unconditionally and never incremented while tenancy is disabled. {{ added "unreleased" }} |
 | `rsigma_api_auth_failures_total` | counter | `reason` (`unauthorized`, `forbidden`) | API requests rejected by [bearer-token authentication](http-api.md#authentication): `unauthorized` is a missing or unrecognized token, `forbidden` a recognized token without the required permission. Each label value surfaces after its first rejection. Stays absent while authentication is disabled. |
 | `rsigma_audit_records_total` | counter | none | Control-plane API calls recorded in the [audit trail](http-api-state.md#audit-trail). Stays absent when audit is disabled (no `--state-db`). |
 | `rsigma_audit_write_errors_total` | counter | none | Audit trail SQLite insert or optional sink emission failures. |
@@ -57,23 +63,29 @@ These counters carry labels that identify which rule fired. They surface on `/me
 
 These two families feed the silence and noisy signals of [`rule hygiene`](../cli/rule/hygiene.md) (and the production-volume column of [`rule scorecard`](../cli/rule/scorecard.md)): pass a saved scrape or a live endpoint as `--metrics` and they join per-rule by `rule_title`.
 
-## Dynamic pipeline sources (5 metrics)
+## Dynamic sources (11 metrics)
 
-Exposed when one or more pipelines declare dynamic sources. The labelled counters surface after the first resolve attempt for the relevant source; `source_cache_hits_total` and `source_resolve_seconds` are global (no `source_id` label).
+Exposed when one or more dynamic sources are configured. The labelled counters surface after the first resolve attempt for the relevant source; `source_cache_hits_total` and `source_resolve_seconds` are global (no `source_id` label).
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `rsigma_source_resolves_total` | counter | `source_id`, `source_type` (`file`, `http`, `command`, `nats`) | Total dynamic source resolution attempts. Counts every attempt, successful or not. |
+| `rsigma_source_resolves_total` | counter | `source_id`, `source_type` (`file`, `http`, `command`, `nats`, `watchlist`, `taxii`) | Total dynamic source resolution attempts. Counts every attempt, successful or not. |
 | `rsigma_source_resolve_errors_total` | counter | `source_id`, `error_kind` (`Fetch`, `Parse`, `Extract`, `Timeout`, `ResourceLimit`) | Failed dynamic source resolutions. |
 | `rsigma_source_resolve_seconds` | histogram | none | Dynamic source resolution latency. Aggregated across all sources. |
 | `rsigma_source_cache_hits_total` | counter | none | Times cached source data was served on resolution failure. Aggregated across all sources. |
 | `rsigma_source_last_resolved_timestamp` | gauge | `source_id` | Unix timestamp of the last successful resolution per source. Alert on staleness. |
+| `rsigma_source_rebuilds_total` | counter | `result` (`success`, `error`) | Rule rebuilds triggered by a changed pipeline source value. {{ added "unreleased" }} |
+| `rsigma_watchlist_indicators` | gauge | `source_id` | Current unexpired indicators in a watchlist. One series per declared watchlist, starting at 0. {{ added "unreleased" }} |
+| `rsigma_watchlist_changes_total` | counter | `source_id`, `op` (`add`, `update`, `remove`, `expire`) | Watchlist indicator changes. {{ added "unreleased" }} |
+| `rsigma_stix_source_indicators` | gauge | `source_id` | Active indicators in a STIX source after lifecycle and the cap. An indicator that emits nothing is not included. Requires `stix-source`. One series per declared STIX source, starting at 0. {{ added "unreleased" }} |
+| `rsigma_stix_source_objects_total` | counter | `source_id` | STIX objects received while resolving a STIX source. Requires `stix-source`. {{ added "unreleased" }} |
+| `rsigma_stix_source_skipped_total` | counter | `source_id`, `reason` (`revoked`, `expired`, `not_yet_valid`, `low_confidence`, `pattern_type`, `unsupported_pattern`, `unmapped_observable`, `invalid_pattern`, `over_limit`) | Indicators or observables left out of a STIX source value on that resolve. An id that stays out is not counted again on later polls. Requires `stix-source`. Each reason is registered at 0. {{ added "unreleased" }} |
 
-The `error_kind` values come from `rsigma_runtime::sources::SourceErrorKind`. `Fetch` covers HTTP, file, command, and NATS connect-or-read failures (per-protocol details land in the `error_message` log field, not the label). `ResourceLimit` covers the 10 MiB body cap, 30 s command exec cap, and similar.
+The `error_kind` values come from `rsigma_runtime::sources::SourceErrorKind`. `Fetch` covers HTTP, file, command, NATS connect-or-read, and TAXII poll failures (per-protocol details land in the `error_message` log field, not the label). `ResourceLimit` covers the 10 MiB body cap, 30 s command exec cap, and similar.
 
-## Enrichment (6 metrics)
+## Enrichment (13 metrics)
 
-Exposed when the daemon is built with `daemon` and `--enrichers` is passed. Every `(enricher_id, kind, status)` triple and every HTTP-cache `enricher_id` row is pre-registered at startup, so all six families render with their `# HELP` and `# TYPE` lines and zeroed counters on the first scrape, even before any event has fired. Filtered (kind- or scope-mismatched) enricher calls do not increment any counter, so cardinality stays bounded by the number of configured enrichers.
+Exposed when the daemon is built with `daemon` and `--enrichers` is passed. Every `(enricher_id, kind, status)` triple, every HTTP-cache `enricher_id` row, every MMDB hit and miss `enricher_id` row, both MMDB reload `result` values, every DNS cache hit and miss `enricher_id` row, and all three DNS query `result` values are pre-registered at startup, so all thirteen families render with their `# HELP` and `# TYPE` lines and zeroed counters on the first scrape, even before any event has fired. Filtered (kind- or scope-mismatched) enricher calls do not increment any counter, so cardinality stays bounded by the number of configured enrichers.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -83,6 +95,17 @@ Exposed when the daemon is built with `daemon` and `--enrichers` is passed. Ever
 | `rsigma_enrichment_http_cache_hits_total` | counter | `enricher_id` | HTTP enricher response-cache hits. Mandatory signal for any rate-limited API recipe. |
 | `rsigma_enrichment_http_cache_misses_total` | counter | `enricher_id` | HTTP enricher response-cache misses. |
 | `rsigma_enrichment_http_cache_expirations_total` | counter | `enricher_id` | HTTP enricher response-cache entries evicted on expiry. |
+| `rsigma_enrichment_mmdb_hits_total` | counter | `enricher_id` | MMDB lookups that found a record and, when `fields` is configured, produced a non-empty projection. |
+| `rsigma_enrichment_mmdb_misses_total` | counter | `enricher_id` | MMDB lookups where there was no record for the IP or the projection was empty, whether or not `default` was injected. |
+| `rsigma_enrichment_mmdb_reloads_total` | counter | `database`, `result` (`success`, `failure`) | MMDB reload attempts that reopened a changed file (`success`) and failed reopens that kept the old reader (`failure`). An unchanged file is not counted. |
+| `rsigma_enrichment_mmdb_build_epoch_seconds` | gauge | `database` | Build epoch from the loaded database's metadata. Alert on `time() - rsigma_enrichment_mmdb_build_epoch_seconds > <max age>`. |
+| `rsigma_enrichment_dns_cache_hits_total` | counter | `enricher_id` | DNS queries answered from the response cache, including cached negative answers. |
+| `rsigma_enrichment_dns_cache_misses_total` | counter | `enricher_id` | DNS queries that went to a nameserver, including every query when caching is disabled. |
+| `rsigma_enrichment_dns_queries_total` | counter | `enricher_id`, `result` (`answer`, `no_records`, `error`) | Upstream DNS query results. `answer` means at least one record of the queried type; `no_records` means NXDOMAIN or NODATA; `error` covers SERVFAIL, refused, I/O, and the resolver's own timeout. |
+
+The `database` label is the `db_path` exactly as configured. Reload and build-epoch metrics are labeled per database rather than per enricher because one database can back several enrichers. Key errors and decode errors are not hits or misses; they appear in `rsigma_enrichment_total{status}`.
+
+DNS counters are per query, not per enrichment call: an `IP` lookup counts two queries. A query cut off by the pipeline's outer enricher timeout never completes, so it is not counted in `queries_total`; it appears in `rsigma_enrichment_total{status="timeout"}`. Key errors send no query and are not counted.
 
 The `kind` label is carried even though `enricher_id` typically already encodes it (`asset_lookup_det` vs `asset_lookup_corr`), so dashboards can compute `sum by (kind)` without depending on a naming convention.
 
@@ -104,7 +127,7 @@ Exposed when the daemon is built with `daemon`. The fixed label sets on `rsigma_
 | `rsigma_silences_active` | gauge | none | Currently-active silences. |
 | `rsigma_inhibited_total` | counter | `rule` | Results muted by an inhibition rule, by rule name. |
 | `rsigma_inhibit_sources_active` | gauge | none | Currently-active inhibition sources. |
-| `rsigma_inhibit_sources_refused_total` | counter | `rule` | Results that would have opened a new inhibition source but were not tracked because `max_inhibit_sources` was reached, by rule name. Appears once a source is first refused. {{ added "0.25.0" }} |
+| `rsigma_inhibit_sources_refused_total` | counter | `rule` | Results that would have opened a new inhibition source but were not tracked because `max_inhibit_sources` or the tenant's `daemon.tenancy.quotas.inhibition_sources` was reached, by rule name. Appears once a source is first refused. {{ added "0.25.0" }} |
 | `rsigma_alert_pipeline_duration_seconds` | histogram | none | Alert-pipeline stage duration in seconds. |
 
 ## Risk-based alerting (9 metrics)
@@ -200,7 +223,7 @@ Exposed when the triage feedback loop is enabled (`daemon.dispositions.enabled: 
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `rsigma_rule_false_positive_ratio` | gauge | `rule_title` | Per-rule false-positive ratio over the rolling window. Absent until the rule reaches `min_sample` dispositions. |
+| `rsigma_rule_false_positive_ratio` | gauge | `rule_title` | Per-rule false-positive ratio over the rolling window. Absent until the rule reaches `min_sample` dispositions. With tenancy enabled, the ratio sums the rule's dispositions across tenants; per-tenant ratios are in `GET /api/v1/dispositions`. {{ added "unreleased" }} |
 | `rsigma_dispositions_total` | counter | `rule_title`, `verdict` | Analyst dispositions counted, by rule and verdict (`true_positive`, `false_positive`, `benign_true_positive`). |
 | `rsigma_disposition_ingest_total` | counter | `source`, `result` | Ingest outcomes by source (`api`, `file`, `http`, `nats`) and result (`accepted`, `duplicate`, `rejected`). |
 | `rsigma_disposition_ingest_errors_total` | counter | `reason` | Ingest errors by reason (`parse`, `validation`). |

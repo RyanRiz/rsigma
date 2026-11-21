@@ -5,6 +5,7 @@ use opentelemetry_proto::tonic::{
     resource::v1::Resource,
 };
 use rsigma_eval::EvaluationResult;
+use rsigma_eval::TenantId;
 use serde_json::{Map, Value};
 
 use crate::io::{AckToken, RawEvent};
@@ -19,6 +20,15 @@ use crate::io::{AckToken, RawEvent};
 /// - Scope metadata goes to `scope.name` / `scope.version`
 /// - Timestamps are ISO 8601, trace/span IDs are lowercase hex
 pub fn logs_request_to_raw_events(request: &ExportLogsServiceRequest) -> Vec<RawEvent> {
+    logs_request_to_raw_events_for(request, None)
+}
+
+/// Like [`logs_request_to_raw_events`] but stamps every event with `tenant`,
+/// which comes from the authenticated ingest principal.
+pub fn logs_request_to_raw_events_for(
+    request: &ExportLogsServiceRequest,
+    tenant: Option<&TenantId>,
+) -> Vec<RawEvent> {
     let mut events = Vec::new();
 
     for resource_logs in &request.resource_logs {
@@ -37,6 +47,7 @@ pub fn logs_request_to_raw_events(request: &ExportLogsServiceRequest) -> Vec<Raw
                 events.push(RawEvent {
                     payload,
                     ack_token: AckToken::Noop,
+                    tenant: tenant.cloned(),
                 });
             }
         }
@@ -192,7 +203,31 @@ fn nanos_to_iso8601(nanos: u64) -> String {
 pub fn evaluation_results_to_logs_request(
     results: &[EvaluationResult],
 ) -> ExportLogsServiceRequest {
-    let log_records = results.iter().map(result_to_log_record).collect();
+    logs_request(results.iter().map(result_to_log_record).collect())
+}
+
+/// Convert evaluation results into an `ExportLogsServiceRequest` whose log
+/// bodies are OCSF findings.
+///
+/// `finding` returns the finding for the result at an index. Each record's
+/// body is that finding as a JSON string, and its severity follows the
+/// Sigma level as in [`evaluation_results_to_logs_request`]. The attribute
+/// set is the same one a native record carries, so a collector can still
+/// route on `rule_title`, `rule_id`, `level`, and `tags`.
+pub(crate) fn ocsf_findings_to_logs_request(
+    results: &[EvaluationResult],
+    finding: impl Fn(usize, &EvaluationResult) -> Value,
+) -> ExportLogsServiceRequest {
+    logs_request(
+        results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| ocsf_log_record(result, &finding(index, result)))
+            .collect(),
+    )
+}
+
+fn logs_request(log_records: Vec<LogRecord>) -> ExportLogsServiceRequest {
     ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {
@@ -238,6 +273,14 @@ fn result_to_log_record(result: &EvaluationResult) -> LogRecord {
         attributes,
         ..Default::default()
     }
+}
+
+fn ocsf_log_record(result: &EvaluationResult, finding: &Value) -> LogRecord {
+    let mut record = result_to_log_record(result);
+    record.body = Some(string_any_value(
+        &serde_json::to_string(finding).unwrap_or_else(|_| "{}".to_string()),
+    ));
+    record
 }
 
 /// Map a Sigma level to an OTLP severity `(number, text)`. Unknown or absent
@@ -640,10 +683,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: "Suspicious PowerShell".to_string(),
                 rule_id: Some("rule-1".to_string()),
+                tenant_id: None,
                 level: Some(rsigma_parser::Level::High),
                 tags: vec!["attack.t1059".to_string()],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Detection(DetectionBody {
                 matched_selections: vec!["selection".to_string()],
@@ -710,10 +755,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: "SSH brute force".to_string(),
                 rule_id: Some("corr-1".to_string()),
+                tenant_id: None,
                 level: Some(rsigma_parser::Level::Critical),
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Correlation(CorrelationBody {
                 correlation_type: CorrelationType::EventCount,
@@ -737,5 +784,104 @@ mod tests {
             !keys.contains(&"matched_fields"),
             "a correlation must not carry matched_fields",
         );
+    }
+
+    #[test]
+    fn ocsf_body_is_the_finding_as_json() {
+        use rsigma_eval::result::{DetectionBody, ResultBody, RuleHeader};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../tests/golden/ocsf/1.1.0/detection.json"
+        ))
+        .unwrap();
+        let result = EvaluationResult {
+            header: RuleHeader {
+                rule_title: "Suspicious PowerShell".to_string(),
+                rule_id: Some("rule-1".to_string()),
+                tenant_id: None,
+                level: Some(rsigma_parser::Level::Medium),
+                tags: vec![],
+                custom_attributes: Arc::new(HashMap::new()),
+                enrichments: None,
+                ruleset: None,
+            },
+            body: ResultBody::Detection(DetectionBody {
+                matched_selections: vec![],
+                matched_fields: vec![],
+                event: None,
+            }),
+        };
+
+        let request =
+            ocsf_findings_to_logs_request(std::slice::from_ref(&result), |_, _| golden.clone());
+        let record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(
+            record.severity_number, 13,
+            "severity still follows the level"
+        );
+        assert_eq!(record.severity_text, "WARN");
+        assert!(
+            record.attributes.iter().any(|kv| kv.key == "rule_title"),
+            "native attributes stay on the record: {:?}",
+            record.attributes,
+        );
+        let body = record.body.as_ref().unwrap();
+        let serde_json::Value::String(raw) = any_value_to_json(body) else {
+            panic!("the body must be a JSON string: {body:?}");
+        };
+        let parsed: Value = serde_json::from_str(&raw).expect("finding JSON");
+        assert_eq!(parsed, golden, "the string body is the finding");
+    }
+
+    #[test]
+    fn logs_request_stamps_the_tenant() {
+        let tenant = TenantId::new("tenant-a").unwrap();
+        let request = make_request(vec![], None, vec![LogRecord::default()]);
+        let events = logs_request_to_raw_events_for(&request, Some(&tenant));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tenant.as_ref(), Some(&tenant));
+
+        let events = logs_request_to_raw_events(&request);
+        assert!(events[0].tenant.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    use rsigma_eval::result::{DetectionBody, ResultBody, RuleHeader};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn tenant_id_becomes_a_log_attribute() {
+        let result = EvaluationResult {
+            header: RuleHeader {
+                rule_title: "Tenanted".to_string(),
+                rule_id: Some("rule-1".to_string()),
+                tenant_id: Some(TenantId::new("tenant-a").unwrap()),
+                level: None,
+                tags: vec![],
+                custom_attributes: Arc::new(HashMap::new()),
+                enrichments: None,
+                ruleset: None,
+            },
+            body: ResultBody::Detection(DetectionBody {
+                matched_selections: vec![],
+                matched_fields: vec![],
+                event: None,
+            }),
+        };
+        let request = evaluation_results_to_logs_request(&[result]);
+        let records = &request.resource_logs[0].scope_logs[0].log_records;
+        let attr = records[0]
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "tenant_id")
+            .expect("tenant_id attribute");
+        let value = attr.value.as_ref().and_then(|value| value.value.as_ref());
+        assert!(matches!(value, Some(any_value::Value::StringValue(s)) if s == "tenant-a"));
     }
 }

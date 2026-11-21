@@ -12,8 +12,9 @@ use tonic::transport::Channel;
 
 use rsigma_eval::ProcessResult;
 
-use super::convert::evaluation_results_to_logs_request;
+use super::convert::{evaluation_results_to_logs_request, ocsf_findings_to_logs_request};
 use crate::error::RuntimeError;
+use crate::io::{DeliveryContext, SinkFormat, ocsf_finding};
 
 /// OTLP transport, selected by the sink URL scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,11 @@ const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Exports detection and correlation results to an OTLP collector.
 ///
+/// In the default format each result becomes a log record whose body is the
+/// rule title and whose attributes are the native result fields. With
+/// [`SinkFormat::Ocsf`] the body is the OCSF Detection Finding as a JSON string.
+/// The record keeps the native attribute set.
+///
 /// The gRPC channel connects lazily, so a collector that is not yet reachable
 /// does not fail daemon startup; delivery failures are surfaced to the
 /// delivery layer, which retries and ultimately routes to the DLQ. Each export
@@ -73,6 +79,9 @@ const GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct OtlpSink {
     transport: Transport,
     timeout: Duration,
+    format: SinkFormat,
+    ocsf: crate::ocsf::OcsfOptions,
+    tenant_filter: Option<rsigma_eval::TenantId>,
 }
 
 impl OtlpSink {
@@ -118,7 +127,36 @@ impl OtlpSink {
         Ok(OtlpSink {
             transport,
             timeout: DEFAULT_OTLP_TIMEOUT,
+            format: SinkFormat::default(),
+            ocsf: crate::ocsf::OcsfOptions::default(),
+            tenant_filter: None,
         })
+    }
+
+    /// Select the log-record body: the rule title ([`SinkFormat::Ndjson`], the
+    /// default) or the OCSF finding ([`SinkFormat::Ocsf`]). Both keep the
+    /// native attributes.
+    #[must_use]
+    pub fn with_format(mut self, format: SinkFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// OCSF serializer options when [`Self::format`] is [`SinkFormat::Ocsf`].
+    #[must_use]
+    pub fn with_ocsf_options(mut self, ocsf: crate::ocsf::OcsfOptions) -> Self {
+        self.ocsf = ocsf;
+        self
+    }
+
+    /// The log-record encoding this sink exports.
+    pub fn format(&self) -> SinkFormat {
+        self.format
+    }
+
+    /// OCSF serializer options when [`Self::format`] is [`SinkFormat::Ocsf`].
+    pub fn ocsf_options(&self) -> &crate::ocsf::OcsfOptions {
+        &self.ocsf
     }
 
     /// Set the deadline for one export attempt. An attempt that exceeds it
@@ -133,13 +171,69 @@ impl OtlpSink {
         self.timeout
     }
 
+    /// Only export results of `tenant`.
+    #[must_use]
+    pub fn with_tenant_filter(mut self, tenant: Option<rsigma_eval::TenantId>) -> Self {
+        self.tenant_filter = tenant;
+        self
+    }
+
     /// Serialize and export a batch of results to the collector.
     pub async fn send(&mut self, result: &ProcessResult) -> Result<(), RuntimeError> {
-        if result.is_empty() {
-            return Ok(());
+        self.send_inner(result, None).await
+    }
+
+    /// Export a batch whose OCSF identity and time come from `ctx`, so they
+    /// match every other sink the same dispatch reaches.
+    pub(crate) async fn send_with_context(
+        &mut self,
+        result: &ProcessResult,
+        ctx: &DeliveryContext,
+    ) -> Result<(), RuntimeError> {
+        self.send_inner(result, Some(ctx)).await
+    }
+
+    async fn send_inner(
+        &mut self,
+        result: &ProcessResult,
+        ctx: Option<&DeliveryContext>,
+    ) -> Result<(), RuntimeError> {
+        match self.build_request(result, ctx) {
+            Some(request) => self.export(request).await,
+            None => Ok(()),
         }
-        self.export(evaluation_results_to_logs_request(result))
-            .await
+    }
+
+    /// The export request for the results this sink delivers, or `None` when
+    /// the tenant filter leaves nothing.
+    fn build_request(
+        &self,
+        result: &ProcessResult,
+        ctx: Option<&DeliveryContext>,
+    ) -> Option<ExportLogsServiceRequest> {
+        // Original batch positions, so a finding uid matches every other sink.
+        let (positions, filtered): (Vec<usize>, ProcessResult) = result
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                self.tenant_filter
+                    .as_ref()
+                    .is_none_or(|tenant| r.header.tenant_id.as_ref() == Some(tenant))
+            })
+            .map(|(index, r)| (index, r.clone()))
+            .unzip();
+        if filtered.is_empty() {
+            return None;
+        }
+        Some(match self.format {
+            SinkFormat::Ndjson => evaluation_results_to_logs_request(&filtered),
+            SinkFormat::Ocsf => {
+                let ocsf = &self.ocsf;
+                ocsf_findings_to_logs_request(&filtered, |index, r| {
+                    ocsf_finding(r, ctx.map(|c| (c, positions[index])), ocsf)
+                })
+            }
+        })
     }
 
     /// Export a pre-serialized line as a single OTLP log-record body. Used when
@@ -299,10 +393,12 @@ mod tests {
             header: RuleHeader {
                 rule_title: "Test Rule".to_string(),
                 rule_id: Some("rule-1".to_string()),
+                tenant_id: None,
                 level: Some(rsigma_parser::Level::High),
                 tags: vec![],
                 custom_attributes: Arc::new(HashMap::new()),
                 enrichments: None,
+                ruleset: None,
             },
             body: ResultBody::Detection(DetectionBody {
                 matched_selections: vec!["selection".to_string()],
@@ -488,6 +584,85 @@ mod tests {
         let record = &got[0].resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(record.severity_text, "ERROR");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn ocsf_export_carries_the_delivery_finding_as_body() {
+        use opentelemetry_proto::tonic::common::v1::any_value;
+
+        let addr = free_port();
+        let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let service = Recording {
+            received: received.clone(),
+        };
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(service))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        wait_reachable(addr).await;
+
+        let mut sink = OtlpSink::new(OtlpProtocol::Grpc, &addr.to_string(), false, None)
+            .unwrap()
+            .with_format(SinkFormat::Ocsf)
+            .with_ocsf_options(crate::ocsf::OcsfOptions::new(
+                crate::ocsf::OcsfVersion::V1_3_0,
+            ));
+        let ctx = DeliveryContext::new();
+        sink.send_with_context(&one_detection(), &ctx)
+            .await
+            .unwrap();
+
+        let got = received.lock().await;
+        let record = &got[0].resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(record.severity_text, "ERROR");
+        assert!(
+            record.attributes.iter().any(|kv| kv.key == "rule_title"),
+            "native attributes stay on the record: {:?}",
+            record.attributes,
+        );
+        let Some(any_value::Value::StringValue(raw)) =
+            record.body.as_ref().and_then(|b| b.value.as_ref())
+        else {
+            panic!(
+                "the body must be the finding JSON string: {:?}",
+                record.body
+            );
+        };
+        let finding: serde_json::Value = serde_json::from_str(raw).expect("finding JSON");
+        assert_eq!(finding["class_uid"], 2004);
+        assert_eq!(finding["finding_info"]["uid"], ctx.finding_uid(0));
+        assert_eq!(finding["metadata"]["version"], "1.3.0");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tenant_filter_keeps_the_original_finding_uid() {
+        use opentelemetry_proto::tonic::common::v1::any_value;
+
+        let tenanted = |tenant: &str| {
+            let mut r = one_detection().remove(0);
+            r.header.tenant_id = Some(rsigma_eval::TenantId::new(tenant).unwrap());
+            r
+        };
+        let batch = vec![tenanted("a"), tenanted("b")];
+        let sink = OtlpSink::new(OtlpProtocol::Grpc, "127.0.0.1:4317", false, None)
+            .unwrap()
+            .with_format(SinkFormat::Ocsf)
+            .with_tenant_filter(Some(rsigma_eval::TenantId::new("b").unwrap()));
+        let ctx = DeliveryContext::new();
+        let request = sink.build_request(&batch, Some(&ctx)).expect("tenant b");
+        let records = &request.resource_logs[0].scope_logs[0].log_records;
+        assert_eq!(records.len(), 1);
+        let Some(any_value::Value::StringValue(raw)) =
+            records[0].body.as_ref().and_then(|b| b.value.as_ref())
+        else {
+            panic!("finding body");
+        };
+        let finding: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(finding["finding_info"]["uid"], ctx.finding_uid(1));
     }
 
     /// A CA, a server leaf (SAN `127.0.0.1` + `localhost`), and a client leaf,

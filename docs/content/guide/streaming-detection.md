@@ -6,6 +6,8 @@ description: "Run real-time Sigma detection with the RSigma daemon: inputs, sink
 
 `rsigma engine daemon` runs RSigma as a long-running service: it keeps a compiled engine in memory, reads events from a continuous source, writes detections to one or more sinks, and exposes a small HTTP API for health checks, metrics, and management. Use it when you need state to survive restarts, hot-reload across rule changes, or a Prometheus-scrapeable detection engine.
 
+The daemon can also run several named rulesets side by side with `--ruleset` or `daemon.rulesets`, each with its own pipelines and correlation state. See [Rulesets](rulesets.md#several-rulesets-side-by-side). {{ added "unreleased" }}
+
 This page covers the daemon's lifecycle, input and output options, hot-reload, state persistence, and the HTTP API surface. For NATS-specific operations (auth, replay, consumer groups, DLQ) see [NATS Streaming](nats-streaming.md). For OTLP ingestion see [OTLP Integration](otlp-integration.md).
 
 ## What the daemon does
@@ -61,7 +63,7 @@ rsigma engine daemon \
     --api-addr 127.0.0.1:9090
 ```
 
-For one-shot pipes and batch replay, use [`engine eval`](evaluating-rules.md#stdin) instead. The daemon's default `--input stdin` is for a long-lived writer that keeps the pipe open (a collector process). If that writer closes stdin, the daemon treats the source as exhausted and shuts down after draining in-flight events; it does not stay up waiting for another pipe.
+For one-shot evaluation without state, use [`engine eval`](evaluating-rules.md#stdin). A one-shot batch that must carry correlation state between runs uses [`engine daemon --input stdin`](../cli/engine/daemon.md#batch-runs) per batch. The daemon's default `--input stdin` is for a long-lived writer that keeps the pipe open (a collector process). If that writer closes stdin, the daemon treats the source as exhausted and shuts down after draining in-flight events. With [`--stdin-mode stream`](../cli/engine/daemon.md#long-running-stdin), it keeps running until a shutdown signal instead.
 
 ## Input sources
 
@@ -69,7 +71,7 @@ The `--input` flag selects the primary event source:
 
 | Source | Flag | What it does |
 |--------|------|--------------|
-| stdin | `--input stdin` (default) | Read NDJSON from standard input. Intended for a long-lived writer; when stdin closes, the daemon drains and exits. Prefer `--input http` for interactive testing, and [`engine eval`](evaluating-rules.md#stdin) for one-shot pipes. |
+| stdin | `--input stdin` (default) | Read NDJSON from standard input. Intended for a long-lived writer; when stdin closes, the daemon drains and exits, unless `--stdin-mode stream` keeps it running until a signal. Prefer `--input http` for interactive testing, [`engine eval`](evaluating-rules.md#stdin) for one-shot evaluation without state, and [`engine daemon --input stdin`](../cli/engine/daemon.md#batch-runs) for a batch that carries state between runs. |
 | HTTP | `--input http` | Accept NDJSON `POST` requests on `/api/v1/events`. |
 | NATS JetStream | `--input nats://host:port/subject` | Subscribe to a JetStream subject with at-least-once delivery. Requires the `daemon-nats` feature. |
 | Unix socket | `--input unix:///path/to.sock` | Accept newline-delimited events over a Unix domain socket (Unix only). Co-located log shippers (rsyslog `omuxsock`, syslog-ng `unix-stream`, Vector, Fluent Bit) write to it directly without a TCP port. |
@@ -165,7 +167,7 @@ For a 50 K/s ingest target, `--buffer-size 50000 --batch-size 64 --drain-timeout
 Three triggers cause the daemon to re-read its rules and pipelines, debounced at 500 ms:
 
 1. A file system change to any `.yml` or `.yaml` file under the rules directory or to any pipeline file passed via `-p`.
-2. A `SIGHUP` signal (Unix only). This also triggers re-resolution of dynamic pipeline sources.
+2. A `SIGHUP` signal (Unix only). This also triggers re-resolution of dynamic sources.
 3. A `POST /api/v1/reload` request.
 
 If the new configuration fails to parse, the daemon keeps the old engine running and increments `rsigma_reloads_failed_total`. Successful reloads atomically swap the in-memory engine via `ArcSwap`, so in-flight events finish on the old engine and new events evaluate against the new one without dropping any.
@@ -214,12 +216,12 @@ The table below is a subset of the core surface. The full catalog (incidents, si
 |------|--------|---------|
 | `/healthz` | GET | Liveness probe. Always 200 once the listener is up. |
 | `/readyz` | GET | Readiness probe. 200 once rules are loaded, 503 otherwise. |
-| `/metrics` | GET | Prometheus text format, {{ rsigma.metrics.names }} metric names under `--all-features` ({{ rsigma.metrics.always }} always-present + {{ rsigma.metrics.otlp }} OTLP + {{ rsigma.metrics.tls }} TLS gated on the matching build features). |
+| `/metrics` | GET | Prometheus text format, {{ rsigma.metrics.names }} metric names under `--all-features` ({{ rsigma.metrics.always }} always-present + {{ rsigma.metrics.otlp }} OTLP + {{ rsigma.metrics.tls }} TLS + {{ rsigma.metrics.stix }} STIX source, gated on the matching build features). |
 | `/api/v1/status` | GET | Counters, state-entry counts, uptime. |
 | `/api/v1/rules` | GET | Rule counts and rules-directory path. |
 | `/api/v1/reload` | POST | Trigger an immediate rules reload. |
 | `/api/v1/events` | POST | Ingest events (only when `--input http`). NDJSON body. |
-| `/api/v1/sources` | GET | Status of dynamic pipeline sources. |
+| `/api/v1/sources` | GET | Status of dynamic sources. |
 | `/api/v1/sources/resolve` | POST | Force re-resolution of all (or some) dynamic sources. |
 | `/api/v1/tap` | GET | Stream a bounded, redactable window of the live event stream as NDJSON. Disabled by default; enable with `daemon.tap.enabled: true`. See [`engine tap`](../cli/engine/tap.md). |
 | `/api/v1/detections/stream` | GET | Stream live detections as NDJSON, with optional `level` and `rule` filters. Disabled by default; enable with `daemon.tail.enabled: true`. See [`engine tail`](../cli/engine/tail.md). |

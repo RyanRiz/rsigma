@@ -12,20 +12,36 @@ libfuzzer-sys = "0.4"
 rsigma-parser = { path = "../crates/rsigma-parser" }
 rsigma-eval = { path = "../crates/rsigma-eval" }
 rsigma-convert = { path = "../crates/rsigma-convert" }
-rsigma-runtime = { path = "../crates/rsigma-runtime", features = ["logfmt", "cef", "otlp"] }
+rsigma-runtime = { path = "../crates/rsigma-runtime", features = ["logfmt", "cef", "otlp", "mmdb-enrich", "dns-enrich", "stix-source"] }
 prost = "0.14"
 serde = "1"
 serde_json = "1"
-tree-sitter = "0.26"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+tree-sitter = "0.27"
 tree-sitter-yaml = "0.7"
 yaml_serde = "0.10"
 regex = "1"
 arbitrary = { version = "1", features = ["derive"] }
-rstix = { path = "../crates/rstix", features = ["serde", "pattern", "validate"] }
+rstix = { path = "../crates/rstix", features = ["serde", "pattern", "validate", "taxii"] }
 
 [[bin]]
 name = "fuzz_stix_pattern"
 path = "fuzz_targets/fuzz_stix_pattern.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_taxii_envelope"
+path = "fuzz_targets/fuzz_taxii_envelope.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_stix_source"
+path = "fuzz_targets/fuzz_stix_source.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_stix_draft"
+path = "fuzz_targets/fuzz_stix_draft.rs"
 doc = false
 
 [[bin]]
@@ -76,6 +92,11 @@ doc = false
 [[bin]]
 name = "fuzz_pipeline_sources_yaml"
 path = "fuzz_targets/fuzz_pipeline_sources_yaml.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_watchlist_request"
+path = "fuzz_targets/fuzz_watchlist_request.rs"
 doc = false
 
 [[bin]]
@@ -166,4 +187,24 @@ doc = false
 [[bin]]
 name = "fuzz_rule_fmt"
 path = "fuzz_targets/fuzz_rule_fmt.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mmdb_record"
+path = "fuzz_targets/fuzz_mmdb_record.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_dns_answer"
+path = "fuzz_targets/fuzz_dns_answer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ruleset_resolve"
+path = "fuzz_targets/fuzz_ruleset_resolve.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_ocsf_sidecar"
+path = "fuzz_targets/fuzz_ocsf_sidecar.rs"
 doc = false

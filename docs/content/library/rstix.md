@@ -123,7 +123,9 @@ Build with `cargo build -p rstix --features pattern`.
 
 ### In scope (Pattern Engine (complete))
 
-Lexer, Level 1-3 parser, SCO schema type-checker (18 built-in + custom types), `Pattern::parse`, `Pattern::evaluate`, `matches_single`, `matches_single_with_bundle`, `evaluate_observed_data`, `Pattern::canonical`, `IndicatorPattern` STIX AST wiring at deserialize, `IndicatorPattern::evaluate`, `IndicatorBuilder`, `ObservationContext`, full §9 comparison and temporal semantics, manifest-driven SCO field tests (`tests/pattern_eval_sco_fields.rs`, 276 cases), spec §9.8 parse/print round-trip tests, `fuzz_stix_pattern`.
+Lexer, Level 1-3 parser, SCO schema type-checker (18 built-in + custom types), `Pattern::parse`, `Pattern::evaluate`, `matches_single`, `matches_single_with_bundle`, `evaluate_observed_data`, `Pattern::canonical`, `Pattern::simple_observables`, `IndicatorPattern` STIX AST wiring at deserialize, `IndicatorPattern::evaluate`, `IndicatorBuilder`, `ObservationContext`, full §9 comparison and temporal semantics, manifest-driven SCO field tests (`tests/pattern_eval_sco_fields.rs`, 276 cases), spec §9.8 parse/print round-trip tests, `fuzz_stix_pattern`.
+
+`Pattern::simple_observables` returns the string and integer values of non-negated `=` and `IN` comparisons when the pattern is one observation or observations joined only by `OR`. `WITHIN`, `REPEATS`, `START`/`STOP`, `AND`, `FOLLOWEDBY`, and `NOT` return [`UnsupportedReason`](https://docs.rs/rstix/latest/rstix/enum.UnsupportedReason.html). Known paths such as `ipv4-addr:value` and `file:hashes.'SHA-256'` set [`ObservableKind`](https://docs.rs/rstix/latest/rstix/enum.ObservableKind.html). Other paths stay in the result with no kind. Domain names, the four hash kinds, and MAC addresses are lowercased. {{ added "unreleased" }}
 
 Grammar authority: STIX Specification §9. Internal storage uses `PatternAst` after type-check.
 
@@ -150,7 +152,7 @@ Optional `taxii` feature: a TAXII 2.1 HTTP client for all normative endpoint gro
 
 | Feature | Key API | Highlights |
 | ------- | ------- | ---------- |
-| `taxii` | `TaxiiClient`, `TaxiiEnvelope` | TAXII 2.1 HTTP client (rustls TLS 1.2+1.3, PEM and PKCS#12 mTLS, SPKI pin/DANE, auth, pagination, SRV + `dns_nameserver()`). Covers Discovery, API Root, Collections, Objects, Manifests, and Status. |
+| `taxii` | `TaxiiClient`, `TaxiiEnvelope` | TAXII 2.1 HTTP client (rustls TLS 1.2+1.3, PEM and PKCS#12 mTLS, SPKI pin/DANE, auth, pagination, SRV + `dns_nameserver()`). `address_filter` drops rejected destination addresses, checks IP literals on every request, and disables redirects and proxies. With no filter, resolution, redirects, and proxies stay at their defaults. Envelope parsing applies `ParseOptions` depth, string, and object-count limits. `PollBudget` is non-exhaustive (`new` or `for_indicators`). `poll_object_pages` delivers each page and returns when the budget is reached, with that page's `X-TAXII-Date-Added-Last` so the caller can resume. `poll_objects` collects those pages and fails at that stop, when the cursor does not advance, or when HTTP 416 recovery would repeat the same filter. {{ added "unreleased" }} Covers Discovery, API Root, Collections, Objects, Manifests, and Status. |
 
 ```rust
 use rstix::taxii::{BearerAuth, TaxiiClient, TaxiiClientConfig, TaxiiFilter};
@@ -240,7 +242,7 @@ Formal record of engineering choices for the Pattern Engine. Full text: [crate R
 
 | | |
 | --- | --- |
-| **Status** | Accepted (PR #296) |
+| **Status** | Accepted |
 | **Applies to** | `IndicatorBuilder`, `IndicatorBuilderError` |
 
 **Context.** Indicators need STIX pattern parse/type-check (when `pattern` is enabled) plus `Indicator::validate()`. Construction paths are JSON deserialize and `IndicatorBuilder`.
@@ -265,7 +267,7 @@ Grouped by Cargo feature (phase name). Rust module paths are an implementation d
 
 | Symbol | Role |
 | ------ | ---- |
-| `StixId`, typed ID wrappers, `StixObjectKind` | ID parse, generate, typed conversions |
+| `StixId`, typed ID wrappers, `StixObjectKind` | ID parse, generate, typed conversions. `StixId::parse` rejects type names outside the STIX 2.1 rules and non-hyphenated UUIDs. {{ added "unreleased" }} |
 | `StixTimestamp`, `TaxiiTimestamp`, `Confidence`, `SpecVersion`, `LanguageTag` | Core wire types |
 | `generate_sco_id`, `select_id_contributing_properties`, `jcs_canonicalize` | Deterministic SCO UUIDv5 |
 | Vocabulary tables (`HASH_ALGORITHM_ENUM`, `REGION_OV`, …) | Closed and open STIX §10 tables |
@@ -388,11 +390,11 @@ Formal record of wire-parse engineering choices. Full text: [crate README: Data 
 
 | | |
 | --- | --- |
-| **Status** | Accepted (#327) |
+| **Status** | Accepted |
 | **Applies to** | `serde` feature (default), `domain-name`, `email-addr`, `url` SCO types |
 | **Spec** | STIX 2.1 §6.4, §6.5, §6.15 |
 
-**Context.** PR #315 previously gated strict IDNA, RFC 5322, and URL checks behind the optional `validate` feature. [Issue #267](https://github.com/timescale/rsigma/issues/267) directs MUST at parse and SHOULD via `Bundle::validate()`.
+**Context.** STIX 2.1 makes the IDNA, RFC 5322, and URL constraints wire-format requirements. The default parser must reject values that violate those requirements. `Bundle::validate()` remains the surface for advisory checks and structured diagnostics.
 
 **Decision.** Malformed `domain-name`, `email-addr`, and `url` values are rejected at the default `serde` parse. URL validation uses full RFC 3986 parse via the `url` crate (any valid absolute URL), not a scheme whitelist. Other wire-format checks use T1 (`Bundle::validate()`) or T2 (Validation Pipeline) as documented in [Validation tiers](#rstix-validation-tiers).
 
