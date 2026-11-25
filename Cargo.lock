@@ -1677,9 +1677,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -2901,6 +2901,7 @@ checksum = "317d6b918ba3893345af072f52cb56bcfcb532a9d0ebcf861ab3c25b37a316ac"
 dependencies = [
  "ipnetwork",
  "memchr",
+ "memmap2",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -2920,6 +2921,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "micromap"
@@ -4492,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4551,6 +4561,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tokio-rustls",
  "tokio-stream",
+ "toml",
  "tonic",
  "tower",
  "tower-http 0.7.1",
@@ -4566,7 +4577,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-convert"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "insta",
  "log",
@@ -4585,7 +4596,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-eval"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -4612,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-ir"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "base64 0.23.1",
  "ciborium",
@@ -4626,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-lsp"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "env_logger",
  "insta",
@@ -4639,7 +4650,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-mcp"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4664,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-parser"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "criterion",
  "fancy-regex",
@@ -4690,7 +4701,7 @@ dependencies = [
 
 [[package]]
 name = "rsigma-runtime"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "arc-swap",
  "async-nats",
@@ -4759,7 +4770,7 @@ dependencies = [
 
 [[package]]
 name = "rstix"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "base64 0.23.1",
  "email_address",
@@ -6514,9 +6525,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

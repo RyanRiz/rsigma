@@ -53,6 +53,7 @@ pub mod error;
 pub mod finding_links;
 pub mod input;
 pub mod io;
+mod log_throttle;
 pub mod metrics;
 pub mod ocsf;
 pub mod parse;
@@ -72,7 +73,7 @@ pub use alert_pipeline::{
     SNAPSHOT_VERSION, Silence, SilenceError, SilenceLimits, SilenceOrigin, SilenceRejection,
     SilenceRemoval, SilenceSpec, SilenceState, SilenceStore, SilenceView, TickOutput,
     build_alert_pipeline, group_fingerprint, load_alert_pipeline_file, parse_alert_pipeline_config,
-    strip_event_payloads,
+    strip_auto_retained_event, strip_event_payloads,
 };
 pub use capture::{
     AdmittedEvent, AdmittedMatch, CaptureConfig, CaptureConfigError, CaptureIncompatibility,
@@ -95,7 +96,7 @@ pub use egress::{
 pub use engine::{EngineStats, RoutingSpec, RuntimeEngine, SourceFetch};
 pub use enrichment::config::{
     EnricherConfig, EnricherResources, EnrichersConfigError, EnrichersFile, build_enrichers,
-    build_enrichers_full, load_enrichers_file,
+    build_enrichers_full, load_enrichers_file, parse_enrichers_config,
 };
 pub use enrichment::{
     CacheKey, CacheOutcome, CommandEnricher, EnrichError, EnrichErrorKind, Enricher,
@@ -128,7 +129,9 @@ pub use io::{
     UnixSocketGuard, UnixSocketSink, UnixSocketSource, bind_unix_listener, parse_unix_scheme,
 };
 pub use metrics::{MetricsHook, NoopMetrics};
-pub use processor::{BatchProcessOutcome, EventFilter, LogProcessor};
+pub use processor::{
+    BatchProcessOutcome, EventFilter, LogProcessor, detection_threads, init_detection_pool,
+};
 pub use risk::{
     IncidentConfig as RiskIncidentConfig, RiskCaps, RiskConfigError, RiskEntityView, RiskEvent,
     RiskFile, RiskIncidentResult, RiskLayer, RiskObject, RiskOutput, RiskRef, RiskState,

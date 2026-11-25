@@ -4,6 +4,193 @@ All notable changes to RSigma are documented in this file. Each entry correspond
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-24
+
+**TL;DR**
+RSigma v0.28.0 is the "detection engineering at scale" release: a single daemon serves several tenants with their state kept apart, named rulesets curate and pin the rules each one runs, STIX and TAXII feeds and pushed watchlists turn threat intel into detections, and five security advisories are fixed in the PostgreSQL, LynxDB, and Fibratus backends and the STIX store. It is the largest RSigma release to date.
+* Multi-tenancy: one daemon serves several tenants, bound only by operator-issued tokens, sources, and NATS subscriptions. Correlation, dedup, incident, silence, risk, and disposition state is keyed per tenant, `daemon.tenancy.quotas` caps each tenant, API routes are scoped to the token's tenant, and sinks route by `{tenant}` (#732).
+* Rulesets: `rulesets:` curates rules with selectors, overlays, and a deterministic lockfile, with the `rsigma ruleset` command group and `--ruleset` on the rule, eval, convert, and hunt commands (#712). Several rulesets run side by side in eval and the daemon, each with its own pipelines and correlation state (#715), and the `convert:` manifest with `rsigma backend build` converts groups of rules into queries plus a per-rule manifest (#717).
+* Threat intel: TAXII 2.1 collections and STIX bundles become dynamic source values (#722), `watchlist` sources take indicators pushed over the API and rebuild the rules that reference them (#716), and `rule draft --from-stix` drafts Sigma rules from STIX indicators (#731), thanks to @SecurityEnthusiast.
+* Enrichment: templates read fields the rule did not match from the event, and the daemon keeps the event only as long as an enricher needs it (#739). A lookup that finds nothing is a miss with its own `on_miss` handling, and the `http` enricher gains `default` and `miss_status` (#740). New `dns` (#708) and `mmdb` (#706) enrichers, with `mmap: true` for `mmdb` cutting idle memory with a 93 MB database from 113 MB to 21.5 MB (#741), and a hosted-API GeoIP recipe (#735, thanks to @Vlam9988).
+* Throughput: daemon intake no longer wakes the whole thread pool for small batches, cutting system CPU for 1,000,000 events and one rule that matches them all from 5.66 s to 0.97 s, and `--worker-threads`, `--detect-threads`, and `--detect-inflight` size the pools (#742). Sinks deliver a batch at once, taking 100,000 events to NATS JetStream from 12.21 s to 0.65 s and to OTLP from 16.65 s to 0.59 s, and retries no longer repeat deliveries the sink knows went out (#743). A stdout sink that keeps up with its queue writes on its own thread, so batching does not slow down a daemon whose enrichers are the slow stage (#747). `engine daemon --input stdin` runs one batch to the end of input and exits, for serverless and cron callers (#714).
+* Correlation and output: chained correlations carry their contributing `events` or `event_refs`, plus `event_sources` naming the rule and child correlation behind each event (#737). OCSF findings are written by eval, backtest, sinks, and webhooks (#711), and `udm_events.yml` canonicalizes Google SecOps UDM events (#705), thanks to @SecurityEnthusiast.
+* Config safety: unknown keys in `rsigma.yaml` and in enricher, webhook, risk, and dynamic source files fail at load with the key named, and the daemon reloads when the enrichers, alert-pipeline, or risk file changes (#738).
+* Security: the PostgreSQL backend escapes quotes in field names and expands placeholders once ([GHSA-799c-444p-fhj7](https://github.com/timescale/rsigma/security/advisories/GHSA-799c-444p-fhj7), #718), the LynxDB backend rejects unsafe field names and expands placeholders once ([GHSA-f96v-37xh-p653](https://github.com/timescale/rsigma/security/advisories/GHSA-f96v-37xh-p653), #719), the Fibratus backend rejects unsafe field names ([GHSA-98v4-pmv2-h8qq](https://github.com/timescale/rsigma/security/advisories/GHSA-98v4-pmv2-h8qq)) and escapes YAML line breaks ([GHSA-gx4c-rpx5-2w58](https://github.com/timescale/rsigma/security/advisories/GHSA-gx4c-rpx5-2w58), #734), and STIX ids are validated before they name a store file ([GHSA-g52x-rcvw-c2qw](https://github.com/timescale/rsigma/security/advisories/GHSA-g52x-rcvw-c2qw), #733), all five reported by @nexus8222. `async-nats` 0.52 stops a header `\r` from panicking the NATS source (#723), and `url` 2.5.9 fixes RUSTSEC-2026-0592 (#738).
+* Dependencies: Dependabot roll-ups with pySigma 2.1.0 in the engine test image (#723, #730), `psm` 0.1.32 with the `cargo deny` license exception for `ar_archive_writer` (#726), and the VS Code extension declaring VS Code 1.91 (#725).
+* Breaking: unknown `rsigma.yaml` keys stop every command with exit `3`, and unknown or inapplicable keys in enricher, webhook, risk, and source files fail to load (#738). An enricher with `default: null` injects `null` on a miss (#740). `--input stdin` exits `3` when stored state cannot be restored and `4` when a run does not complete (#714), and a zero `--buffer-size`, `--batch-size`, or `--sink-batch-max` is rejected (#742). LynxDB and Fibratus conversion rejects field names outside their identifier syntax (#719, #734), and STIX ids outside the STIX 2.1 type-name rules no longer parse (#733). Correlation, alert-pipeline, risk, and disposition snapshots move to version 2, which older releases cannot read (#732). In the libraries, `EnricherConfig` and `EnrichersConfigError` are `#[non_exhaustive]` (#738), `EnrichErrorKind` gains `Miss` (#740), `CorrelationBody` gains `event_sources` (#737), the tenancy types gain tenant fields (#732), `RuleHeader` gains `ruleset` and `CorrelationSnapshot` gains `rulesets` (#712, #715), `SourceType` and `DataFormat` gain variants (#716, #722), `DraftError` (#731) and `StixIdError` (#733) gain variants, `TickOutput` and `RiskOutput` gain `finding_links` (#711), and Fibratus `sanitize_field` is replaced by `field_ident` (#734). See the migration notes in the entries below.
+* Docs and CI: the docs home page is redesigned and every internal fragment link is checked at build time (#710), the fuzz crate is checked on every PR (#724), the agent skill covers schema pipelines, hunting, and rule set review (#707), and `rsigma --features` lists every optional feature, checked against the crate manifest (#745).
+
+### Faster stdout delivery with enrichers (#747)
+
+A stdout sink whose worker keeps up with its queue now writes each batch on a dedicated `rsigma-stdout` thread. Before, every batch went through Tokio's `block_in_place`, which moves the runtime worker to another thread for the write. When enrichment is the slow stage, the sink worker drains about two results at a time, so that move happened about every second result, and the enrichment task kept changing threads. Batched delivery (#743) made each write cheaper, so the worker returned to its queue sooner, woke more often, and moved the runtime more often: at the default `--sink-batch-flush-ms 0`, an enriched daemon ran slower than before #743. A worker that falls behind, with results still queued behind the batch it drained, keeps writing in place, so a busy sink pays no round trip to the writer thread. Delivery order, retries, and the lines a retry skips are unchanged.
+
+On an Apple M4 Pro (12 cores), stdin batch mode to stdout piped to `wc -l`, 1,000,000 events, wall and system seconds before #743, before this change, and after, medians of 14 interleaved runs:
+
+- One MMDB enricher on every result: 5.63 s / 4.31 s, 6.46 s / 3.98 s, and 5.28 s / 2.41 s.
+- Three MMDB enrichers with a `default` on every entry: 6.93 s / 6.48 s, 7.50 s / 5.37 s, and 6.92 s / 3.58 s.
+- The same two configs with `--sink-batch-flush-ms 50`, and runs without enrichers: unchanged within noise.
+- One rule matching every event, without enrichers (`scripts/perf/stdin-daemon.sh`, 11 interleaved runs): 0.86 s before and 0.87 s after.
+
+Library API: `DeliverySink::deliver_batch` takes a `backlog` flag, set when more results were already queued behind the batch. The default implementation ignores it.
+
+### `rsigma --features` lists `ocsf` and `mmdb-mmap` (#745)
+
+`rsigma --features`, the `rsigma --version` features line, and the "Compiled-in features" footer of `rsigma --help` left out `ocsf` and `mmdb-mmap`, so a binary built with either feature did not report it. Both are listed now, and a default build reports `daemon` and the `ocsf` it implies. A unit test compares the list with the `[features]` table of the `rsigma` crate's `Cargo.toml`, so a feature added to the manifest without being listed fails the build's tests.
+
+See [Detecting features at runtime](https://rsigma.io/reference/feature-flags/#detecting-features-at-runtime).
+
+### Batched sink delivery (#743)
+
+Each sink worker now makes the first delivery attempt for everything it drained from its queue at once, up to `--sink-batch-max` results. Stdout, `file://`, and `unix://` sinks write the batch with one write instead of one or two writes per line. The NATS sink publishes every message of the batch and then awaits the JetStream acks together, instead of one publish-and-ack round trip per message. The OTLP sink exports the batch in one request instead of one per result. A result that fails in the batch is retried on its own with the same retry budget, backoff, and DLQ routing as before. Webhooks still post one request per result.
+
+On an Apple M4 Pro (12 cores), stdin batch mode, one rule matching every event, wall and system seconds before and after, medians of 7 interleaved runs unless noted:
+
+- 1,000,000 events to stdout piped to `wc -l`: 1.36 s / 1.06 s to 0.93 s / 0.65 s.
+- 1,000,000 events to a file sink: 3.53 s / 3.52 s to 0.94 s / 0.70 s.
+- 1,000,000 events to stdout redirected to `/dev/null`, which was slower than a pipe: 2.42 s to 0.91 s wall (median of 3).
+- 100,000 events to a NATS JetStream sink on a local server: 12.21 s to 0.65 s wall (median of 3), every message stored.
+- 100,000 events to an OTLP/gRPC sink on a local collector: 16.65 s to 0.59 s wall (median of 3).
+
+Retries no longer repeat deliveries the sink knows went out:
+
+- Stdout skips the lines a failed write already delivered, and ends a line the failure cut off before the next write. Before, a retry could write lines twice.
+- NATS remembers which messages of a failed result JetStream confirmed, and a retry publishes only the others. Before, a retry republished every message of the result.
+- A webhook retry starts at the result whose request failed, keeping each request's signing id and timestamp. Before, a retry re-posted results of the same delivery that had already gone out.
+
+The OTLP sink now reads the collector's partial success over both OTLP/gRPC and OTLP/HTTP. Rejected log records are counted on the new `rsigma_sink_otlp_rejected_records_total{sink}` counter and logged in a warning at most once every 10 seconds. They are not retried, as the OTLP specification asks.
+
+`--sink-batch-flush-ms` (and `daemon.output.batch_flush_ms`) now works: a batch smaller than `--sink-batch-max` waits up to that many milliseconds for more results before it is delivered.
+
+Library API: `DeliverySink` gains `deliver_batch` with a default that delivers one result at a time and stops at the first failure, `OtlpSink` gains `with_metrics`, and `MetricsHook` gains `on_sink_otlp_rejected_records` with a default no-op body.
+
+Behavior changes:
+
+- The `--sink-batch-flush-ms` default changes from 50 to 0, which delivers whatever is queued at once, as the daemon effectively did before because the setting had no effect. `DeliveryConfig::default()` changes the same way.
+- The NATS sink publishes a whole batch before it awaits the acks, so a message retried after a failed ack can land after messages published after it. Before, a failed message was retried before the next one was published.
+
+See [`engine daemon`: Output sinks and DLQ](https://rsigma.io/cli/engine/daemon/#output-sinks-and-dlq).
+
+### Faster daemon intake (#742)
+
+Small detection batches no longer spread across every Rayon thread. Detection runs on the calling thread until a batch's projected cost reaches 500 µs and then forks the rest, and parsing stays on the calling thread for batches under 32 KiB of input. With cheap rules or small events, waking the whole pool per batch used to cost more than the work: idle workers spun and slept between batches, which showed up as system CPU several times the wall time. Results and their order are unchanged.
+
+The stdin reader also forwards lines in chunks of up to 256 instead of one channel send per line, and still forwards a line on a slow pipe before the next read blocks.
+
+On an Apple M4 Pro (12 cores), stdin to stdout, 1,000,000 events, medians of 7 interleaved runs, wall and system seconds before and after:
+
+- One trivial rule matching every event: 1.63 s / 5.66 s to 1.31 s / 0.97 s, and with correlation rules' in-flight depth of 1, 1.90 s / 13.42 s to 1.55 s / 0.98 s.
+- One trivial rule matching nothing: 0.57 s / 2.77 s to 0.37 s / 0.18 s, and at in-flight depth 1, 1.19 s / 8.81 s to 0.89 s / 0.09 s.
+- The 3,132-rule SigmaHQ tree over Windows events: wall time unchanged (4.87 s to 4.89 s, and 4.88 s to 4.78 s at depth 1), with system time up 5 to 9%.
+
+The `Input channel full, backpressure applied` warning is logged at most once every 10 seconds with a `suppressed` count instead of once per occurrence; `rsigma_back_pressure_events_total` still counts every occurrence, and now counts OTLP ingestion too. The input queue gauge no longer overcounts an event whose send failed at shutdown, and the `rsigma_pipeline_latency_seconds` help text now says it stops at dispatch, before enrichment and sink delivery.
+
+New `--worker-threads`, `--detect-threads`, and `--detect-inflight` flags and the matching `daemon.runtime` config keys size the Tokio and detection thread pools. `RAYON_NUM_THREADS` and `RSIGMA_DETECT_INFLIGHT` remain as fallbacks. The daemon logs the effective sizes at startup, and logs why the in-flight depth stays 1 when correlation rules are loaded. The daemon page gains measured tuning guidance.
+
+Library API: `rsigma-runtime` gains `init_detection_pool` and `detection_threads`.
+
+Behavior changes:
+
+- `--buffer-size 0`, `--batch-size 0`, and `--sink-batch-max 0` are rejected. A zero `daemon.input.buffer_size`, `daemon.input.batch_size`, or `daemon.output.batch_max` in a config file stops the daemon with exit code 3. Before, a zero buffer size panicked and the other two were accepted without effect.
+
+See [`engine daemon`: Throughput](https://rsigma.io/cli/engine/daemon/#throughput).
+
+### Memory-mapped mmdb databases (#741)
+
+An `mmdb` enricher entry can set `mmap: true` to memory-map its database instead of reading it into memory. It needs the new `mmdb-mmap` feature, which the prebuilt binaries and the Docker image include. With a 93 MB database, the daemon's idle resident memory dropped from 113 MB to 21.5 MB (18.5 MB without enrichers), and the mapped pages live in the operating system's page cache, which processes that map the same file share. Once pages are resident, lookups cost the same as with the file in memory. The default stays the eager read.
+
+A mapped file must be replaced by renaming a new file over it, as `geoipupdate` does: writing to it in place can crash the daemon with `SIGBUS`. `mmap: true` without the feature, `mmap: true` on another enricher type, and entries on one database that disagree on `mmap` fail at load.
+
+The enrichers guide gains sizing notes for `mmdb`: memory per database, lookup cost, and why one entry with several fields is cheaper than several entries on the same file.
+
+Library API: `EnricherConfig` gains `mmap`, and `rsigma-runtime` gains the `mmdb-mmap` feature.
+
+See [Enrichers](https://rsigma.io/guide/enrichers/#mmdb-local-mmdb-lookup).
+
+### Enricher miss handling (#740)
+
+A miss, a lookup that ran and found no data for its key, is now its own outcome. It covers a `lookup` cache miss or an extract that matched nothing, a `stix` query with no objects or an extract that returned `null`, an `mmdb` address with no record or an empty projection, a `dns` NXDOMAIN or NODATA answer, and the new `http` miss statuses.
+
+The `http` enricher honors `default`: when the response, after the optional `extract`, is `null`, it injects the default instead of `null`, also on a cache hit. The new `miss_status` list (for example `miss_status: [404]`) turns listed statuses into misses for APIs such as VirusTotal that answer an unknown indicator with 404: the body is not read, `default` is injected when set, and the status is cached for `cache_ttl` like a body. An extract error and every other failure still apply `on_error`, even with `default` set. The VirusTotal and hosted GeoIP recipes now use `miss_status` and `default`.
+
+An explicit `default: null` now injects `null` on a miss for every enricher type, as the recipes that use it described. Before, it behaved like no `default` at all.
+
+The new `on_miss: skip | null | drop` key handles misses separately from `on_error` on `lookup`, `http`, `stix`, `mmdb`, and `dns`, and falls back to `on_error` when absent. So `on_error: drop` with `on_miss: skip` fails closed on errors but keeps detections whose lookup found nothing. Misses report `status="miss"` in `rsigma_enrichment_total` when they are skipped or injected as `null`, and `drop` when they drop the result.
+
+Misses log at debug level instead of one warning per result. Other enrichment failures log at most one warning per enricher every 10 seconds, and each warning carries a `suppressed` count of the failures since the previous one.
+
+Breaking changes:
+
+- An enricher with `default: null` now injects `null` on a miss instead of applying `on_error`. Remove `default` to keep the old behavior.
+- `on_miss` together with `default` (including `default: null`), and a `miss_status` entry outside `300..=599`, fail at load with `enricher '<id>': invalid '<field>': ...`.
+- Library API: `EnrichErrorKind` is `#[non_exhaustive]` with a new `Miss` variant, so exhaustive matches need a wildcard arm. The `lookup`, `stix`, `mmdb`, and `dns` no-data outcomes return `Miss` instead of `Fetch`, displayed with a `no match:` prefix instead of `fetch failed:`. `EnricherConfig` gains `miss_status` and `on_miss`, `EnrichersConfigError` gains `InvalidValue`, and `Enricher` gains an `on_miss` method that defaults to `on_error`. `HttpEnricher` gains `with_default` and `with_miss_status`, and the five lookup types gain `with_on_miss`.
+
+Behavior changes:
+
+- Dashboards that sum `rsigma_enrichment_total` statuses see misses move from `skip` and `error` to `miss`.
+- Enrichment failure warnings that repeated per result are folded into one warning per enricher every 10 seconds.
+
+See [Enrichers](https://rsigma.io/guide/enrichers/#misses-and-errors).
+
+### Enrichers read unmatched fields from the event (#739)
+
+`${detection.fields.<name>}` in an enricher template now resolves fields the rule did not match on. A matched field still wins, even when its value is null or empty; otherwise the name is read from the event, as a whole top-level key first and then as a dotted path. Before, the value came only from `matched_fields`, so an `mmdb` or `dns` key such as `${detection.fields.SourceIp}` rendered empty for the usual rule that does not select on the address, and every lookup failed. An `mmdb` or `dns` key that still renders empty now says the field is neither a matched field nor present in the event. Webhook templates keep their behavior.
+
+The daemon retains each detection's event automatically while a loaded enricher reads `${detection.fields.*}` or `${detection.event.*}`, so these templates no longer need `--include-event`. It strips the event right after enrichment unless `--include-event`, capture, or the rule's `rsigma.include_event: "true"` asks for it, and follows enricher reloads, logging the effective value when it changes. Retention serializes the event into every detection only while a loaded enricher reads the payload, the same work `--include-event` does. MCP `evaluate_events` retains and strips events the same way for the enrichers passed to it.
+
+With capture on, the strip before delivery no longer removes the event of a rule that sets `rsigma.include_event: "true"`, or correlation `events`, `event_refs`, and `event_sources`.
+
+Library API: `EnrichmentPipeline::needs_event`, `EnricherConfig::rendered_fields`, `strip_auto_retained_event`, `RuntimeEngine::set_include_event`, `LogProcessor::set_include_event` and `LogProcessor::include_event`, and in `rsigma-eval`, `set_include_event` on `SchemaRouter`, `RulesetEngines`, and `UnitEngine`.
+
+Behavior changes:
+
+- Enricher templates that rendered empty for unmatched fields now resolve them from the event, so enrichers that used to skip or fall back to their `default` now run.
+- Capture no longer strips events that rules asked for, or correlation event payloads.
+
+See [Enrichers](https://rsigma.io/guide/enrichers/#kind-and-template-namespaces) and [`engine daemon`](https://rsigma.io/cli/engine/daemon/).
+
+### Strict config files (#738)
+
+Enricher, webhook, risk, and dynamic source configs now reject keys that are unknown or that do not apply to an entry's type, at every level including `scope`, `retry`, `signing`, `stix`, `auth`, and `extract`. Each error names the key and lists the supported ones, so a typo such as `defualt:` or `fromat:` fails at load instead of being ignored. A dynamic source with an unknown `format`, `on_error`, or `refresh` value, an invalid `timeout`, or a `required` that is not a boolean fails instead of falling back to a default. In an enricher entry, a key set to an empty value (`headers: {}`) counts as absent. Duration errors in enricher, webhook, and risk configs now include the bad value.
+
+Unknown `rsigma.yaml` keys are errors. Every command that reads the config prints `error: unknown config key '<key>' in <path>` for each one and exits `3`, and `rsigma config validate` fails on them. `rsigma config show` still prints the effective config. Keys of a feature this build leaves out, such as `daemon.stix_store` without `stix-enrich`, are known keys that only warn that the section is inert.
+
+Bespoke enricher types registered with `register_builtin` now receive their custom keys, as the developer docs described. HTTP sources honor the documented `max_body_size` and command sources honor `max_stdout`, which override the 10 MiB cap for one source.
+
+The daemon now reloads when the enrichers, alert-pipeline, or risk file changes, as the docs described. The watcher follows `.yml` and `.yaml` changes in the directory of each file, and a reload with an invalid file keeps the previous configuration.
+
+`rsigma_runtime::parse_enrichers_config` validates an enrichers config without opening files or touching the network, and a new `fuzz_enrichers_config` target covers it.
+
+Breaking changes:
+
+- A config file with a key that is unknown or does not apply now fails to load. That includes `default` on `template` or `command` enrichers, which was ignored. For enrichers, webhooks, risk, and sources files, the daemon refuses to start and a reload keeps the previous configuration. MCP `evaluate_events` rejects the same enricher configs.
+- Unknown `rsigma.yaml` keys stop every command that reads the config with exit `3`. `rsigma config validate` fails on them without `--strict`, which is kept, hidden, for compatibility.
+- A dynamic source with an unknown `format`, `on_error`, or `refresh` value no longer falls back to `json`, `use_cached`, or `once`, and an invalid `timeout` or a non-boolean `required` is an error.
+- Library API: `EnricherConfig` gains the public `extra` field, `output` becomes `Option<OutputFormatLabel>`, and both `EnricherConfig` and `EnrichersConfigError` are `#[non_exhaustive]`. `EnrichersConfigError` gains `UnknownField` and `InapplicableField`. `rsigma_eval::pipeline::sources::SourceType::Http` gains `max_body_size` and `SourceType::Command` gains `max_stdout`.
+
+Migration: remove or fix the key or value the error names. Library code that matches `EnrichersConfigError` exhaustively needs a wildcard arm, and code that builds or exhaustively destructures `SourceType::Http` or `SourceType::Command` needs the new fields or `..`.
+
+See [Enrichers](https://rsigma.io/guide/enrichers/#config-schema), [Dynamic Sources](https://rsigma.io/reference/dynamic-sources/#schema), and [`config validate`](https://rsigma.io/cli/config/validate/).
+
+### Events and event sources on chained correlations (#737)
+
+A chained correlation in `full` or `refs` event mode now carries the contributing `events` or `event_refs`, which it never did before. A parent receives the events its child correlations retained when they fired and fed it, so raw events behind a child that never fired are left out. Each event appears once, oldest first, even when a child re-fires and delivers it again, and the parent's own `timespan`, window mode, `rsigma.action`, and `rsigma.max_correlation_events` cap decide which events it keeps.
+
+Every correlation result that carries `events` or `event_refs` now also carries `event_sources`, one entry per event. `rule` names the reference from the correlation's `rules:` list that the event matched, which tells the two sides of a `temporal` correlation apart, and `via` names the child correlation that delivered the event to a chained parent. OCSF findings carry `event_sources` in `evidences[].data`, and `strip_event` drops it with the events.
+
+A parent's event mode and cap make its child correlations buffer events for it, even when their own mode is `none`. That adds memory bounded by the cap for each active child group, and the children's own results are unchanged. The default event mode is still `none`, which keeps no buffers.
+
+Correlation state snapshots gain `seq`, `rule`, and `via` fields on buffered entries. Snapshots from earlier versions load, with an empty source, `{}`, for their restored events, and earlier versions ignore the new fields.
+
+Breaking changes: code that builds `rsigma_eval::CorrelationBody` with a struct literal needs the new `event_sources` field. Consumers that reject unknown keys in correlation results see `event_sources` whenever an event mode is set.
+
+See [Correlation in eval mode](https://rsigma.io/guide/evaluating-rules/#correlation-in-eval-mode).
+
+### Hosted GeoIP API recipe (docs) (#735)
+
+The `enrich_ip_geoip` recipe gains a hosted-API variant: an `http` enricher with a response cache, the API key in a header instead of the URL, and a jq `extract` that injects the same `{country, region, city}` shape as the `mmdb` variant, with `{country: "unknown"}` for addresses the provider has no record for. The CLI README lists the three GeoIP variants together again. Docs only.
+
+Thanks to @Vlam9988, whose #713 proposed the hosted-API variant this recipe builds on.
+
 ### Daemon batch runs over stdin (#714)
 
 `rsigma engine daemon --input stdin` is a one-shot batch runner for serverless and cron callers. It reads stdin to end of input, evaluates every event, drains every sink and the dead-letter queue, saves `--state-db`, and exits. A correlation window that spans batches fires in the run that completes it, and after exit the state database is a single file with no `-wal` or `-shm` sidecar.
@@ -27,6 +214,8 @@ The Fibratus backend passed field names through unchanged, so a field name such 
 
 **Breaking changes:** `rsigma_convert::backends::fibratus::shared::sanitize_field` is replaced by `field_ident`, which returns `Result<&str>` and rejects names outside Fibratus identifier syntax.
 
+Thanks to @nexus8222 for reporting both issues.
+
 ### STIX ids are validated before they name a store file (security, #733)
 
 `StixId::parse` checked only the `--` delimiter and the UUID, and `FsStore` used the id as a file name under `objects/`. With `--allow-custom`, a bundle passed to `rsigma taxii store` or a collection read by `rsigma taxii sync` could carry an id such as `../../x--<uuid>` or `/tmp/x--<uuid>` and write a JSON file outside the store ([GHSA-g52x-rcvw-c2qw](https://github.com/timescale/rsigma/security/advisories/GHSA-g52x-rcvw-c2qw)).
@@ -35,6 +224,8 @@ The Fibratus backend passed field names through unchanged, so a field name such 
 - `FsStore` checks the file name for every id before it writes or deletes and fails with `StoreError::InvalidObjectId`, so an id built with `StixId::generate` from an unchecked type name cannot escape the store either.
 
 **Breaking changes:** `StixIdError` gains the `InvalidTypeName` and `NonHyphenatedUuid` variants. Ids that broke the STIX type-name rules, such as uppercase or two-character type names, no longer parse, and an `FsStore` that already holds such an id fails to open until the file is removed.
+
+Thanks to @nexus8222 for reporting this issue.
 
 ### Multi-tenant daemon (#732)
 
@@ -70,6 +261,8 @@ The title comes from `--title`, or from the indicator name when one indicator co
 
 **Breaking.** Exhaustive matches on `DraftError` must handle the new variants.
 
+Thanks to @SecurityEnthusiast for this contribution.
+
 ### pySigma 2.1.0 and dependency follow-up for #723 (#730)
 
 Rolls up the Dependabot PRs that opened after #723. The pySigma engine image moves to pySigma 2.1.0 (#728), with `requirements.txt` re-resolved for Python 3.13 against packages released on or before 2026-11-12, which also brings `jq` 1.13.0, `certifi` 2026.10.23, and `types-pyyaml` 6.0.12.20261111. The `test` backend still matches pySigma's output. CI: `taiki-e/install-action` v2.90.3, repinned by commit SHA (#729). Held back: the `python:3.15-slim` base image (#727), because `google-re2` publishes no Python 3.15 wheel and the slim image has no compiler to build it from source; `tikv-jemallocator` 0.7.0 (#425) remains excluded after the measured musl daemon throughput regression.
@@ -102,6 +295,8 @@ A TAXII source polls indicators of spec version 2.1. The first poll reads from t
 
 **Breaking changes.** Code that matches on `SourceType` or `DataFormat` exhaustively must handle `Taxii` and `Stix`. `SourceType::File` and `SourceType::Http` gain a `stix` field: set it to `None` when the source is not `format: stix`. A TAXII envelope that exceeds the parse limits now fails instead of being parsed.
 
+Thanks to @SecurityEnthusiast for this contribution.
+
 ### LynxDB output rejects unsafe field names and expands template placeholders once (security, #719)
 
 The LynxDB backend rendered field names verbatim, so a field name such as `Image=* OR CommandLine` rewrote the logic of the generated `search` or `where` stage. It also substituted `{rule.title}`, `{rule.id}`, and pipeline state keys into the finished query after the detection was rendered, so a field name or regex value of `{rule.title}` was replaced by the raw title, which could close a quoted string and append pipeline stages such as `| stats count by host` ([GHSA-f96v-37xh-p653](https://github.com/timescale/rsigma/security/advisories/GHSA-f96v-37xh-p653)).
@@ -110,6 +305,8 @@ The LynxDB backend rendered field names verbatim, so a field name such as `Image
 - Query template placeholders are substituted in a single pass with `render_query_template`, so placeholder text inside a rule's values stays literal. Pipeline state still takes precedence over the default `index`.
 
 **Breaking changes.** A rule or pipeline that maps a field to a name outside LynxDB identifier syntax now fails to convert for LynxDB. Such a name did not convert to a working query before.
+
+Thanks to @nexus8222, whose PostgreSQL report ([GHSA-799c-444p-fhj7](https://github.com/timescale/rsigma/security/advisories/GHSA-799c-444p-fhj7)) led to this finding.
 
 ### PostgreSQL output escapes quotes in field names and expands template placeholders once (security, #718)
 
@@ -122,6 +319,8 @@ The PostgreSQL backend wrapped mixed-case field names in double quotes without d
 
 No breaking changes.
 
+Thanks to @nexus8222 for reporting this issue.
+
 ### Watchlist sources and rebuilds on source change (#716)
 
 A dynamic source with `type: watchlist` holds indicators pushed over the daemon HTTP API. Nothing is fetched. `POST`, `PUT`, and `DELETE /api/v1/sources/{source_id}/indicators` add, replace, and delete values, and `GET` lists the unexpired ones. Each value is compared exactly, after surrounding whitespace is removed. An empty value, a value longer than `max_value_length` (default 2048 bytes), or a value containing an ASCII control character is rejected. Expiry comes from the item's `expires_at`, then the item's `ttl`, then the request `ttl`, then the source `default_ttl`. When none of those is set, the indicator stays until it is deleted. A sweeper drops expired indicators about every 10 seconds.
@@ -133,6 +332,8 @@ With `--state-db`, indicators are written through before the response. Writes to
 `POST`, `PUT`, and `DELETE` require `sources:write` and are audited. `GET` requires `sources:read` and is not audited. `DELETE` carries a JSON body. The audit trail records a SHA-256 digest of that body and does not store the body itself. A request may carry at most 10,000 indicators and 4 MiB. When the audit trail is enabled, a body larger than `daemon.api.audit.max_body_bytes` (default 64 KiB) is rejected with 413 before the handler runs. `max_indicators` (default 100,000) caps the stored set. An `expires_at` that is not later than the current time is rejected. `refresh`, `format`, `extract`, and `timeout` are rejected on a watchlist, and the ids `resolve` and `cache` are reserved.
 
 **Breaking changes.** Rules that reference a dynamic source now change when that source's value changes, without `POST /api/v1/reload`. Code that matches on `SourceType` exhaustively must handle the `Watchlist` variant.
+
+Thanks to @SecurityEnthusiast for this contribution.
 
 ### Conversion manifest (#717)
 
@@ -184,6 +385,8 @@ Line sinks accept `?format=ocsf` with optional `?ocsf_version=1.1.0|1.3.0` (defa
 
 See [OCSF Findings](https://rsigma.io/guide/ocsf-findings/) and [Output formats](https://rsigma.io/reference/output/).
 
+Thanks to @SecurityEnthusiast for this contribution.
+
 ### Documentation home page redesign, flat anchor aliases, and fragment validation (#710)
 
 The `rsigma.io` home page opens with a split hero, a tabbed quick-run snippet (`Evaluate`, `Daemon`, `Convert`, `Rust`), a tabbed install bar, a four-card benchmark strip, the detection-loop diagram paired with workflow cards, grouped downstream integrations, and a minimal footer, with focus mode (`Alt+F`) enabled site-wide. The version-tag legend moves to [Release Notes](https://rsigma.io/release-notes/#version-tags).
@@ -200,7 +403,7 @@ The daemon exposes `rsigma_enrichment_dns_cache_hits_total`, `rsigma_enrichment_
 
 The library surface adds `DnsEnricher`, `DnsRecordType`, `DnsResolverConfig`, and `SUPPORTED_DNS_RECORD_TYPES`, plus four `MetricsHook` methods for cache hits, cache misses, query results, and label pre-registration.
 
-Breaking changes: `EnricherConfig` has four new public fields, so code that builds it with a struct literal must add `record_type: None`, `nameservers: Vec::new()`, `negative_cache_ttl: None`, and `cache_max_entries: None`. YAML configs are unaffected.
+Breaking changes: `EnricherConfig` gains the public `record_type`, `nameservers`, `negative_cache_ttl`, and `cache_max_entries` fields. In this release it is also `#[non_exhaustive]` (#738), so library code builds it by deserializing a config instead of with a struct literal. YAML configs are unaffected.
 
 See [Enrichers](https://rsigma.io/guide/enrichers/#dns-dns-lookup) and [Prometheus metrics](https://rsigma.io/reference/metrics/).
 
@@ -212,6 +415,8 @@ The `skills/rsigma` skill now tells agents to pass a canonicalizing pipeline wit
 
 Adds path-only `udm_events.yml` for Google SecOps UDM-shaped eval input (Chronicle / Bindplane-style nested JSON). Maps the portable five Sigma categories with `metadata.event_type` gates.
 
+Thanks to @SecurityEnthusiast for this contribution.
+
 ### Native MMDB enricher (#706)
 
 `rsigma-runtime` adds a `type: mmdb` enricher that looks up an IP address in an operator-supplied MaxMind DB file and injects the decoded record under `enrichments.<field>`. Any MMDB layout works (GeoLite2 and GeoIP2 City or ASN, IP2Location, IP2Proxy, and databases you build yourself) because records are decoded generically into JSON, and an optional `fields:` map projects values through dotted paths where numeric segments are array indexes. Entries that name the same `db_path` share one loaded reader, for both detection and correlation kinds.
@@ -222,9 +427,11 @@ The daemon exposes `rsigma_enrichment_mmdb_hits_total`, `rsigma_enrichment_mmdb_
 
 The library surface adds `MmdbEnricher`, `MmdbDatabase`, `MmdbFields`, and `MmdbLookupError`, six `MetricsHook` methods for hits, misses, reloads, build epoch, and label pre-registration, and an `EnrichersConfigError::Database` variant for a database that fails to open at config load.
 
-Breaking changes: `EnrichersConfigError` is not `#[non_exhaustive]`, so an exhaustive `match` on it needs an arm for `Database`. `EnricherConfig` has three new public fields, so code that builds it with a struct literal must add `db_path: None`, `key: None`, and `fields: BTreeMap::new()`. YAML configs are unaffected.
+Breaking changes: `EnrichersConfigError` gains the `Database` variant, and in this release the enum is also `#[non_exhaustive]` (#738), so a `match` on it needs a wildcard arm. `EnricherConfig` gains the public `db_path`, `key`, and `fields` fields and is built by deserializing a config (#738). YAML configs are unaffected.
 
 See [Enrichers](https://rsigma.io/guide/enrichers/#mmdb-local-mmdb-lookup) and [Prometheus metrics](https://rsigma.io/reference/metrics/).
+
+[v0.27.0...v0.28.0](https://github.com/timescale/rsigma/compare/v0.27.0...v0.28.0)
 
 ## [0.27.0] - 2026-11-12
 
@@ -3873,6 +4080,7 @@ First release of rsigma -- a Sigma detection toolkit in Rust. Ships a parser, ev
 
 Initial crates.io publish. Reserved the `rsigma` crate name with a minimal CLI binary (parser + evaluator only, no linter/LSP/pipelines/correlation). Superseded the same day by v0.2.0, which is the first feature-complete release.
 
+[0.28.0]: https://github.com/timescale/rsigma/releases/tag/v0.28.0
 [0.27.0]: https://github.com/timescale/rsigma/releases/tag/v0.27.0
 [0.26.0]: https://github.com/timescale/rsigma/releases/tag/v0.26.0
 [0.25.0]: https://github.com/timescale/rsigma/releases/tag/v0.25.0

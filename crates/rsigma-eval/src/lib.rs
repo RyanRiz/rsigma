@@ -104,6 +104,7 @@ pub mod fields;
 mod key_shape;
 pub mod logsource;
 pub mod matcher;
+mod parallel;
 pub mod pipeline;
 pub mod result;
 pub mod router;
@@ -156,8 +157,8 @@ pub use pipeline::{
     validate_source_refs,
 };
 pub use result::{
-    CorrelationBody, DetectionBody, EvaluationResult, FieldMatch, MatchDetailLevel, MatcherKind,
-    ProcessResultExt, ResultBody, RuleHeader,
+    CorrelationBody, DetectionBody, EvaluationResult, EventSource, FieldMatch, MatchDetailLevel,
+    MatcherKind, ProcessResultExt, ResultBody, RuleHeader,
 };
 pub use router::{RouteOutcome, RouteResult, SchemaPruning, SchemaRouter};
 pub use rule_draft::{
