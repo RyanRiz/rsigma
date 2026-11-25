@@ -32,6 +32,7 @@ pub struct Metrics {
     pub sink_retries_total: IntCounterVec,
     pub sink_dropped_total: IntCounterVec,
     pub sink_delivery_failures_total: IntCounterVec,
+    pub sink_otlp_rejected_records_total: IntCounterVec,
     pub webhook_requests_total: IntCounterVec,
     pub webhook_request_duration_seconds: prometheus::HistogramVec,
     pub detection_matches_by_rule: IntCounterVec,
@@ -259,7 +260,7 @@ impl Metrics {
         let pipeline_latency = Histogram::with_opts(
             HistogramOpts::new(
                 "rsigma_pipeline_latency_seconds",
-                "End-to-end latency from event dequeue to sink send",
+                "Latency from event dequeue to dispatch, before enrichment and sink delivery",
             )
             .buckets(vec![
                 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
@@ -311,6 +312,14 @@ impl Metrics {
             Opts::new(
                 "rsigma_sink_delivery_failures_total",
                 "Sink deliveries that exhausted retries and were routed to the DLQ",
+            ),
+            &["sink"],
+        )
+        .unwrap();
+        let sink_otlp_rejected_records_total = IntCounterVec::new(
+            Opts::new(
+                "rsigma_sink_otlp_rejected_records_total",
+                "Log records an OTLP collector rejected in a partial success; not retried",
             ),
             &["sink"],
         )
@@ -417,6 +426,9 @@ impl Metrics {
             .unwrap();
         registry
             .register(Box::new(sink_delivery_failures_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(sink_otlp_rejected_records_total.clone()))
             .unwrap();
         registry
             .register(Box::new(webhook_requests_total.clone()))
@@ -1459,6 +1471,7 @@ impl Metrics {
             sink_retries_total,
             sink_dropped_total,
             sink_delivery_failures_total,
+            sink_otlp_rejected_records_total,
             webhook_requests_total,
             webhook_request_duration_seconds,
             detection_matches_by_rule,
@@ -2033,7 +2046,7 @@ impl MetricsHook for Metrics {
         // even before the enricher has fired. `inc_by(0)` and a
         // bare `with_label_values` both materialise the entry; the
         // former is more explicit about the intent.
-        for status in ["success", "skip", "error", "timeout", "drop"] {
+        for status in ["success", "skip", "error", "timeout", "miss", "drop"] {
             self.enrichment_total
                 .with_label_values(&[enricher_id, kind, status])
                 .inc_by(0);
@@ -2066,6 +2079,11 @@ impl MetricsHook for Metrics {
         self.sink_delivery_failures_total
             .with_label_values(&[sink])
             .inc_by(0);
+        if sink == "otlp" {
+            self.sink_otlp_rejected_records_total
+                .with_label_values(&[sink])
+                .inc_by(0);
+        }
     }
 
     fn on_sink_queue_depth_change(&self, sink: &str, delta: i64) {
@@ -2089,6 +2107,12 @@ impl MetricsHook for Metrics {
         self.sink_delivery_failures_total
             .with_label_values(&[sink])
             .inc();
+    }
+
+    fn on_sink_otlp_rejected_records(&self, sink: &str, count: u64) {
+        self.sink_otlp_rejected_records_total
+            .with_label_values(&[sink])
+            .inc_by(count);
     }
 
     fn register_webhook(&self, webhook_id: &str) {
@@ -2168,6 +2192,16 @@ const STIX_SKIP_REASONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_latency_help_names_where_it_stops() {
+        let m = Metrics::new();
+        m.observe_pipeline_latency(0.001);
+        assert!(m.encode().contains(
+            "# HELP rsigma_pipeline_latency_seconds Latency from event dequeue to dispatch, \
+             before enrichment and sink delivery\n"
+        ));
+    }
 
     #[test]
     fn detection_matches_by_rule_labels() {

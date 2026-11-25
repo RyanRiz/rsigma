@@ -24,15 +24,17 @@ daachorse-index = ["rsigma-eval/daachorse-index"]
 stix-enrich = ["dep:rstix", "rstix/store", "rstix/store-fs"]
 # Post-evaluation MMDB lookup enricher (`type: mmdb` in enrichers YAML).
 mmdb-enrich = ["dep:maxminddb"]
+# Memory-mapped MMDB files (`mmap: true` on `type: mmdb` enrichers).
+mmdb-mmap = ["mmdb-enrich", "maxminddb/mmap"]
 # Post-evaluation DNS lookup enricher (`type: dns` in enrichers YAML).
 dns-enrich = ["dep:hickory-resolver"]
 # TAXII collections and `format: stix` file or HTTP sources.
 stix-source = ["dep:rstix", "rstix/taxii", "rstix/pattern"]
 
 [dependencies]
-rsigma-parser = { path = "../rsigma-parser", version = "0.27.0" }
-rstix = { path = "../rstix", version = "0.27.0", optional = true, default-features = false, features = ["serde"] }
-rsigma-eval = { path = "../rsigma-eval", version = "0.27.0", features = ["parallel"] }
+rsigma-parser = { path = "../rsigma-parser", version = "0.28.0" }
+rstix = { path = "../rstix", version = "0.28.0", optional = true, default-features = false, features = ["serde"] }
+rsigma-eval = { path = "../rsigma-eval", version = "0.28.0", features = ["parallel"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std", "process", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

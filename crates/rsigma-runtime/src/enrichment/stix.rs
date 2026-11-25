@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use super::{
     EnrichError, EnrichErrorKind, Enricher, EnricherKind, OnError, Scope, inject_enrichment,
-    template::render_template,
+    render_enricher_template,
 };
 use crate::sources::extract::apply_extract;
 
@@ -46,6 +46,7 @@ pub struct StixEnricher {
     default: Option<Value>,
     timeout: Duration,
     on_error: OnError,
+    on_miss: OnError,
     scope: Scope,
     store: Arc<dyn StixStore>,
 }
@@ -73,9 +74,17 @@ impl StixEnricher {
             default,
             timeout,
             on_error,
+            on_miss: on_error,
             scope,
             store,
         }
+    }
+
+    /// Set the policy applied when this enricher finds no data
+    /// ([`EnrichErrorKind::Miss`]). Defaults to the `on_error` policy.
+    pub fn with_on_miss(mut self, on_miss: OnError) -> Self {
+        self.on_miss = on_miss;
+        self
     }
 
     fn render_extract(&self, result: &EvaluationResult) -> Option<ExtractExpr> {
@@ -85,7 +94,7 @@ impl StixEnricher {
             ExtractExpr::JsonPath(s) => ("jsonpath", s),
             ExtractExpr::Cel(s) => ("cel", s),
         };
-        let rendered = render_template(raw, result);
+        let rendered = render_enricher_template(raw, result);
         Some(match lang {
             "jq" => ExtractExpr::Jq(rendered),
             "jsonpath" => ExtractExpr::JsonPath(rendered),
@@ -106,7 +115,7 @@ impl StixEnricher {
 
     fn build_query(&self, result: &EvaluationResult) -> Result<StixQuery, EnrichError> {
         if let Some(template) = &self.query.stix_id {
-            let rendered = render_template(template, result);
+            let rendered = render_enricher_template(template, result);
             if rendered.is_empty() {
                 return Err(EnrichError {
                     enricher_id: self.id.clone(),
@@ -136,7 +145,7 @@ impl StixEnricher {
                     "stix enricher requires stix_id, text_search, or attack_technique".into(),
                 ),
             })?;
-            let rendered = render_template(template, result);
+            let rendered = render_enricher_template(template, result);
             if rendered.is_empty() {
                 return Err(EnrichError {
                     enricher_id: self.id.clone(),
@@ -191,6 +200,9 @@ impl Enricher for StixEnricher {
     fn on_error(&self) -> OnError {
         self.on_error
     }
+    fn on_miss(&self) -> OnError {
+        self.on_miss
+    }
 
     async fn enrich(&self, result: &mut EvaluationResult) -> Result<(), EnrichError> {
         let query = self.build_query(result)?;
@@ -202,7 +214,7 @@ impl Enricher for StixEnricher {
             }
             return Err(EnrichError {
                 enricher_id: self.id.clone(),
-                kind: EnrichErrorKind::Fetch("stix store query returned no objects".into()),
+                kind: EnrichErrorKind::Miss("stix store query returned no objects".into()),
             });
         }
 
@@ -222,7 +234,7 @@ impl Enricher for StixEnricher {
             }
             return Err(EnrichError {
                 enricher_id: self.id.clone(),
-                kind: EnrichErrorKind::Fetch("stix extract returned null".into()),
+                kind: EnrichErrorKind::Miss("stix extract returned null".into()),
             });
         }
         inject_enrichment(result, &self.inject_field, extracted);

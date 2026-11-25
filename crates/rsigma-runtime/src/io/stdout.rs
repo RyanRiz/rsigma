@@ -1,16 +1,28 @@
-use std::io::Write;
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 
 use rsigma_eval::{ProcessResult, TenantId};
 
 use crate::error::RuntimeError;
-use crate::io::{DeliveryContext, SinkFormat, serialize_result};
+use crate::io::DeliveryContext;
+use crate::io::SinkFormat;
+use crate::io::lines::{LineEncoding, LineWriter, WriterThread};
 
 /// Serializes ProcessResult to one line per result and writes it to stdout.
+///
+/// A delivery's lines, or a whole batch of deliveries, go out in one write.
+/// Batches the delivery worker drains while keeping up are written on one
+/// `rsigma-stdout` thread shared by every stdout sink.
+/// When a delivery is retried after a failed write, lines that already
+/// reached stdout are not written again, and a line cut off by the failure is
+/// ended before anything else is written.
 pub struct StdoutSink {
     pretty: bool,
     format: SinkFormat,
     ocsf: crate::ocsf::OcsfOptions,
     tenant_filter: Option<TenantId>,
+    out: Mutex<LineWriter<std::io::Stdout>>,
 }
 
 impl StdoutSink {
@@ -20,6 +32,7 @@ impl StdoutSink {
             format: SinkFormat::default(),
             ocsf: crate::ocsf::OcsfOptions::default(),
             tenant_filter: None,
+            out: Mutex::new(LineWriter::new(std::io::stdout())),
         }
     }
 
@@ -54,7 +67,7 @@ impl StdoutSink {
 
     /// Serialize and write a ProcessResult to stdout.
     pub fn send(&self, result: &ProcessResult) -> Result<(), RuntimeError> {
-        self.send_inner(result, None)
+        self.with_writer(|out| out.write_result(result, None, self.encoding()))
     }
 
     pub(crate) fn send_with_context(
@@ -62,46 +75,54 @@ impl StdoutSink {
         result: &ProcessResult,
         ctx: &DeliveryContext,
     ) -> Result<(), RuntimeError> {
-        self.send_inner(result, Some(ctx))
+        self.with_writer(|out| out.write_result(result, Some(ctx), self.encoding()))
     }
 
-    fn send_inner(
+    /// Write a batch of deliveries in one write, one outcome per delivery the
+    /// write reached.
+    ///
+    /// Without a `backlog` the delivery worker is keeping up, and the batch
+    /// is written on the stdout writer thread, so the runtime thread stays
+    /// with the tasks that feed the worker. With one the worker is the
+    /// bottleneck, and the batch is written in place through
+    /// [`super::blocking_write`]: a full batch shares the cost of moving the
+    /// runtime to another thread, and the write adds no round trip.
+    pub(crate) async fn send_batch(
         &self,
-        result: &ProcessResult,
-        ctx: Option<&DeliveryContext>,
-    ) -> Result<(), RuntimeError> {
-        if result.is_empty() {
-            return Ok(());
+        items: &[(&ProcessResult, &DeliveryContext)],
+        backlog: bool,
+    ) -> Vec<Result<(), RuntimeError>> {
+        let writer = if backlog { None } else { stdout_writer() };
+        let Some(writer) = writer else {
+            return super::blocking_write(|| {
+                self.with_writer(|out| out.write_results(items, self.encoding()))
+            });
+        };
+        writer
+            .write_results(&self.out, items, self.encoding())
+            .await
+    }
+
+    /// Run `write` holding the process's stdout lock as well as this sink's
+    /// writer, so a write that takes several `write` calls is not interleaved
+    /// with another stdout writer's output.
+    fn with_writer<R>(&self, write: impl FnOnce(&mut LineWriter<std::io::Stdout>) -> R) -> R {
+        let _stdout = std::io::stdout().lock();
+        write(&mut self.out.lock())
+    }
+
+    fn encoding(&self) -> LineEncoding<'_> {
+        LineEncoding {
+            format: self.format,
+            pretty: self.pretty,
+            ocsf: &self.ocsf,
+            tenant_filter: self.tenant_filter.as_ref(),
         }
-
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-
-        for (index, m) in result.iter().enumerate() {
-            if let Some(filter) = &self.tenant_filter
-                && m.header.tenant_id.as_ref() != Some(filter)
-            {
-                continue;
-            }
-            let json = serialize_result(
-                m,
-                self.format,
-                self.pretty,
-                ctx.map(|ctx| (ctx, index)),
-                &self.ocsf,
-            )?;
-            writeln!(out, "{json}")?;
-        }
-
-        Ok(())
     }
 
     /// Write a pre-serialized JSON string directly to stdout.
     pub fn send_raw(&self, json: &str) -> Result<(), RuntimeError> {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        writeln!(out, "{json}")?;
-        Ok(())
+        self.with_writer(|out| out.write_line(json))
     }
 
     /// Write a pre-serialized line when it belongs to `tenant`.
@@ -117,4 +138,21 @@ impl StdoutSink {
         }
         self.send_raw(json)
     }
+}
+
+/// The process's stdout writer thread, started on first use. `None` when it
+/// could not be started.
+fn stdout_writer() -> Option<&'static WriterThread> {
+    static WRITER: OnceLock<Option<WriterThread>> = OnceLock::new();
+    WRITER
+        .get_or_init(
+            || match WriterThread::spawn("rsigma-stdout", || std::io::stdout().lock()) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    tracing::warn!(%error, "Could not start the stdout writer thread");
+                    None
+                }
+            },
+        )
+        .as_ref()
 }

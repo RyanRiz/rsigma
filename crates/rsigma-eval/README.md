@@ -46,7 +46,7 @@ The free function `apply_filters(collection: &SigmaCollection) -> Vec<SigmaRule>
 
 ### Ruleset fan-out
 
-`RulesetEngines` evaluates several independent rulesets over the same events. Each `RulesetUnit` owns its compiled engine, pipelines, and correlation state; `process_event` and `process_batch` stamp the ruleset name on every result, apply optional `when` schema bindings, and count skipped events (`skipped_totals` reads the running totals, `take_skipped` drains the counts since its last call); `process_event` also counts routing outcomes for a routed unit. Classification runs once per event, and only when a unit has a `when` binding. `export_state` and `import_state` carry per-ruleset correlation state, a single-engine snapshot imports into a fan-out with one unit, and `rule_field_set` unions the units' field sets. A unit can also list `tenants`; a bound unit accepts only events carrying one of them.
+`RulesetEngines` evaluates several independent rulesets over the same events. Each `RulesetUnit` owns its compiled engine, pipelines, and correlation state; `process_event` and `process_batch` stamp the ruleset name on every result, apply optional `when` schema bindings, and count skipped events (`skipped_totals` reads the running totals, `take_skipped` drains the counts since its last call); `process_event` also counts routing outcomes for a routed unit. Classification runs once per event, and only when a unit has a `when` binding. `export_state` and `import_state` carry per-ruleset correlation state, a single-engine snapshot imports into a fan-out with one unit, and `rule_field_set` unions the units' field sets. A unit can also list `tenants`; a bound unit accepts only events carrying one of them. `RulesetEngines::set_include_event`, `UnitEngine::set_include_event`, and `SchemaRouter::set_include_event` change event retention on a built engine for the next event evaluated.
 
 ### Tenants
 
@@ -102,7 +102,7 @@ A non-short-circuiting, bloom-free recording evaluator that backs `rsigma engine
 |----------|-------------|
 | `parse_pipeline(yaml: &str)` | Parse a pipeline from a YAML string |
 | `parse_pipeline_file(path: &Path)` | Parse a pipeline from a YAML file |
-| `parse_sources_file(path: &Path)` | Parse a standalone source YAML file (top-level `sources:` list) |
+| `parse_sources_file(path: &Path)` | Parse a standalone source YAML file (top-level `sources:` list). Unknown keys, keys that do not apply to a source's type, and unknown `format`, `on_error`, and `refresh` values are errors |
 | `parse_sources_dir(dir: &Path)` | Parse all `*.yml`/`*.yaml` source files in a directory |
 | `validate_source_refs(pipeline, external_ids)` | Validate that `${source.*}` references resolve against declared and/or external source IDs |
 | `sources::scan_source_templates(text)` | Find every `${source.<id>}` or `${source.<id>.<path>}` template in a string, with its id, path, and byte offset; the one reference grammar used by pipeline parsing and runtime expansion |
@@ -288,6 +288,9 @@ Stateful processing with sliding time windows, group-by aggregation, and all 8 c
 - **Configurable cap**: `max_correlation_events` bounds memory per window
 - **Zero cost when disabled**: buffers are not allocated unless mode is `Full` or `Refs`
 - **Per-correlation override**: set `rsigma.correlation_event_mode` via `custom_attributes` in YAML
+- **Chained correlations**: a parent in `Full` or `Refs` mode carries the events its child correlations retained when they fired and fed it. Each event appears once, oldest first, capped and windowed by the parent's own settings
+- **Retention down the chain**: a parent's mode and cap make its children buffer events even when their own mode is `None`; the children's own results stay without events
+- **Event sources**: every result with `events` or `event_refs` also carries `event_sources`, one `EventSource` per event naming the referenced `rule` it matched and, for a chained parent, the child correlation it came `via`
 
 ### Memory Management
 

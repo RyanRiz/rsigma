@@ -87,7 +87,7 @@ pub(crate) const SINK_RETRY_MAX: u32 = 3;
 pub(crate) const SINK_BACKOFF_BASE_MS: u64 = 100;
 pub(crate) const SINK_BACKOFF_MAX_MS: u64 = 5_000;
 pub(crate) const SINK_BATCH_MAX: usize = 64;
-pub(crate) const SINK_BATCH_FLUSH_MS: u64 = 50;
+pub(crate) const SINK_BATCH_FLUSH_MS: u64 = 0;
 /// Default HTTP egress policy applied to dynamic-source and enrichment HTTP
 /// clients. `default` blocks link-local and known cloud-metadata addresses
 /// (the classic SSRF targets) while leaving loopback and RFC1918 private
@@ -140,9 +140,7 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
             rulesets: None,
             sources: Some(Vec::new()),
             enrichers: None,
-            #[cfg(feature = "stix-enrich")]
             stix_store: None,
-            #[cfg(feature = "stix-enrich")]
             stix_store_allow_custom: false,
             alert_pipeline: None,
             risk: None,
@@ -252,6 +250,7 @@ pub(crate) fn defaults_partial() -> RsigmaConfigPartial {
                 strict: Some(LOGSOURCE_STRICT),
             }),
             tenancy: None,
+            runtime: None,
         }),
         eval: Some(EvalPartial {
             rules: None,

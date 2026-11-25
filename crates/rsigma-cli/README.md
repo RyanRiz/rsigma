@@ -133,7 +133,7 @@ Both `engine daemon` and `engine eval` accept their settings via a YAML config f
 # Scaffold a commented template at ./rsigma.yaml.
 rsigma config init
 
-# Discover files, deserialize, warn on unknown keys and inert sections.
+# Discover files, deserialize, fail on unknown keys, and report inert sections.
 rsigma config validate
 
 # Print the effective config with the source of each leaf.
@@ -291,7 +291,7 @@ Unlike `engine eval`, the daemon stays alive after stdin reaches EOF and support
 | `--syslog-strip-bom` | bool | `true` | Strip a leading UTF-8 BOM from RFC 5424 syslog messages. Pass `false` to keep it byte-for-byte |
 | `--jq` | string | none | jq filter to extract event payload (conflicts with `--jsonpath`) |
 | `--jsonpath` | string | none | JSONPath (RFC 9535) query (conflicts with `--jq`) |
-| `--include-event` | flag | `false` | Include full event JSON in each detection match |
+| `--include-event` | flag | `false` | Include full event JSON in each detection match. Enrichers that read `${detection.fields.*}` or `${detection.event.*}` do not need it; the daemon retains events for them and strips them before delivery |
 | `--pretty` | flag | `false` | Pretty-print JSON output |
 | `--api-addr` | string | `0.0.0.0:9090` | Address for health, metrics, and management API server |
 | `--api-token-env` | string | none | Require bearer-token auth on the API; the named environment variable holds the single accepted token (full admin permissions). For per-token roles and granular `resource:action` permissions use the `daemon.api.auth` config block instead (mutually exclusive). `GET /healthz` and `GET /readyz` stay open. |
@@ -312,8 +312,11 @@ Unlike `engine eval`, the daemon stays alive after stdin reaches EOF and support
 | `--event-logsource` | string | unset | Static event logsource when the field is absent, as `product=windows,...` (an `-e @file.evtx` input implies `product: windows`) |
 | `--observe-fields` | flag | `false` | Record the field keys of every event evaluated by the engine so `/api/v1/fields*` can report gap and broken-coverage signals. Off by default; when off the engine task does not iterate event fields at all |
 | `--observe-fields-max-keys` | integer | **10000** | Hard ceiling on distinct field names tracked by the observer. Overflow drops are counted via `rsigma_fields_observer_overflow_dropped_total`. No effect without `--observe-fields` |
-| `--buffer-size` | integer | **10000** | Bounded channel capacity for source-to-engine and engine-to-sink queues |
-| `--batch-size` | integer | **1** | Maximum events per engine lock acquisition (reduces mutex overhead under load) |
+| `--buffer-size` | integer | **10000** | Bounded channel capacity for source-to-engine and engine-to-sink queues, in events. At least 1 |
+| `--batch-size` | integer | **128** | Maximum events per detection batch, capped at `--buffer-size`. At least 1 |
+| `--worker-threads` | integer | Tokio default | Tokio worker threads for ingestion, the API, and sink delivery (`daemon.runtime.worker_threads`) |
+| `--detect-threads` | integer | `RAYON_NUM_THREADS`, else one per core | Threads in the pool that parses and evaluates batches (`daemon.runtime.detect_threads`) |
+| `--detect-inflight` | integer | `RSIGMA_DETECT_INFLIGHT`, else scales with the detection threads | Detection batches evaluated concurrently, 1 to 8; always 1 with correlation rules (`daemon.runtime.detect_inflight`) |
 | `--drain-timeout` | integer | **5** | Seconds to wait for in-flight events to drain on shutdown |
 | `--dlq` | string | none | Dead-letter queue: `stdout`, `file://<path>`, or `nats://<host>:<port>/<subject>` |
 | `--state-db` | path | none | Path to SQLite database for persisting correlation state across restarts |
@@ -490,13 +493,13 @@ curl -X POST http://localhost:9090/v1/logs \
 
 **Hot-reload triggers:**
 
-- File system changes to `.yml`/`.yaml` files in the rules directory (debounced 500ms)
+- File system changes to `.yml`/`.yaml` files in the rules directory, or in the directory of a `-p` pipeline file or of the `--enrichers`, `--alert-pipeline`, or `--risk` file (debounced 500ms)
 - `SIGHUP` signal (Unix only) -- triggers both rule reload and dynamic source re-resolution
 - `POST /api/v1/reload` -- cross-platform; the recommended cert-rotation path on Windows
 - `POST /api/v1/sources/resolve` -- re-resolves dynamic sources without reloading rules
 - NATS control subject `rsigma.control.resolve` (when using NATS sources) -- payload can be empty (resolve all) or `{"source_id": "..."}` (resolve one)
 
-The first three triggers all funnel through one debounced reload task that re-reads rules, pipelines, enrichers, and (when `daemon-tls` is built in) the TLS certificate and key. A failed reload of any component bumps `rsigma_reloads_failed_total`, logs an error, and leaves the previous in-memory state active so a typo on disk cannot black-hole the daemon.
+The first three triggers all funnel through one debounced reload task that re-reads rules, pipelines, enrichers, the alert pipeline, the risk config, and (when `daemon-tls` is built in) the TLS certificate and key. A failed reload of any component bumps `rsigma_reloads_failed_total`, logs an error, and leaves the previous in-memory state active so a typo on disk cannot black-hole the daemon.
 
 **Prometheus metrics:**
 
@@ -760,6 +763,8 @@ Sigma rules can include `rsigma.*` custom attributes to override CLI defaults on
 | `rsigma.action` | correlation rules | `"alert"` or `"reset"`, overrides `--action` |
 | `rsigma.correlation_event_mode` | correlation rules | `"none"`, `"full"`, or `"refs"`, overrides `--correlation-event-mode` |
 | `rsigma.max_correlation_events` | correlation rules | Integer as string (e.g. `"25"`), overrides `--max-correlation-events` |
+
+Set on a chained parent, `rsigma.correlation_event_mode` and `rsigma.max_correlation_events` also make its child correlations retain events up to that cap, so the parent's result carries the events behind each child firing along with `event_sources`. The children's own output keeps their own mode.
 
 Example rule YAML:
 
@@ -1423,11 +1428,35 @@ enrichers:
     inject_field: <field-name>     # required, key under enrichments.<...>
     timeout: 5s                    # optional, humantime; default 5s
     on_error: skip | null | drop   # optional; default skip
+    on_miss: skip | null | drop    # optional; lookup, http, stix, mmdb, dns; default on_error
     scope:                         # optional; see "Scope filtering"
       rules: [<rule-id-or-glob>, ...]
       tags:  [<tag-or-prefix.*>, ...]
       levels: [low, medium, high, critical, informational]
     # ... primitive-specific fields below ...
+```
+
+Keys that are unknown, or that do not apply to the entry's `type:`, are rejected at load with an error that names the key and lists the supported ones. The same holds for keys under `scope` and at the top level of the file. A key set to an empty value (`headers: {}`, `attack_technique: false`, `miss_status: []`, `mmap: false`) counts as absent. `default` counts whenever it is written, `default: null` included. Bespoke types registered with `register_builtin` receive unknown keys and validate them themselves.
+
+### Misses and errors
+
+A miss is a lookup that ran and found no data for its key: a `lookup` cache miss or an extract that matched nothing, a `stix` query with no objects or an extract that returned `null`, an `mmdb` address with no record or an empty projection, a `dns` NXDOMAIN or NODATA answer, and an `http` response whose status is listed in `miss_status`. An `http` result that is `null` after the optional `extract` is not a miss: it injects `default` when one is configured, and `null` otherwise. Everything else that stops an enricher is a failure. `template` and `command` have no misses.
+
+- `default` is injected on a miss, and a miss it covers counts as a success. Writing `default: null` injects `null`.
+- `on_miss: skip | null | drop` handles a miss when `default` is not set. It applies to `lookup`, `http`, `stix`, `mmdb`, and `dns`, and falls back to `on_error` when absent.
+- `on_error` handles failures, and misses when neither `default` nor `on_miss` is set.
+
+Setting `on_miss` together with `default` (including `default: null`) fails at load, because `default` always handles the miss. `default: null` and `on_miss: null` both inject `null`; the first reports `status="success"` and the second `status="miss"`. To fail closed on errors but keep detections whose lookup found nothing, set `on_error: drop` and `on_miss: skip`:
+
+```yaml
+- id: geo_src
+  kind: detection
+  type: mmdb
+  inject_field: geo
+  db_path: /var/lib/geoip/GeoLite2-City.mmdb
+  key: "${detection.fields.SourceIp}"
+  on_error: drop
+  on_miss: skip
 ```
 
 ### Kind and template namespaces
@@ -1443,8 +1472,10 @@ Detection variables (`${detection.*}`):
 |---|---|
 | `${detection.rule.title}` / `.id` / `.level` | Rule metadata from `RuleHeader` |
 | `${detection.tags}` | Comma-joined `tags` |
-| `${detection.fields.<name>}` | The matched value of `<name>` from `matched_fields` |
-| `${detection.event.<dotted.path>}` | JSON path into the original event (when `rsigma.include_event: "true"` on the rule) |
+| `${detection.fields.<name>}` | The matched value of `<name>` from `matched_fields`; when the rule did not match on `<name>`, the value of `<name>` in the event |
+| `${detection.event.<dotted.path>}` | JSON path into the original event |
+
+A matched field wins, even when its value is null or empty. Otherwise `<name>` is read from the event as a whole top-level key first, then as a dotted path, and renders empty when neither exists. The daemon retains each detection's event automatically while a loaded enricher reads `${detection.fields.*}` or `${detection.event.*}`, and strips it right after enrichment unless `--include-event`, capture, or the rule's `rsigma.include_event: "true"` asks for it. Webhook templates do not fall back and still need `--include-event` for event fields.
 
 Correlation variables (`${correlation.*}`):
 
@@ -1496,14 +1527,14 @@ Reads a value from the dynamic-pipelines `SourceCache` by `source_id` and applie
   extract: '.assets[] | select(.hostname == "${correlation.group_key.HostName}")'
   extract_type: jq                 # jq | jsonpath | cel; defaults to jq
   default: "unknown"               # injected on cache miss / no extract match
-  on_error: skip                   # applied only when default is not configured
+  on_error: skip                   # applied to errors, and to misses when default is not configured
 ```
 
 The decision matrix:
 
 - **Cache hit + extract matches** → inject the extracted value
-- **Cache hit + no extract match** → if `default` is configured, inject it; otherwise apply `on_error`
-- **Cache miss** → if `default` is configured, inject it; otherwise apply `on_error`
+- **Cache hit + no extract match** → if `default` is configured, inject it; otherwise apply `on_miss`, or `on_error` when `on_miss` is absent
+- **Cache miss** → if `default` is configured, inject it; otherwise apply `on_miss`, or `on_error` when `on_miss` is absent
 - **Extract evaluation error** (invalid jq, type mismatch) → always applies `on_error`, even with `default` set
 
 `lookup` requires at least one dynamic source to be configured on the daemon via `--source <file>`. The loader surfaces a clear error at startup if a `lookup` enricher is configured without a source cache. (Pipeline-embedded `sources:` blocks also populate the cache but are deprecated; see [Source declaration](#source-declaration).)
@@ -1524,12 +1555,23 @@ Per-result `reqwest` request with template-expanded URL, headers, and optional b
   cache_ttl: 1h                    # mandatory for the 4 req/min free tier
   extract: ".data.attributes.last_analysis_stats"
   extract_type: jq
+  miss_status: [404]               # VirusTotal answers an unknown hash with 404
+  default: null                    # injected for an unknown hash
   on_error: skip
   scope:
     tags: ["attack.execution", "attack.defense_evasion"]
 ```
 
 Each enricher instance owns its own response cache: two enrichers hitting the same URL with different `Authorization` headers do not share entries.
+
+Miss and error handling:
+
+- A 2xx value, after the optional `extract`, that is not `null` is injected; a `null` value injects `default` when one is configured, and `null` otherwise.
+- A status listed in `miss_status` (each entry in `300..=599`) injects `default` when one is configured, and is otherwise a miss handled by `on_miss` (logged at debug). The body is not read.
+- An `extract` evaluation error applies `on_error`.
+- Any other non-2xx status, a timeout, a transport error, a body over the cap, or invalid JSON applies `on_error`, even when `default` is set.
+
+Both 2xx bodies and `miss_status` responses are cached for `cache_ttl`, and `default` is applied again on each hit.
 
 ### `command`: per-result local-process execution
 
@@ -1647,26 +1689,9 @@ enrichers:
     default: { country: "unknown" }
 ```
 
-#### `enrich_ip_rdns`: reverse DNS for an IP
+The database is read into memory once per file, however many entries name it. With the `mmdb-mmap` feature (included in the prebuilt binaries and the Docker image), `mmap: true` memory-maps the file instead, which drops a 93 MB database's idle cost from about 95 MB of resident memory to about 3 MB and shares its pages with other processes; the file must then be replaced by renaming a new file over it, because writing to it in place can crash the daemon with `SIGBUS`. Entries that name one file must agree on `mmap`. Each entry repeats the key render and tree lookup, so one entry with several fields is cheaper than several entries on the same file.
 
-Use `dns` with `record_type: PTR` to resolve an event-supplied IP address to a hostname. `extract: ".[0]"` keeps the first answer, and `default` covers addresses with no PTR record:
-
-```yaml
-# enrichers.yml
-enrichers:
-  - id: enrich_ip_rdns
-    kind: detection
-    type: dns
-    record_type: PTR
-    key: "${detection.fields.SourceIp}"
-    inject_field: src_hostname
-    extract: ".[0]"
-    default: "unknown"
-```
-
-Forward lookups take `record_type: A`, `AAAA`, or `IP` (both), and `key` then holds a hostname such as `${detection.fields.DestinationHostname}`. See [Enrichers: `dns`](https://rsigma.io/guide/enrichers/#dns-dns-lookup) for the record types and cache behavior.
-
-If the GeoIP data is already exported as JSON, use `lookup` against a dynamic source instead; fall back to `http` for vendor APIs:
+If the GeoIP data is already exported as JSON, use `lookup` against a dynamic source instead:
 
 ```yaml
 # sources.yml
@@ -1691,6 +1716,46 @@ enrichers:
     default: { country: "unknown" }
 ```
 
+For a hosted GeoIP API, use `http` with a `cache_ttl`. Send the key in a header, because `${ENV_VAR}` values in `url` are inserted verbatim and a failed request logs the full URL. The `extract` injects the same shape as the `mmdb` recipe. It yields `null` for private and reserved addresses that the provider answers with a no-record body, and `default` injects `{country: "unknown"}` for them:
+
+```yaml
+# enrichers.yml
+enrichers:
+  - id: enrich_ip_geoip
+    kind: detection
+    type: http
+    inject_field: geoip
+    url: "https://geoip.example.com/v1/${detection.fields.SourceIp}"
+    headers:
+      Authorization: "Bearer ${GEOIP_API_KEY}"
+    cache_ttl: 24h
+    extract: 'select(.country_code) | {country: .country_code, region: .region_code, city: .city}'
+    extract_type: jq
+    default: { country: "unknown" }
+    on_error: skip
+```
+
+Adapt `url`, `headers`, and the response paths in `extract` to the provider. If the provider answers an unknown address with a status such as 404, add it to `miss_status`. See [Enrichers: recipes](https://rsigma.io/guide/enrichers/#composing-enrichers-recipes) for the details.
+
+#### `enrich_ip_rdns`: reverse DNS for an IP
+
+Use `dns` with `record_type: PTR` to resolve an event-supplied IP address to a hostname. `extract: ".[0]"` keeps the first answer, and `default` covers addresses with no PTR record:
+
+```yaml
+# enrichers.yml
+enrichers:
+  - id: enrich_ip_rdns
+    kind: detection
+    type: dns
+    record_type: PTR
+    key: "${detection.fields.SourceIp}"
+    inject_field: src_hostname
+    extract: ".[0]"
+    default: "unknown"
+```
+
+Forward lookups take `record_type: A`, `AAAA`, or `IP` (both), and `key` then holds a hostname such as `${detection.fields.DestinationHostname}`. See [Enrichers: `dns`](https://rsigma.io/guide/enrichers/#dns-dns-lookup) for the record types and cache behavior.
+
 #### `enrich_hash_virustotal`: hash reputation with cache
 
 `cache_ttl` is mandatory for the 4 req/min free tier and a major win for duplicate-detection bursts on any tier:
@@ -1706,10 +1771,14 @@ enrichers:
   cache_ttl: 1h
   extract: ".data.attributes.last_analysis_stats"
   extract_type: jq
+  miss_status: [404]
+  default: null
   on_error: skip
   scope:
     tags: ["attack.execution"]
 ```
+
+Expected `enrichments.file_reputation` shape: the `last_analysis_stats` object, or `null` when VirusTotal has no report for the hash (HTTP 404, cached for `cache_ttl`). A `null` rather than a placeholder string keeps the field an object wherever it has a value, so a sink with a typed schema does not reject either form.
 
 #### `enrich_cve_kev`: known-exploited-vulnerability flag
 
@@ -1788,13 +1857,17 @@ register_builtin(
 
 Reserved names (`template`, `lookup`, `http`, `command`, `stix`, `mmdb`, `dns`) are rejected at registration time; duplicate registrations of the same name are rejected to keep the global registry append-only. Bespoke types follow the same `kind` / `scope` / template rules as the seven primitives; promotion does not change the YAML shape, only the `type:` value.
 
+### Logging
+
+A miss without `default` logs at debug level (`Enricher found no data`). A miss covered by `default` is a success and is not logged. Every other failure logs a warning at most once per 10 seconds per enricher id, and each warning carries a `suppressed` field with the number of that enricher's failures since the previous warning that were not logged. When the enrichers are reloaded, failures not yet reported are logged once per enricher id.
+
 ### Metrics
 
 The enrichment pipeline reports thirteen Prometheus metrics:
 
 | Metric | Labels | Description |
 |---|---|---|
-| `rsigma_enrichment_total` | `enricher_id`, `kind`, `status` | Per-call outcome counter; `status` is `success` / `skip` / `error` / `timeout` / `drop` |
+| `rsigma_enrichment_total` | `enricher_id`, `kind`, `status` | Per-call outcome counter; `status` is `success`/`skip`/`error`/`timeout`/`miss`/`drop`. A miss that is skipped or injected as `null` reports `miss` |
 | `rsigma_enrichment_duration_seconds` | `enricher_id`, `kind` | Per-enricher latency histogram |
 | `rsigma_enrichment_queue_depth` | none | Pending enrichment calls (sum across both kinds) |
 | `rsigma_enrichment_http_cache_hits_total` | `enricher_id` | HTTP enricher response-cache hits |
@@ -1827,17 +1900,30 @@ The `kind` label is carried even though `enricher_id` typically already encodes 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `daemon` | **on** | Enables the `engine daemon` subcommand (tokio, axum, prometheus, notify, rusqlite) |
+| `daemon` | **on** | Enables the `engine daemon` subcommand (tokio, axum, prometheus, notify, rusqlite) (implies `ocsf`) |
+| `ocsf` | **on** (via `daemon`) | Enables `--finding-format ocsf` on `engine eval` and `rule backtest` |
+| `mcp` | off | Enables `mcp serve`, the Model Context Protocol server |
 | `daemon-nats` | off | Enables NATS JetStream input/output, authentication, replay, and consumer groups (implies `daemon`) |
-| `daemon-otlp` | off | Enables OTLP log ingestion via HTTP (protobuf/JSON) and gRPC on `/v1/logs` (implies `daemon`) |
+| `daemon-otlp` | off | Enables OTLP log ingestion via HTTP (protobuf/JSON) and gRPC on `/v1/logs`, and the OTLP output sink (implies `daemon`) |
+| `daemon-tls` | off | Enables TLS termination and optional mTLS on the daemon API listener (implies `daemon`) |
 | `logfmt` | off | Enables `logfmt` input format in `daemon` and `eval` |
 | `cef` | off | Enables CEF (ArcSight) input format in `daemon` and `eval` |
 | `evtx` | off | Enables EVTX (Windows Event Log) input format |
 | `daachorse-index` | off | Enables the `--cross-rule-ac` flag and links in [daachorse](https://crates.io/crates/daachorse) for cross-rule Aho-Corasick pre-filtering of large substring-heavy rule sets |
+| `hunt-postgres` | off | Enables `hunt run --emit events` against PostgreSQL (`--emit sql` works without it) |
+| `taxii-sync` | off | Enables `taxii sync` and `taxii store` |
+| `stix-draft` | off | Enables `rule draft --from-stix` |
+| `stix-enrich` | off | Enables `engine daemon --stix-store` and `type: stix` enrichers (implies `daemon`) |
+| `stix-source` | off | Enables `type: taxii` sources and `format: stix` on file and HTTP sources (implies `daemon`) |
+| `mmdb-enrich` | off | Enables `type: mmdb` enrichers (implies `daemon`) |
+| `mmdb-mmap` | off | Enables `mmap: true` on `type: mmdb` enrichers (implies `mmdb-enrich`) |
+| `dns-enrich` | off | Enables `type: dns` enrichers (implies `daemon`) |
+
+`rsigma --features` prints the features a binary was built with. See the [feature flags reference](https://rsigma.io/reference/feature-flags/) for what each one pulls in.
 
 ```bash
 # Build with all features
-cargo build --release --features daemon-nats,daemon-otlp,logfmt,cef,evtx,daachorse-index
+cargo build --release --all-features
 
 # Build without daemon (parser, eval, convert, lint only)
 cargo build --release --no-default-features

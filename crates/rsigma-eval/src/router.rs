@@ -343,6 +343,17 @@ impl<L> SchemaRouter<L> {
         })
     }
 
+    /// Set global `include_event` on every per-schema engine and the shared
+    /// correlation store. Takes effect for the next event evaluated.
+    pub fn set_include_event(&mut self, include: bool) {
+        for engine in &mut self.engines {
+            engine.set_include_event(include);
+        }
+        if let Some(correlation) = &mut self.correlation {
+            correlation.set_include_event(include);
+        }
+    }
+
     /// The unknown-handling policy this router enforces.
     pub fn on_unknown(&self) -> OnUnknown {
         self.plan.on_unknown()
@@ -526,23 +537,9 @@ impl<L> SchemaRouter<L> {
         let plan = &self.plan;
         let engines = &self.engines;
         let extractor = self.logsource_extractor.as_ref();
-        let phase1: Vec<Routed1> = {
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                events
-                    .par_iter()
-                    .map(|e| detect_one(classifier, plan, engines, extractor, *e))
-                    .collect()
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                events
-                    .iter()
-                    .map(|e| detect_one(classifier, plan, engines, extractor, *e))
-                    .collect()
-            }
-        };
+        let phase1: Vec<Routed1> = crate::parallel::map_ordered(events, |e| {
+            detect_one(classifier, plan, engines, extractor, *e)
+        });
         phase1
             .into_iter()
             .map(|routed| match routed {
@@ -606,23 +603,9 @@ impl<L> SchemaRouter<L> {
         let plan = &self.plan;
         let engines = &self.engines;
         let extractor = self.logsource_extractor.as_ref();
-        let phase1: Vec<Routed1> = {
-            #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                events
-                    .par_iter()
-                    .map(|e| detect_one(classifier, plan, engines, extractor, *e))
-                    .collect()
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                events
-                    .iter()
-                    .map(|e| detect_one(classifier, plan, engines, extractor, *e))
-                    .collect()
-            }
-        };
+        let phase1: Vec<Routed1> = crate::parallel::map_ordered(events, |e| {
+            detect_one(classifier, plan, engines, extractor, *e)
+        });
 
         // Stateful phase: feed detections into the shared correlation store in
         // event order. Disjoint field borrows let the field maps and the

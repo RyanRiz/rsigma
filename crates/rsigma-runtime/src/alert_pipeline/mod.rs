@@ -756,6 +756,33 @@ pub fn strip_event_payloads(result: &mut EvaluationResult) {
     if let Some(correlation) = result.as_correlation_mut() {
         correlation.events = None;
         correlation.event_refs = None;
+        correlation.event_sources = None;
+    }
+}
+
+/// Remove a detection event that the engine retained for enrichment but
+/// nobody asked to deliver.
+///
+/// Clears [`DetectionBody::event`](rsigma_eval::DetectionBody::event) unless
+/// the rule set `rsigma.include_event` to the string `"true"`, the same test
+/// the rule compiler applies. Correlation payloads (`events`, `event_refs`,
+/// `event_sources`) come from the correlation config and are never touched.
+///
+/// Callers that turn on engine-wide retention only because
+/// [`EnrichmentPipeline::needs_event`](crate::EnrichmentPipeline::needs_event)
+/// asked for it call this after the enrichment pipeline runs.
+pub fn strip_auto_retained_event(result: &mut EvaluationResult) {
+    let rule_asked = result
+        .header
+        .custom_attributes
+        .get("rsigma.include_event")
+        .and_then(Value::as_str)
+        == Some("true");
+    if rule_asked {
+        return;
+    }
+    if let Some(detection) = result.as_detection_mut() {
+        detection.event = None;
     }
 }
 
@@ -915,6 +942,91 @@ mod tests {
         // on event.raw (one incident opened).
         assert!(kept[0].as_detection().unwrap().event.is_none());
         assert_eq!(st.incidents.len(), 1);
+    }
+
+    #[test]
+    fn strip_event_payloads_drops_correlation_events_and_sources() {
+        let mut result = EvaluationResult {
+            header: detection("10.0.0.1", Level::High).header,
+            body: ResultBody::Correlation(rsigma_eval::CorrelationBody {
+                correlation_type: rsigma_parser::CorrelationType::EventCount,
+                group_key: vec![],
+                aggregated_value: 1.0,
+                timespan_secs: 60,
+                events: None,
+                event_refs: Some(vec![]),
+                event_sources: Some(vec![]),
+            }),
+        };
+        strip_event_payloads(&mut result);
+        let correlation = result.as_correlation().unwrap();
+        assert!(correlation.event_refs.is_none());
+        assert!(correlation.event_sources.is_none());
+    }
+
+    fn detection_with_include_event(value: Option<Value>) -> EvaluationResult {
+        let mut result = detection("10.0.0.1", Level::High);
+        if let Some(value) = value {
+            result.header.custom_attributes =
+                Arc::new(HashMap::from([("rsigma.include_event".to_string(), value)]));
+        }
+        result
+    }
+
+    #[test]
+    fn strip_auto_retained_event_drops_an_event_the_rule_did_not_ask_for() {
+        let mut result = detection_with_include_event(None);
+        strip_auto_retained_event(&mut result);
+        assert!(result.as_detection().unwrap().event.is_none());
+
+        let mut result = detection_with_include_event(Some(Value::String("false".into())));
+        strip_auto_retained_event(&mut result);
+        assert!(result.as_detection().unwrap().event.is_none());
+    }
+
+    #[test]
+    fn strip_auto_retained_event_keeps_an_event_the_rule_asked_for() {
+        let mut result = detection_with_include_event(Some(Value::String("true".into())));
+        strip_auto_retained_event(&mut result);
+        assert_eq!(
+            result.as_detection().unwrap().event,
+            Some(serde_json::json!({"raw": "event"}))
+        );
+    }
+
+    #[test]
+    fn strip_auto_retained_event_treats_a_boolean_like_the_compiler() {
+        // The compiler attaches the event only for the string "true", so a
+        // boolean never asked for it.
+        let mut result = detection_with_include_event(Some(Value::Bool(true)));
+        strip_auto_retained_event(&mut result);
+        assert!(result.as_detection().unwrap().event.is_none());
+    }
+
+    #[test]
+    fn strip_auto_retained_event_keeps_correlation_payloads() {
+        let event_ref = rsigma_eval::EventRef {
+            timestamp: 1,
+            id: Some("e1".to_string()),
+        };
+        let mut result = EvaluationResult {
+            header: detection("10.0.0.1", Level::High).header,
+            body: ResultBody::Correlation(rsigma_eval::CorrelationBody {
+                correlation_type: rsigma_parser::CorrelationType::EventCount,
+                group_key: vec![],
+                aggregated_value: 1.0,
+                timespan_secs: 60,
+                events: Some(vec![serde_json::json!({"raw": "event"})]),
+                event_refs: Some(vec![event_ref]),
+                event_sources: Some(vec![rsigma_eval::EventSource {
+                    rule: Some("rule-1".to_string()),
+                    via: None,
+                }]),
+            }),
+        };
+        let before = serde_json::to_value(&result.body).unwrap();
+        strip_auto_retained_event(&mut result);
+        assert_eq!(serde_json::to_value(&result.body).unwrap(), before);
     }
 
     #[test]
@@ -1247,6 +1359,7 @@ mod tests {
                 timespan_secs: 60,
                 events: None,
                 event_refs: None,
+                event_sources: None,
             }),
         };
         p.process_with_capture(vec![correlation], &mut st, 0, &NoopMetrics, Some(&mut sink));

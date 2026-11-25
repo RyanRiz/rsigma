@@ -43,7 +43,9 @@ pub trait MetricsHook: Send + Sync {
 
     /// One enrichment call completed (success, skip, error, timeout, drop).
     /// `kind` is the enricher's declared kind (`detection` / `correlation`).
-    /// `status` is one of `success` / `skip` / `error` / `timeout` / `drop`.
+    /// `status` is one of `success`, `skip`, `error`, `timeout`, `miss`, or
+    /// `drop`. A miss ([`EnrichErrorKind::Miss`](crate::EnrichErrorKind::Miss))
+    /// that is skipped or injected as `null` reports `miss`.
     fn on_enrichment_completed(
         &self,
         _enricher_id: &str,
@@ -145,6 +147,9 @@ pub trait MetricsHook: Send + Sync {
     fn on_sink_dropped(&self, _sink: &str) {}
     /// A sink exhausted its retries and routed the result to the DLQ.
     fn on_sink_delivery_failed(&self, _sink: &str) {}
+    /// An OTLP collector accepted an export but rejected `count` of its log
+    /// records in a partial success. Rejected records are not retried.
+    fn on_sink_otlp_rejected_records(&self, _sink: &str, _count: u64) {}
 
     /// Pre-register a webhook's `webhook_id` label so its request metrics
     /// appear on `/metrics` from the first scrape, before any traffic.
